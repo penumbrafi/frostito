@@ -42,6 +42,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use sha2::{Digest, Sha512};
 
+pub mod context;
 pub mod curve;
 pub mod dkg;
 mod error;
@@ -55,6 +56,7 @@ pub mod reshare;
 pub(crate) mod test_rng;
 mod types;
 
+pub use context::{SigningContext, SIGNING_CONTEXT_DOMAIN};
 pub use curve::{OsstCurve, OsstPoint, OsstScalar};
 pub use error::OsstError;
 pub use lagrange::compute_lagrange_coefficients;
@@ -71,6 +73,30 @@ pub use curve::secp256k1::Secp256k1Curve;
 
 #[cfg(feature = "decaf377")]
 pub use curve::decaf377::Decaf377Curve;
+
+/// Sample a uniform scalar for any backend curve, from a `rand_core` 0.6 RNG.
+///
+/// Sugar over [`OsstScalar::random`] for callers that would otherwise
+/// hand-roll nonce sampling. Reach for it when a backend's own `Field::random`
+/// is out of reach: the pallas backend rides on `ff` 0.14 (Zakura Common 1.0),
+/// which moved `Field::random` onto rand_core 0.10's `Rng` trait, so a
+/// rand_core 0.6 `OsRng` cannot call it. This crate keeps its whole public API
+/// on rand_core 0.6 and samples by wide reduction internally; external callers
+/// should use this rather than re-deriving that bridge and risking a different
+/// distribution.
+///
+/// ```ignore
+/// use osst::random_scalar;
+/// use pasta_curves::pallas::Scalar;
+///
+/// let nonce: Scalar = random_scalar(&mut rand_core::OsRng);
+/// ```
+#[inline]
+pub fn random_scalar<S: OsstScalar, R: rand_core::RngCore + rand_core::CryptoRng>(
+    rng: &mut R,
+) -> S {
+    S::random(rng)
+}
 
 /// Hash a point and payload to a scalar challenge
 /// H(u_i || payload) -> c_i
@@ -1019,5 +1045,26 @@ mod decaf377_tests {
         let result = verify(&group_pubkey, &contributions, t, payload);
         assert!(result.is_ok());
         assert!(result.unwrap(), "2-of-3 decaf377 should verify");
+    }
+}
+
+#[cfg(all(test, feature = "ristretto255"))]
+mod random_scalar_tests {
+    use super::*;
+    use curve25519_dalek::scalar::Scalar;
+
+    #[test]
+    fn random_scalar_matches_the_trait_method_and_varies() {
+        let mut rng = rand::rngs::OsRng;
+        let a: Scalar = random_scalar(&mut rng);
+        let b: Scalar = random_scalar(&mut rng);
+        // Overwhelmingly unlikely to collide, and never the trivial values.
+        assert_ne!(a, b);
+        assert_ne!(a, <Scalar as OsstScalar>::zero());
+        assert_ne!(a, <Scalar as OsstScalar>::one());
+
+        // Same construction as calling the trait method directly.
+        let c: Scalar = <Scalar as OsstScalar>::random(&mut rng);
+        assert_ne!(c, <Scalar as OsstScalar>::zero());
     }
 }

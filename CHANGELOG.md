@@ -1,5 +1,68 @@
 # changelog
 
+## [0.3.0] - 2026-09-20
+
+sweep release: pull generic threshold-signing utilities that had drifted
+into the downstream repos (zcli `crates/frost-spend`, zk.poker
+`poker-server`/`poker-sdk`, zeratul, penumbrafi/penumbra `narsild`) back
+into the canonical crate.
+
+### added
+
+- **`context::SigningContext`** — `{ epoch, manifest_hash, message }` with a
+  canonical, domain-separated, length-prefixed encoding that every signer
+  recomputes independently. That encoding, not the bare message, is what FROST
+  signs over.
+
+  This is what makes `reshare` an actual rotation. A key-preserving reshare
+  leaves the group public key unchanged, so a pre-rotation quorum can still
+  produce signatures that verify under it; binding the epoch into the signed
+  bytes means an epoch-n signature is not a valid epoch-n+1 authorization.
+
+  **Scope — it only works where the verifier is osst-aware** (custody
+  authorization, escrow release, narsil spend approval, internal attestations).
+  It does **not** apply to protocol-defined signatures — Orchard `SpendAuthSig`
+  over a sighash, Penumbra spend auth, Bitcoin sighash — where the message is
+  fixed by consensus and there is nowhere to put the epoch. Retiring shares in
+  that setting needs an on-chain rotation to a *new* group key. See the module
+  docs.
+- **`random_scalar`** — free-function sugar over `OsstScalar::random`, for
+  external callers. `narsild` (penumbrafi/penumbra#31) had duplicated the
+  pallas wide-reduction bridge byte-for-byte because the trait method was easy
+  to miss; the docs now carry the reason a caller must not reach for the curve
+  crate's own `Field::random` (ff 0.14 moved it onto rand_core 0.10).
+- **`nested::InnerSigningParamsV2::from_outer`** — derive a nested position's
+  outer context (binding factor, challenge, Lagrange coefficient) from the
+  outer `SigningPackage` and group public key. Five downstream call sites
+  hand-rolled this; two of them also reimplemented `binding_factor` verbatim,
+  which would silently break on any domain-tag change. Composition of existing
+  public methods, no new crypto.
+
+### notes for downstream
+
+Nothing in this release is breaking; `0.2.0` callers compile unchanged.
+
+Known duplication left in place deliberately, each tracked for its own review:
+
+- **weighted nested FROST v2** (zcli `frost-spend/src/nested.rs`) — a
+  stake-weighted generalization where one holder owns many share indices
+  (`Σ_j λ_j·share_j` in place of `μ_k·σ_k`) plus commit-reveal precommitments.
+  Genuinely generic and a real extension of `nested`, but it is a novel
+  construction carrying its own security argument and currently has no caller
+  anywhere. Deferred to a PR that can be reviewed on its own terms.
+- **threshold ElGamal partial decryption** (zeratul
+  `ghettobox-vault-pvm/src/pss/recovery.rs`) — group algebra over `osst::verify`
+  and `compute_lagrange_coefficients`, the natural companion to `Contribution`.
+  Deferred for the same reason: new crypto surface deserves its own review.
+- **`serde`/SCALE codecs** for `SecretShare`, `Contribution`, `DealerCommitment`
+  and `SubShare` — three consumers re-derive these, and the `serde`, `codec` and
+  `scale-info` optional deps in `Cargo.toml` are currently dead (no `cfg` in
+  `src/` references them). Needs a deliberate encode-as-bytes design, since
+  backend scalar types do not implement `Encode`/`Serialize` themselves.
+- **round-2 confidentiality for `dkg`** (zcli `frost-spend/src/sealed.rs`) —
+  osst's DKG genuinely lacks it. Wants an optional feature or companion crate;
+  `snow` + `x25519-dalek` + `hkdf` do not belong in no_std core.
+
 ## [0.2.0] - 2026-09-20
 
 consolidation release: the three divergent copies of this crate (the
