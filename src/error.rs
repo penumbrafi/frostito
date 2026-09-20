@@ -47,6 +47,19 @@ pub enum OsstError {
 
     /// Two rounds of the same protocol were mixed (session id mismatch)
     SessionMismatch,
+
+    /// A dealer's proof of knowledge of its constant term did not verify.
+    /// Carries the failing dealer's index: this is a complaint, and it names
+    /// who to disqualify.
+    InvalidProofOfKnowledge(u32),
+
+    /// A dealer's sub-share did not verify against its commitment. Carries the
+    /// failing dealer's index.
+    InvalidSubShare(u32),
+
+    /// The ceremony cannot continue: too few dealers remain after
+    /// disqualification.
+    DkgAborted { qualified: usize, need: usize },
 }
 
 impl fmt::Display for OsstError {
@@ -78,6 +91,17 @@ impl fmt::Display for OsstError {
                 write!(f, "coordinator-supplied outer context does not match")
             }
             Self::SessionMismatch => write!(f, "session id mismatch"),
+            Self::InvalidProofOfKnowledge(idx) => {
+                write!(f, "dealer {} published an invalid proof of knowledge", idx)
+            }
+            Self::InvalidSubShare(idx) => {
+                write!(f, "dealer {} sent an invalid sub-share", idx)
+            }
+            Self::DkgAborted { qualified, need } => write!(
+                f,
+                "dkg aborted: {} qualified dealers remain, need {}",
+                qualified, need
+            ),
         }
     }
 }
