@@ -34,6 +34,19 @@ pub enum OsstError {
 
     /// Dealers committed to different new thresholds
     ThresholdMismatch { expected: u32, got: u32 },
+
+    /// The signing package's message is not the message the signer approved
+    MessageMismatch,
+
+    /// A commitment in the package is not the one produced in the local round
+    UnexpectedCommitment,
+
+    /// A coordinator-supplied outer context does not match the locally
+    /// recomputed one (binding factor, challenge or Lagrange coefficient)
+    ChallengeMismatch,
+
+    /// Two rounds of the same protocol were mixed (session id mismatch)
+    SessionMismatch,
 }
 
 impl fmt::Display for OsstError {
@@ -55,6 +68,16 @@ impl fmt::Display for OsstError {
             Self::ThresholdMismatch { expected, got } => {
                 write!(f, "dealer committed to threshold {}, expected {}", got, expected)
             }
+            Self::MessageMismatch => {
+                write!(f, "signing package message is not the approved message")
+            }
+            Self::UnexpectedCommitment => {
+                write!(f, "commitment is not the one produced in this round")
+            }
+            Self::ChallengeMismatch => {
+                write!(f, "coordinator-supplied outer context does not match")
+            }
+            Self::SessionMismatch => write!(f, "session id mismatch"),
         }
     }
 }

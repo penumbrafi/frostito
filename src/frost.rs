@@ -431,6 +431,31 @@ pub fn commit<P: OsstPoint, R: rand_core::RngCore + rand_core::CryptoRng>(
 /// # Errors
 ///
 /// Returns `InvalidIndex` if this signer's index is not in the package.
+/// [`sign`] with the message given as an epoch-bound
+/// [`SigningContext`](crate::SigningContext).
+///
+/// The package must have been built over `ctx.encode()`; otherwise this
+/// returns [`OsstError::MessageMismatch`] rather than signing whatever the
+/// coordinator put in the package. This is the only-way-in form: a caller that
+/// uses it cannot forget to bind the epoch and manifest.
+///
+/// Note the verifier-side rule (see [`crate::context`]): epoch binding is a
+/// property of the verifier. A verifier MUST rebuild the context bytes from an
+/// epoch and manifest hash it obtains from an authoritative source, and never
+/// from data carried alongside the signature.
+pub fn sign_with_context<P: OsstPoint>(
+    ctx: &crate::SigningContext<'_>,
+    package: &SigningPackage<P>,
+    nonces: Nonces<P::Scalar>,
+    share: &SecretShare<P::Scalar>,
+    group_pubkey: &P,
+) -> Result<SignatureShare<P::Scalar>, OsstError> {
+    if package.message() != ctx.encode().as_slice() {
+        return Err(OsstError::MessageMismatch);
+    }
+    sign(package, nonces, share, group_pubkey)
+}
+
 pub fn sign<P: OsstPoint>(
     package: &SigningPackage<P>,
     nonces: Nonces<P::Scalar>,

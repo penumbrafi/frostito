@@ -646,10 +646,21 @@ pub mod zcash {
         if !osst_ok { return None; }
 
         // phase 2: inner commitment with RedPallas binding
+        // v1 single-process helper: the "session" is this call, so the id is
+        // derived from the message. (Removed in 0.4.0 — see the `legacy-v1`
+        // feature.)
+        let mut session_id = [0u8; 32];
+        {
+            let h = blake2b_simd::Params::new()
+                .hash_length(32)
+                .personal(b"frostito_v1_sess")
+                .hash(message);
+            session_id.copy_from_slice(h.as_bytes());
+        }
         let mut inner_nonces = Vec::new();
         let mut inner_commits = Vec::new();
         for &k in &active_jury {
-            let (n, c) = nested::inner_commit::<Point, _>(k, &mut rng);
+            let (n, c) = nested::inner_commit::<Point, _>(k, session_id, &mut rng);
             inner_nonces.push(n);
             inner_commits.push(c);
         }
