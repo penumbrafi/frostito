@@ -1,5 +1,9 @@
-//! Audit PoCs — flat `osst::frost`, `osst::liveness`, and hash domain
-//! separation (SECURITY-REVIEW-2026-09.md, findings F-1, L-1, H-1, P-1).
+//! Audit regression tests — flat `osst::frost`, `osst::liveness`, and hash
+//! domain separation (SECURITY-REVIEW-2026-09.md, findings F-1, L-1, H-1,
+//! P-1).
+//!
+//! These were `#[ignore]`d PoCs asserting the break. Each now performs the
+//! same attack and asserts that it fails; none is ignored.
 
 #![cfg(all(feature = "ristretto255", feature = "std"))]
 
