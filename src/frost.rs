@@ -907,11 +907,12 @@ mod pallas_tests {
     use pasta_curves::pallas::{Point, Scalar};
     use rand::rngs::OsRng;
 
+    use crate::test_rng::OsRng10;
+
     fn shamir_split(secret: &Scalar, n: u32, t: u32) -> Vec<SecretShare<Scalar>> {
-        let mut rng = OsRng;
         let mut coeffs = vec![*secret];
         for _ in 1..t {
-            coeffs.push(<Scalar as Field>::random(&mut rng));
+            coeffs.push(<Scalar as Field>::random(&mut OsRng10));
         }
         (1..=n)
             .map(|i| {
@@ -931,7 +932,7 @@ mod pallas_tests {
     fn test_pallas_frost() {
         let mut rng = OsRng;
 
-        let secret = <Scalar as Field>::random(&mut rng);
+        let secret = <Scalar as Field>::random(&mut OsRng10);
         let group_pubkey: Point = Point::generator().mul_scalar(&secret);
 
         let n = 5u32;

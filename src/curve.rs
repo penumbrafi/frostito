@@ -277,7 +277,13 @@ pub mod pallas {
         }
 
         fn random<R: rand_core::RngCore + rand_core::CryptoRng>(rng: &mut R) -> Self {
-            <Scalar as Field>::random(rng)
+            // ff 0.14 (Zakura Common 1.0) moved `Field::random` onto rand_core
+            // 0.10's `Rng` trait, which is incompatible with the rand_core 0.6
+            // RNG this API is generic over. Sample uniformly ourselves via
+            // fill_bytes + wide reduction to keep osst on rand_core 0.6.
+            let mut bytes = [0u8; 64];
+            rng.fill_bytes(&mut bytes);
+            <Scalar as FromUniformBytes<64>>::from_uniform_bytes(&bytes)
         }
 
         fn from_bytes_wide(bytes: &[u8; 64]) -> Self {

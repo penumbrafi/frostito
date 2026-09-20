@@ -37,7 +37,11 @@ zeroize = { version = "1.8", default-features = false, features = ["derive"] }
 curve25519-dalek = { version = "4.1", default-features = false, features = ["digest", "group", "alloc", "rand_core", "zeroize"], optional = true }
 
 # pallas - for Zcash Orchard compatibility
-pasta_curves = { version = "0.5", default-features = false, features = ["alloc"], optional = true }
+# Zakura Common 1.0 fork (pasta-1.0 / ff+group 0.14). Package rename keeps the
+# `use pasta_curves` paths working; the pallas backend only touches stable
+# ff/group traits (Field/PrimeField/FromUniformBytes/Group/GroupEncoding) that
+# are unchanged across the 0.13 -> 0.14 bump.
+pasta_curves = { package = "zakura-pasta-curves", version = "=1.0.0", default-features = false, features = ["alloc"], optional = true }
 
 # secp256k1 - for Bitcoin compatibility
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa"], optional = true }
@@ -61,3 +65,7 @@ scale-info = { version = "2.11", default-features = false, features = ["derive"]
 [dev-dependencies]
 rand = "0.8"
 hex = "0.4"
+# Zakura Common 1.0's ff 0.14 bounds `Field::random` on rand_core 0.10's `Rng`,
+# which rand 0.8's `OsRng` does not implement. The pallas tests bridge the two
+# with a local adapter; see the `OsRng10` in `frost.rs`.
+rand_core_10 = { package = "rand_core", version = "0.10", default-features = false }
