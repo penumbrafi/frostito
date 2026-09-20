@@ -32,7 +32,7 @@ fn split(secret: &Scalar, n: u32, t: u32, rng: &mut OsRng) -> Vec<SecretShare<Sc
                 y = y.add(&c.mul(&xp));
                 xp = xp.mul(&x);
             }
-            SecretShare::new(i, y)
+            SecretShare::new(i, y).unwrap()
         })
         .collect()
 }

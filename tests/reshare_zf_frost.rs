@@ -125,7 +125,7 @@ fn zf_dkg_then_frostito_reshare_then_zf_sign() {
         .iter()
         .map(|&i| {
             let s = zf_share_to_scalar(&old_shares[&id(i)]);
-            (i, Dealer::new(i, s, new_t, &mut rng))
+            (i, Dealer::new(i, s, new_t, &mut rng).unwrap())
         })
         .collect();
 
@@ -137,7 +137,7 @@ fn zf_dkg_then_frostito_reshare_then_zf_sign() {
         let mut agg: Aggregator<P> = Aggregator::new(j, &dealer_set).unwrap();
         for (&i, dealer) in &dealers {
             assert!(agg
-                .add_subshare(dealer.generate_subshare(j), dealer.commitment().clone())
+                .add_subshare(dealer.generate_subshare(j).unwrap(), dealer.commitment().clone())
                 .unwrap());
             let _ = i;
         }

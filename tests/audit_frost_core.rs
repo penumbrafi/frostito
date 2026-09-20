@@ -13,20 +13,18 @@ use rand::rngs::OsRng;
 
 type Point = RistrettoPoint;
 
-/// F-1 (Low) — `frost::sign` never checks that the commitment the package
+/// F-1 (Low, FIXED) — `frost::sign` checks that the commitment the package
 /// carries under this signer's index is the one derived from the nonces it is
 /// about to consume.
 ///
-/// ZF `frost-core` rejects this (`Error::IncorrectCommitment`); osst only checks
-/// that the index is present. The effect is that a coordinator chooses the
-/// binding factor an honest signer applies to its own binding nonce, with the
-/// hiding nonce held fixed. One session yields one equation in three unknowns,
-/// so this is not by itself an extraction; it becomes one for any signer whose
-/// nonce state survives a process restart (the crate documents that as the
-/// caller's problem) and it removes a cheap, standard invariant.
+/// Until 0.4.0 osst only checked that the index was present, so a coordinator
+/// chose the binding factor an honest signer applied to its own binding nonce
+/// while holding the hiding nonce fixed. One session is one equation in three
+/// unknowns, so it was not by itself an extraction; it became one for any
+/// signer whose nonce state survived a process restart. ZF `frost-core`
+/// rejects this as `Error::IncorrectCommitment`.
 #[test]
-#[ignore = "F-1: frost::sign accepts a package carrying a foreign commitment under the signer's own index"]
-fn sign_accepts_a_foreign_commitment_for_its_own_index() {
+fn sign_rejects_a_foreign_commitment_for_its_own_index() {
     let mut rng = OsRng;
 
     let secret = <Scalar as OsstScalar>::random(&mut rng);
@@ -38,22 +36,30 @@ fn sign_accepts_a_foreign_commitment_for_its_own_index() {
     let group_pubkey = <Point as OsstPoint>::generator().mul_scalar(&secret);
 
     // Signer 1 commits honestly.
-    let (nonces_1, _my_commitment) = frost::commit::<Point, _>(1, &mut rng);
+    let (nonces_1, my_commitment) = frost::commit::<Point, _>(1, &mut rng).unwrap();
     // The coordinator publishes a commitment for index 1 that signer 1 did not make.
-    let (_, foreign_for_1) = frost::commit::<Point, _>(1, &mut rng);
-    let (_, commits_2) = frost::commit::<Point, _>(2, &mut rng);
+    let (_, foreign_for_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
+    let (_, commits_2) = frost::commit::<Point, _>(2, &mut rng).unwrap();
 
-    let package =
-        frost::SigningPackage::<Point>::new(b"m".to_vec(), vec![foreign_for_1, commits_2]).unwrap();
+    let share_1 = SecretShare::new(1, eval(1)).unwrap();
 
-    let share_1 = SecretShare::new(1, eval(1));
-    let result = frost::sign::<Point>(&package, nonces_1, &share_1, &group_pubkey);
-
-    // Desired behaviour: Err. Actual: Ok, with rho chosen by the coordinator.
-    assert!(
-        result.is_err(),
-        "sign() should reject a package whose commitment for this signer is not its own"
+    let package = frost::SigningPackage::<Point>::new(
+        b"m".to_vec(),
+        vec![foreign_for_1, commits_2.clone()],
+    )
+    .unwrap();
+    assert_eq!(
+        frost::sign::<Point>(&package, nonces_1, &share_1, &group_pubkey).unwrap_err(),
+        osst::OsstError::UnexpectedCommitment,
+        "sign() must reject a package whose commitment for this signer is not its own"
     );
+
+    // The honest package still signs.
+    let (nonces_1, my_commitment2) = frost::commit::<Point, _>(1, &mut rng).unwrap();
+    let _ = my_commitment;
+    let package =
+        frost::SigningPackage::<Point>::new(b"m".to_vec(), vec![my_commitment2, commits_2]).unwrap();
+    assert!(frost::sign::<Point>(&package, nonces_1, &share_1, &group_pubkey).is_ok());
 }
 
 /// L-1 (Medium, FIXED) — the liveness contribution signature binds the public
@@ -72,7 +78,7 @@ fn liveness_signature_does_not_transfer_to_a_related_key() {
     let sk = <Scalar as OsstScalar>::random(&mut rng);
     let pk = <Point as OsstPoint>::generator().mul_scalar(&sk);
 
-    let dealer: Dealer<Point> = Dealer::new(1, <Scalar as OsstScalar>::random(&mut rng), 3, &mut rng);
+    let dealer: Dealer<Point> = Dealer::new(1, <Scalar as OsstScalar>::random(&mut rng), 3, &mut rng).unwrap();
     let anchor = CheckpointAnchor::new(100, [1u8; 32], 0);
     let liveness = LivenessProof::new(anchor, vec![1, 2, 3], [2u8; 32]);
     let context = b"epoch-42";
@@ -162,28 +168,56 @@ fn osst_and_liveness_challenges_are_domain_separated() {
     assert_ne!(legacy, liveness_c);
 }
 
-/// P-1 (Low) — adversarial indices panic rather than erroring.
+/// P-1 (Low, FIXED) — adversarial indices and thresholds error rather than
+/// panicking.
 ///
-/// Several constructors `assert!` on caller input instead of returning
-/// `OsstError::InvalidIndex`. In a node that parses indices off the wire — which
-/// `narsild` does — an index of 0 aborts the process. These pass today and
-/// document the surface; they should be converted to `Result` returns.
+/// Several constructors used `assert!` on caller input. In a node that parses
+/// indices off the wire — which `narsild` does — an index of 0 from a peer
+/// aborted the process. They now return `OsstError`.
 #[test]
-#[should_panic(expected = "1-indexed")]
-fn secret_share_index_zero_panics() {
-    let _ = SecretShare::new(0, <Scalar as OsstScalar>::zero());
-}
-
-#[test]
-#[should_panic(expected = "1-indexed")]
-fn frost_commit_index_zero_panics() {
+fn wire_parsed_indices_error_rather_than_aborting_the_process() {
+    use osst::OsstError;
     let mut rng = OsRng;
-    let _ = frost::commit::<Point, _>(0, &mut rng);
-}
 
-#[test]
-#[should_panic(expected = "threshold must be positive")]
-fn dkg_dealer_threshold_zero_panics() {
-    let mut rng = OsRng;
-    let _: osst::dkg::Dealer<Point> = osst::dkg::Dealer::new(1, 0, &mut rng);
+    assert_eq!(
+        SecretShare::new(0, <Scalar as OsstScalar>::zero()).unwrap_err(),
+        OsstError::InvalidIndex
+    );
+    assert_eq!(
+        frost::commit::<Point, _>(0, &mut rng).unwrap_err(),
+        OsstError::InvalidIndex
+    );
+    assert_eq!(
+        osst::dkg::Dealer::<Point>::new(0, 3, &mut rng).unwrap_err(),
+        OsstError::InvalidIndex
+    );
+    assert_eq!(
+        osst::dkg::Dealer::<Point>::new(1, 0, &mut rng).unwrap_err(),
+        OsstError::ThresholdMismatch {
+            expected: 1,
+            got: 0
+        }
+    );
+    assert_eq!(
+        Dealer::<Point>::new(0, <Scalar as OsstScalar>::zero(), 3, &mut rng).unwrap_err(),
+        OsstError::InvalidIndex
+    );
+
+    let dealer = osst::dkg::Dealer::<Point>::new(1, 2, &mut rng).unwrap();
+    assert_eq!(
+        dealer.generate_subshare(0).unwrap_err(),
+        OsstError::InvalidIndex
+    );
+    assert_eq!(
+        dealer.commitment().evaluate_at(0).unwrap_err(),
+        OsstError::InvalidIndex
+    );
+    assert_eq!(
+        osst::reshare::DealerCommitment::<Point>::from_polynomial(1, &[]).unwrap_err(),
+        OsstError::EmptyContributions
+    );
+    assert_eq!(
+        osst::reshare::SubShare::new(0, 1, <Scalar as OsstScalar>::zero()).unwrap_err(),
+        OsstError::InvalidIndex
+    );
 }

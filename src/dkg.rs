@@ -165,22 +165,26 @@ impl<P: OsstPoint> Dealer<P> {
         index: u32,
         threshold: u32,
         rng: &mut R,
-    ) -> Self {
-        assert!(index > 0, "index must be 1-indexed");
-        assert!(threshold > 0, "threshold must be positive");
+    ) -> Result<Self, OsstError> {
+        if index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        if threshold == 0 {
+            return Err(OsstError::ThresholdMismatch { expected: 1, got: 0 });
+        }
 
         let mut polynomial = Vec::with_capacity(threshold as usize);
         for _ in 0..threshold {
             polynomial.push(P::Scalar::random(rng));
         }
 
-        let commitment = DealerCommitment::from_polynomial(index, &polynomial);
+        let commitment = DealerCommitment::from_polynomial(index, &polynomial)?;
 
-        Self {
+        Ok(Self {
             index,
             polynomial,
             commitment,
-        }
+        })
     }
 
     #[inline]
@@ -215,8 +219,10 @@ impl<P: OsstPoint> Dealer<P> {
     }
 
     /// Generate sub-share for player j: f_i(j)
-    pub fn generate_subshare(&self, player_index: u32) -> SubShare<P::Scalar> {
-        assert!(player_index > 0, "player_index must be 1-indexed");
+    pub fn generate_subshare(&self, player_index: u32) -> Result<SubShare<P::Scalar>, OsstError> {
+        if player_index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
 
         let j = P::Scalar::from_u32(player_index);
 
@@ -231,10 +237,11 @@ impl<P: OsstPoint> Dealer<P> {
     }
 
     /// Generate sub-shares for all players 1..=n
-    pub fn generate_subshares(&self, num_players: u32) -> Vec<SubShare<P::Scalar>> {
-        (1..=num_players)
-            .map(|j| self.generate_subshare(j))
-            .collect()
+    pub fn generate_subshares(
+        &self,
+        num_players: u32,
+    ) -> Result<Vec<SubShare<P::Scalar>>, OsstError> {
+        (1..=num_players).map(|j| self.generate_subshare(j)).collect()
     }
 }
 
@@ -587,7 +594,7 @@ impl<P: OsstPoint> DkgState<P> {
 
     /// Derive public verification share for player j.
     ///
-    /// Y_j = g^{s_j} = Σ_i C_i.evaluate_at(j)
+    /// Y_j = g^{s_j} = Σ_i C_i.evaluate_at(j).expect("index is 1-indexed by construction")
     ///
     /// These are needed for FROST share verification — detecting which
     /// signer produced a bad signature share without revealing secrets.
@@ -604,7 +611,7 @@ impl<P: OsstPoint> DkgState<P> {
 
         let mut vshare = P::identity();
         for commitment in self.commitments.iter().flatten() {
-            vshare = vshare.add(&commitment.evaluate_at(player_index));
+            vshare = vshare.add(&commitment.evaluate_at(player_index).expect("index is 1-indexed by construction"));
         }
 
         Ok(vshare)
@@ -648,7 +655,7 @@ mod tests {
 
         // phase 1: each participant creates a dealer
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         // phase 2: collect commitments
         let commitments: Vec<&DealerCommitment<RistrettoPoint>> =
@@ -659,7 +666,7 @@ mod tests {
         for j in 1..=n {
             let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
-                let subshare = dealer.generate_subshare(j);
+                let subshare = dealer.generate_subshare(j).expect("index is 1-indexed by construction");
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
@@ -678,7 +685,7 @@ mod tests {
         let secret_shares: Vec<SecretShare<Scalar>> = shares
             .iter()
             .enumerate()
-            .map(|(i, (s, _))| SecretShare::new((i + 1) as u32, *s))
+            .map(|(i, (s, _))| SecretShare::new((i + 1) as u32, *s).expect("index is 1-indexed by construction"))
             .collect();
 
         let payload = b"dkg test verification";
@@ -698,7 +705,7 @@ mod tests {
         let t = 3u32;
 
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let mut state: DkgState<RistrettoPoint> = DkgState::new(1, t, n);
 
@@ -719,7 +726,7 @@ mod tests {
         // derive group key from aggregator
         let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(1, n).unwrap();
         for dealer in &dealers {
-            let subshare = dealer.generate_subshare(1);
+            let subshare = dealer.generate_subshare(1).expect("index is 1-indexed by construction");
             agg.add_subshare(subshare, dealer.commitment()).unwrap();
         }
         let agg_key = agg.derive_group_key().unwrap();
@@ -734,16 +741,16 @@ mod tests {
         let t = 2u32;
 
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(1, n).unwrap();
 
         // good sub-share
-        let subshare = dealers[0].generate_subshare(1);
+        let subshare = dealers[0].generate_subshare(1).expect("index is 1-indexed by construction");
         assert!(agg.add_subshare(subshare, dealers[0].commitment()).is_ok());
 
         // tampered sub-share (wrong value)
-        let bad = SubShare::new(2, 1, Scalar::random(&mut rng));
+        let bad = SubShare::new(2, 1, Scalar::random(&mut rng)).expect("index is 1-indexed by construction");
         let result = agg.add_subshare(bad, dealers[1].commitment());
         assert!(matches!(result, Err(OsstError::InvalidSubShare(_))));
     }
@@ -751,13 +758,13 @@ mod tests {
     #[test]
     fn test_dkg_duplicate_rejected() {
         let mut rng = OsRng;
-        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, 2, &mut rng);
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
 
         let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(1, &[1]).unwrap();
-        let subshare = dealer.generate_subshare(1);
+        let subshare = dealer.generate_subshare(1).expect("index is 1-indexed by construction");
         assert!(agg.add_subshare(subshare, dealer.commitment()).unwrap());
 
-        let subshare2 = dealer.generate_subshare(1);
+        let subshare2 = dealer.generate_subshare(1).expect("index is 1-indexed by construction");
         assert!(!agg.add_subshare(subshare2, dealer.commitment()).unwrap());
     }
 
@@ -768,7 +775,7 @@ mod tests {
         let t = 4u32;
 
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let commitments: Vec<&DealerCommitment<RistrettoPoint>> =
             dealers.iter().map(|d| d.commitment()).collect();
@@ -779,14 +786,14 @@ mod tests {
         for j in 1..=n {
             let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
-                let subshare = dealer.generate_subshare(j);
+                let subshare = dealer.generate_subshare(j).expect("index is 1-indexed by construction");
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
             if group_key.is_none() {
                 group_key = Some(agg.derive_group_key().unwrap());
             }
-            secret_shares.push(SecretShare::new(j, agg.finalize().unwrap()));
+            secret_shares.push(SecretShare::new(j, agg.finalize().unwrap()).expect("index is 1-indexed by construction"));
         }
 
         let group_key = group_key.unwrap();
@@ -808,18 +815,18 @@ mod tests {
         let n = 5u32;
         let t = 3u32;
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let set = [1u32, 3, 4];
         let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(2, &set).unwrap();
         // dealer 5 committed too, but is not in the agreed set
         assert_eq!(
-            agg.add_subshare(dealers[4].generate_subshare(2), dealers[4].commitment()),
+            agg.add_subshare(dealers[4].generate_subshare(2).expect("index is 1-indexed by construction"), dealers[4].commitment()),
             Err(OsstError::UnexpectedDealer(5))
         );
         for &i in &set {
             let d = &dealers[(i - 1) as usize];
-            agg.add_subshare(d.generate_subshare(2), d.commitment()).unwrap();
+            agg.add_subshare(d.generate_subshare(2).expect("index is 1-indexed by construction"), d.commitment()).unwrap();
         }
         assert!(agg.is_complete());
 
@@ -833,7 +840,7 @@ mod tests {
         // An incomplete aggregator refuses to finalize
         let mut partial: Aggregator<RistrettoPoint> = Aggregator::new(2, &set).unwrap();
         partial
-            .add_subshare(dealers[0].generate_subshare(2), dealers[0].commitment())
+            .add_subshare(dealers[0].generate_subshare(2).expect("index is 1-indexed by construction"), dealers[0].commitment())
             .unwrap();
         assert_eq!(partial.missing_dealers(), vec![3, 4]);
         assert!(matches!(
@@ -849,7 +856,7 @@ mod tests {
     #[test]
     fn pok_verifies_for_an_honest_dealer() {
         let mut rng = OsRng;
-        let dealer: Dealer<RistrettoPoint> = Dealer::new(2, 3, &mut rng);
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(2, 3, &mut rng).expect("index is 1-indexed by construction");
         let pkg = dealer.round1_package(7, &mut rng);
         assert!(pkg.verify(7).is_ok());
     }
@@ -857,7 +864,7 @@ mod tests {
     #[test]
     fn pok_is_bound_to_the_dealer_index_the_epoch_and_the_commitment() {
         let mut rng = OsRng;
-        let dealer: Dealer<RistrettoPoint> = Dealer::new(2, 3, &mut rng);
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(2, 3, &mut rng).expect("index is 1-indexed by construction");
         let pkg = dealer.round1_package(7, &mut rng);
 
         // another epoch
@@ -870,7 +877,7 @@ mod tests {
 
         // another constant term: the rogue-key shape. The attacker publishes a
         // C_0 it did not choose and cannot prove knowledge of.
-        let other: Dealer<RistrettoPoint> = Dealer::new(2, 3, &mut rng);
+        let other: Dealer<RistrettoPoint> = Dealer::new(2, 3, &mut rng).expect("index is 1-indexed by construction");
         let mut rogue = pkg.clone();
         rogue.commitment = other.commitment().clone();
         assert_eq!(rogue.verify(7), Err(OsstError::InvalidProofOfKnowledge(2)));
@@ -879,8 +886,8 @@ mod tests {
     #[test]
     fn dkg_state_rejects_a_dealer_that_cannot_prove_knowledge() {
         let mut rng = OsRng;
-        let honest: Dealer<RistrettoPoint> = Dealer::new(1, 2, &mut rng);
-        let other: Dealer<RistrettoPoint> = Dealer::new(2, 2, &mut rng);
+        let honest: Dealer<RistrettoPoint> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
+        let other: Dealer<RistrettoPoint> = Dealer::new(2, 2, &mut rng).expect("index is 1-indexed by construction");
 
         let mut state: DkgState<RistrettoPoint> = DkgState::new(1, 2, 3);
 
@@ -906,7 +913,7 @@ mod tests {
         let n = 3u32;
         let t = 2u32;
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let mut state: DkgState<RistrettoPoint> = DkgState::new(9, t, n);
         for d in &dealers {
@@ -917,7 +924,7 @@ mod tests {
         // Player 1 finds dealer 3's sub-share invalid. The error names the
         // dealer: that is the complaint.
         let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(1, n).unwrap();
-        let bad = SubShare::new(3, 1, Scalar::random(&mut rng));
+        let bad = SubShare::new(3, 1, Scalar::random(&mut rng)).expect("index is 1-indexed by construction");
         assert_eq!(
             agg.add_subshare(bad, dealers[2].commitment()),
             Err(OsstError::InvalidSubShare(3))
@@ -950,7 +957,7 @@ mod tests {
     fn disqualifying_below_threshold_aborts_the_ceremony() {
         let mut rng = OsRng;
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=3).map(|i| Dealer::new(i, 3, &mut rng)).collect();
+            (1..=3).map(|i| Dealer::new(i, 3, &mut rng).expect("index is 1-indexed by construction")).collect();
         let mut state: DkgState<RistrettoPoint> = DkgState::new(1, 3, 3);
         for d in &dealers {
             state.submit_commitment(d.round1_package(1, &mut rng)).unwrap();
@@ -979,7 +986,7 @@ mod pallas_tests {
         let t = 3u32;
 
         let dealers: Vec<Dealer<Point>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let commitments: Vec<&DealerCommitment<Point>> =
             dealers.iter().map(|d| d.commitment()).collect();
@@ -989,14 +996,14 @@ mod pallas_tests {
         for j in 1..=n {
             let mut agg: Aggregator<Point> = Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
-                let subshare = dealer.generate_subshare(j);
+                let subshare = dealer.generate_subshare(j).expect("index is 1-indexed by construction");
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
             if group_key.is_none() {
                 group_key = Some(agg.derive_group_key().unwrap());
             }
-            shares.push(SecretShare::new(j, agg.finalize().unwrap()));
+            shares.push(SecretShare::new(j, agg.finalize().unwrap()).expect("index is 1-indexed by construction"));
         }
 
         let group_key = group_key.unwrap();

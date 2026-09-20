@@ -25,7 +25,7 @@
 //! use osst::{SecretShare, verify};
 //!
 //! // After DKG, each custodian has a share
-//! let share = SecretShare::new(index, scalar);
+//! let share = SecretShare::new(index, scalar).expect("index is 1-indexed by construction");
 //!
 //! // Generate contribution (Schnorr proof)
 //! let contribution = share.contribute(&mut rng, &payload);
@@ -157,9 +157,19 @@ impl<S: OsstScalar> Drop for SecretShare<S> {
 }
 
 impl<S: OsstScalar> SecretShare<S> {
-    pub fn new(index: u32, scalar: S) -> Self {
-        assert!(index > 0, "index must be 1-indexed");
-        Self { index, scalar }
+    /// Construct a share.
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::InvalidIndex`] if `index` is 0 — Shamir indices are
+    /// 1-indexed, and index 0 is the secret itself. This returns rather than
+    /// panicking (P-1): a node parsing an index off the wire must not be
+    /// abortable by a peer.
+    pub fn new(index: u32, scalar: S) -> Result<Self, OsstError> {
+        if index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        Ok(Self { index, scalar })
     }
 
     /// Access the secret scalar (use sparingly, avoid logging/debugging)
@@ -493,7 +503,7 @@ mod pallas_tests {
                     x_pow *= x;
                 }
 
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
@@ -603,7 +613,7 @@ mod tests {
                     x_pow *= x;
                 }
 
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
@@ -848,7 +858,7 @@ mod secp256k1_tests {
                     y = y.add(&coeff.mul(&x_pow));
                     x_pow = x_pow.mul(&x);
                 }
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
@@ -971,7 +981,7 @@ mod decaf377_tests {
                     y = y.add(&coeff.mul(&x_pow));
                     x_pow = x_pow.mul(&x);
                 }
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }

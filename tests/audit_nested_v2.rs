@@ -38,7 +38,7 @@ fn split(secret: &Scalar, n: u32, t: u32, rng: &mut OsRng) -> Vec<SecretShare<Sc
                 y = y.add(&c.mul(&xp));
                 xp = xp.mul(&x);
             }
-            SecretShare::new(i, y)
+            SecretShare::new(i, y).unwrap()
         })
         .collect()
 }
@@ -66,7 +66,7 @@ fn world(rng: &mut OsRng) -> World {
     let pieces = split(&sigma_2, 5, 3, rng);
     World {
         group_pubkey,
-        share_1: SecretShare::new(1, eval(1)),
+        share_1: SecretShare::new(1, eval(1)).unwrap(),
         inner_shares: pieces[..3].to_vec(),
         quorum: vec![1, 2, 3],
     }
@@ -113,7 +113,7 @@ fn coordinator_cannot_swap_the_message_under_the_inner_group() {
 
     // The coordinator is the other outer signer. It builds an outer package
     // over UNAPPROVED, using the jury's real commitment pair.
-    let (nonces_1, commits_1) = frost::commit::<Point, _>(1, &mut rng);
+    let (nonces_1, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
     let commits_2 = SigningCommitments {
         index: 2,
         hiding: d_nested,
@@ -164,7 +164,7 @@ fn the_approved_message_still_signs() {
     let (d_nested, e_nested) =
         aggregate_inner_commitment_pair::<Point>(&SESSION, &commitments).unwrap();
 
-    let (nonces_1, commits_1) = frost::commit::<Point, _>(1, &mut rng);
+    let (nonces_1, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
     let commits_2 = SigningCommitments {
         index: 2,
         hiding: d_nested,
@@ -234,11 +234,11 @@ fn substituted_nested_commitment_is_rejected_by_the_holder() {
         aggregate_inner_commitment_pair::<Point>(&SESSION, &commitments).unwrap();
 
     // The coordinator publishes a DIFFERENT pair for position 2.
-    let (_, foreign) = frost::commit::<Point, _>(2, &mut rng);
+    let (_, foreign) = frost::commit::<Point, _>(2, &mut rng).unwrap();
     assert_ne!(foreign.hiding, d_nested);
     assert_ne!(foreign.binding, e_nested);
 
-    let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng);
+    let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
     let package =
         frost::SigningPackage::<Point>::new(msg.to_vec(), vec![commits_1, foreign]).unwrap();
 
@@ -286,7 +286,7 @@ fn nonces_from_another_session_are_rejected() {
     }
     let (d_b, e_b) = aggregate_inner_commitment_pair::<Point>(&OTHER, &commits_b).unwrap();
 
-    let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng);
+    let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
     let package = frost::SigningPackage::<Point>::new(
         msg.to_vec(),
         vec![
@@ -347,7 +347,7 @@ fn incomplete_quorum_is_rejected() {
     let (d_nested, e_nested) =
         aggregate_inner_commitment_pair::<Point>(&SESSION, &commitments).unwrap();
 
-    let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng);
+    let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
     let package = frost::SigningPackage::<Point>::new(
         msg.to_vec(),
         vec![
@@ -444,7 +444,7 @@ fn v2_response_equals_the_flat_frost_response() {
     let (d_nested, e_nested) =
         aggregate_inner_commitment_pair::<Point>(&SESSION, &commitments).unwrap();
 
-    let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng);
+    let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
     let commits_2 = SigningCommitments {
         index: 2,
         hiding: d_nested,

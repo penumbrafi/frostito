@@ -116,7 +116,7 @@ pub fn interleaved_dkg<P: OsstPoint, R: rand_core::RngCore + rand_core::CryptoRn
     let mut coeff_dkgs: Vec<CoefficientDkg<P>> = Vec::with_capacity(outer_t as usize);
     for j in 0..outer_t {
         let dealers: Vec<dkg::Dealer<P>> = (1..=inner_n)
-            .map(|k| dkg::Dealer::new(k, inner_t, rng))
+            .map(|k| dkg::Dealer::new(k, inner_t, rng).expect("index is 1-indexed by construction"))
             .collect();
         coeff_dkgs.push(CoefficientDkg {
             coeff_index: j,
@@ -149,7 +149,7 @@ pub fn interleaved_dkg<P: OsstPoint, R: rand_core::RngCore + rand_core::CryptoRn
             let dealer_set: Vec<u32> = dkg_j.dealers.iter().map(|d| d.index()).collect();
             let mut agg: dkg::Aggregator<P> = dkg::Aggregator::new(k, &dealer_set)?;
             for dealer in &dkg_j.dealers {
-                let subshare = dealer.generate_subshare(k);
+                let subshare = dealer.generate_subshare(k).expect("index is 1-indexed by construction");
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])?;
             }
             coefficient_shares.push(agg.finalize()?);
@@ -183,7 +183,7 @@ pub fn split_evaluation_for_inner<P: OsstPoint, R: rand_core::RngCore + rand_cor
     // dealer_index is arbitrary here (must be >0 per DealerCommitment invariant).
     // use 1 as placeholder — the index is not meaningful for split verification,
     // only the polynomial commitments matter.
-    let commitment = DealerCommitment::from_polynomial(1, &coeffs);
+    let commitment = DealerCommitment::from_polynomial(1, &coeffs).expect("index is 1-indexed by construction");
 
     let shares = (1..=inner_n)
         .map(|k| {
@@ -479,8 +479,8 @@ mod tests {
         let secret = <Scalar as OsstScalar>::random(&mut rng);
         let group_pubkey = <Point as OsstPoint>::generator().mul_scalar(&secret);
 
-        let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng);
-        let (_, commits_2) = frost::commit::<Point, _>(2, &mut rng);
+        let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).expect("index is 1-indexed by construction");
+        let (_, commits_2) = frost::commit::<Point, _>(2, &mut rng).expect("index is 1-indexed by construction");
         let package =
             frost::SigningPackage::new(msg.to_vec(), vec![commits_1, commits_2]).unwrap();
 
@@ -542,8 +542,8 @@ mod tests {
         let sigma_2 = eval(2); // the NESTED position's outer share
         let group_pubkey = <Point as OsstPoint>::generator().mul_scalar(&secret);
 
-        let share_1 = SecretShare::new(1, sigma_1.clone());
-        let share_2_flat = SecretShare::new(2, sigma_2.clone());
+        let share_1 = SecretShare::new(1, sigma_1.clone()).expect("index is 1-indexed by construction");
+        let share_2_flat = SecretShare::new(2, sigma_2.clone()).expect("index is 1-indexed by construction");
 
         // ── split position 2's key 3-of-5 among inner holders ──────────────
         let inner_t = 3u32;
@@ -565,7 +565,7 @@ mod tests {
             .iter()
             .map(|k| {
                 let (_, piece) = inner_pieces.iter().find(|(i, _)| i == k).unwrap();
-                SecretShare::new(*k, piece.clone())
+                SecretShare::new(*k, piece.clone()).expect("index is 1-indexed by construction")
             })
             .collect();
 
@@ -614,7 +614,7 @@ mod tests {
 
         // ── outer round: position 1 commits normally, position 2 uses the
         //    aggregate PAIR (so the outer binding factor actually applies) ──
-        let (nonces_1, commits_1) = frost::commit::<Point, _>(1, &mut rng);
+        let (nonces_1, commits_1) = frost::commit::<Point, _>(1, &mut rng).expect("index is 1-indexed by construction");
         let commits_2 = frost::SigningCommitments {
             index: 2,
             hiding: d_nested,
@@ -744,7 +744,7 @@ mod tests {
             .iter()
             .map(|k| {
                 let (_, piece) = inner_pieces.iter().find(|(i, _)| i == k).unwrap();
-                SecretShare::new(*k, piece.clone())
+                SecretShare::new(*k, piece.clone()).expect("index is 1-indexed by construction")
             })
             .collect();
 
@@ -758,7 +758,7 @@ mod tests {
         let (d_nested, e_nested) = aggregate_inner_commitment_pair::<Point>(&SESSION, &inner_commitments).unwrap();
         let group_pubkey = <Point as OsstPoint>::generator().mul_scalar(&sigma_2);
 
-        let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng);
+        let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).expect("index is 1-indexed by construction");
         let commits_2 = frost::SigningCommitments {
             index: 2,
             hiding: d_nested,
@@ -879,8 +879,8 @@ mod tests {
         let nested_position = 3u32;
 
         // outer participants
-        let buyer_dealer: dkg::Dealer<Point> = dkg::Dealer::new(1, outer_t, &mut rng);
-        let seller_dealer: dkg::Dealer<Point> = dkg::Dealer::new(2, outer_t, &mut rng);
+        let buyer_dealer: dkg::Dealer<Point> = dkg::Dealer::new(1, outer_t, &mut rng).expect("index is 1-indexed by construction");
+        let seller_dealer: dkg::Dealer<Point> = dkg::Dealer::new(2, outer_t, &mut rng).expect("index is 1-indexed by construction");
 
         // interleaved DKG for nested position
         let (inner_shares, coeff_commitments) =
@@ -898,11 +898,11 @@ mod tests {
         }
 
         // players split evaluations with feldman commitments
-        let f1_at_p = buyer_dealer.generate_subshare(nested_position);
+        let f1_at_p = buyer_dealer.generate_subshare(nested_position).expect("index is 1-indexed by construction");
         let (f1_pieces, f1_commitment) =
             split_evaluation_for_inner::<Point, _>(f1_at_p.value(), inner_n, inner_t, &mut rng);
 
-        let f2_at_p = seller_dealer.generate_subshare(nested_position);
+        let f2_at_p = seller_dealer.generate_subshare(nested_position).expect("index is 1-indexed by construction");
         let (f2_pieces, f2_commitment) =
             split_evaluation_for_inner::<Point, _>(f2_at_p.value(), inner_n, inner_t, &mut rng);
 
@@ -922,14 +922,14 @@ mod tests {
                 nested_position,
                 &[(1, f1_pieces[k].1), (2, f2_pieces[k].1)],
             );
-            escrow_shares.push(SecretShare::new((k + 1) as u32, sigma));
+            escrow_shares.push(SecretShare::new((k + 1) as u32, sigma).expect("index is 1-indexed by construction"));
         }
 
         // outer keys
-        let s1 = *buyer_dealer.generate_subshare(1).value()
-            + *seller_dealer.generate_subshare(1).value()
+        let s1 = *buyer_dealer.generate_subshare(1).expect("index is 1-indexed by construction").value()
+            + *seller_dealer.generate_subshare(1).expect("index is 1-indexed by construction").value()
             + fp_at_1;
-        let buyer_share = SecretShare::new(1, s1);
+        let buyer_share = SecretShare::new(1, s1).expect("index is 1-indexed by construction");
 
         let group_key = buyer_dealer
             .commitment()
@@ -939,8 +939,8 @@ mod tests {
 
         // escrow verification share
         let p_scalar = Scalar::from(nested_position);
-        let mut y_escrow = buyer_dealer.commitment().evaluate_at(nested_position)
-            .add(&seller_dealer.commitment().evaluate_at(nested_position));
+        let mut y_escrow = buyer_dealer.commitment().evaluate_at(nested_position).expect("index is 1-indexed by construction")
+            .add(&seller_dealer.commitment().evaluate_at(nested_position).expect("index is 1-indexed by construction"));
         let mut p_pow = Scalar::ONE;
         for cc in &coeff_commitments {
             y_escrow = y_escrow.add(&cc.mul_scalar(&p_pow));
@@ -973,7 +973,7 @@ mod tests {
         let r_nested = aggregate_inner_commitments(&all_inner_commitments, message);
 
         // buyer commits normally
-        let (buyer_nonces, buyer_frost_commitments) = frost::commit::<Point, _>(1, &mut rng);
+        let (buyer_nonces, buyer_frost_commitments) = frost::commit::<Point, _>(1, &mut rng).expect("index is 1-indexed by construction");
 
         // the nested position presents r_nested as its hiding commitment
         // and identity as its binding commitment (inner binding already applied)
@@ -1068,8 +1068,8 @@ mod tests {
         let inner_t = 3u32;
         let nested_position = 3u32;
 
-        let buyer_dealer: dkg::Dealer<Point> = dkg::Dealer::new(1, outer_t, &mut rng);
-        let seller_dealer: dkg::Dealer<Point> = dkg::Dealer::new(2, outer_t, &mut rng);
+        let buyer_dealer: dkg::Dealer<Point> = dkg::Dealer::new(1, outer_t, &mut rng).expect("index is 1-indexed by construction");
+        let seller_dealer: dkg::Dealer<Point> = dkg::Dealer::new(2, outer_t, &mut rng).expect("index is 1-indexed by construction");
 
         let (inner_shares, coeff_commitments) =
             interleaved_dkg::<Point, _>(inner_n, inner_t, outer_t, &mut rng).unwrap();
@@ -1082,8 +1082,8 @@ mod tests {
             fp_at_1 += eval_lambda[i] * inner_shares[(k - 1) as usize].eval_at(1);
         }
 
-        let f1_at_p = buyer_dealer.generate_subshare(nested_position);
-        let f2_at_p = seller_dealer.generate_subshare(nested_position);
+        let f1_at_p = buyer_dealer.generate_subshare(nested_position).expect("index is 1-indexed by construction");
+        let f2_at_p = seller_dealer.generate_subshare(nested_position).expect("index is 1-indexed by construction");
         let (f1_pieces, _) =
             split_evaluation_for_inner::<Point, _>(f1_at_p.value(), inner_n, inner_t, &mut rng);
         let (f2_pieces, _) =
@@ -1096,13 +1096,13 @@ mod tests {
                 nested_position,
                 &[(1, f1_pieces[k].1), (2, f2_pieces[k].1)],
             );
-            escrow_shares.push(SecretShare::new((k + 1) as u32, sigma));
+            escrow_shares.push(SecretShare::new((k + 1) as u32, sigma).expect("index is 1-indexed by construction"));
         }
 
-        let s1 = *buyer_dealer.generate_subshare(1).value()
-            + *seller_dealer.generate_subshare(1).value()
+        let s1 = *buyer_dealer.generate_subshare(1).expect("index is 1-indexed by construction").value()
+            + *seller_dealer.generate_subshare(1).expect("index is 1-indexed by construction").value()
             + fp_at_1;
-        let buyer_share = SecretShare::new(1, s1);
+        let buyer_share = SecretShare::new(1, s1).expect("index is 1-indexed by construction");
         let group_key = buyer_dealer
             .commitment()
             .share_commitment()
@@ -1124,7 +1124,7 @@ mod tests {
             }
 
             let r_nested = aggregate_inner_commitments(&commits_vec, message);
-            let (buyer_nonces, buyer_commits) = frost::commit::<Point, _>(1, &mut rng);
+            let (buyer_nonces, buyer_commits) = frost::commit::<Point, _>(1, &mut rng).expect("index is 1-indexed by construction");
 
             let escrow_commits = frost::SigningCommitments {
                 index: nested_position,

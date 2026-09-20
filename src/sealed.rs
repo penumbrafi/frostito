@@ -391,7 +391,7 @@ pub fn seal_round2<P: OsstPoint>(
     let commitment = dealer.commitment();
     let mut out = Vec::with_capacity(roster.participants().len());
     for (index, _) in roster.participants() {
-        let subshare = dealer.generate_subshare(*index);
+        let subshare = dealer.generate_subshare(*index).expect("index is 1-indexed by construction");
         out.push(seal_subshare::<P>(
             dealer_x25519_secret,
             roster,
@@ -461,8 +461,8 @@ mod tests {
     fn a_sealed_subshare_round_trips_and_hides_the_scalar() {
         let mut rng = OsRng;
         let r = roster(SESSION);
-        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng);
-        let subshare = dealer.generate_subshare(2);
+        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
+        let subshare = dealer.generate_subshare(2).expect("index is 1-indexed by construction");
         let plaintext = subshare.to_bytes();
 
         let sealed = seal_subshare::<Point>(
@@ -503,12 +503,12 @@ mod tests {
     fn the_wrong_recipient_cannot_open_it() {
         let mut rng = OsRng;
         let r = roster(SESSION);
-        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng);
+        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
         let sealed = seal_subshare::<Point>(
             &x25519_secret_from_seed(&SEED_1),
             &r,
             ROUND,
-            &dealer.generate_subshare(2),
+            &dealer.generate_subshare(2).expect("index is 1-indexed by construction"),
             dealer.commitment(),
         )
         .unwrap();
@@ -551,14 +551,14 @@ mod tests {
     fn a_package_cannot_be_reattributed_to_another_sender() {
         let mut rng = OsRng;
         let r = roster(SESSION);
-        let dealer1: Dealer<Point> = Dealer::new(1, 2, &mut rng);
-        let dealer3: Dealer<Point> = Dealer::new(3, 2, &mut rng);
+        let dealer1: Dealer<Point> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
+        let dealer3: Dealer<Point> = Dealer::new(3, 2, &mut rng).expect("index is 1-indexed by construction");
 
         let sealed = seal_subshare::<Point>(
             &x25519_secret_from_seed(&SEED_1),
             &r,
             ROUND,
-            &dealer1.generate_subshare(2),
+            &dealer1.generate_subshare(2).expect("index is 1-indexed by construction"),
             dealer1.commitment(),
         )
         .unwrap();
@@ -585,7 +585,7 @@ mod tests {
             &x25519_secret_from_seed(&[42u8; 32]),
             &r,
             ROUND,
-            &dealer3.generate_subshare(2),
+            &dealer3.generate_subshare(2).expect("index is 1-indexed by construction"),
             dealer3.commitment(),
         )
         .unwrap();
@@ -610,15 +610,15 @@ mod tests {
     fn a_commitment_and_subshare_from_different_dealings_do_not_pair() {
         let mut rng = OsRng;
         let r = roster(SESSION);
-        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng);
+        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
         // the same dealer index, a different polynomial
-        let other: Dealer<Point> = Dealer::new(1, 2, &mut rng);
+        let other: Dealer<Point> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
 
         let sealed = seal_subshare::<Point>(
             &x25519_secret_from_seed(&SEED_1),
             &r,
             ROUND,
-            &dealer.generate_subshare(2),
+            &dealer.generate_subshare(2).expect("index is 1-indexed by construction"),
             dealer.commitment(),
         )
         .unwrap();
@@ -643,8 +643,8 @@ mod tests {
                 &x25519_secret_from_seed(&SEED_1),
                 &r,
                 ROUND,
-                &dealer.generate_subshare(2),
-                Dealer::<Point>::new(2, 2, &mut rng).commitment(),
+                &dealer.generate_subshare(2).expect("index is 1-indexed by construction"),
+                Dealer::<Point>::new(2, 2, &mut rng).unwrap().commitment(),
             )
             .unwrap_err(),
             OsstError::InvalidIndex
@@ -658,12 +658,12 @@ mod tests {
     fn a_package_from_another_ceremony_does_not_open() {
         let mut rng = OsRng;
         let r = roster(SESSION);
-        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng);
+        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
         let sealed = seal_subshare::<Point>(
             &x25519_secret_from_seed(&SEED_1),
             &r,
             ROUND,
-            &dealer.generate_subshare(2),
+            &dealer.generate_subshare(2).expect("index is 1-indexed by construction"),
             dealer.commitment(),
         )
         .unwrap();
@@ -705,12 +705,12 @@ mod tests {
     fn tampering_is_detected() {
         let mut rng = OsRng;
         let r = roster(SESSION);
-        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng);
+        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
         let mut sealed = seal_subshare::<Point>(
             &x25519_secret_from_seed(&SEED_1),
             &r,
             ROUND,
-            &dealer.generate_subshare(2),
+            &dealer.generate_subshare(2).expect("index is 1-indexed by construction"),
             dealer.commitment(),
         )
         .unwrap();
@@ -736,8 +736,8 @@ mod tests {
     fn each_package_is_fresh() {
         let mut rng = OsRng;
         let r = roster(SESSION);
-        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng);
-        let sub = dealer.generate_subshare(2);
+        let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
+        let sub = dealer.generate_subshare(2).expect("index is 1-indexed by construction");
         let sk = x25519_secret_from_seed(&SEED_1);
         let one = seal_subshare::<Point>(&sk, &r, ROUND, &sub, dealer.commitment()).unwrap();
         let two = seal_subshare::<Point>(&sk, &r, ROUND, &sub, dealer.commitment()).unwrap();
@@ -754,7 +754,7 @@ mod tests {
         let seeds = [SEED_1, SEED_2, SEED_3];
         let r = roster(SESSION);
 
-        let dealers: Vec<Dealer<Point>> = (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+        let dealers: Vec<Dealer<Point>> = (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
         let wire: Vec<Vec<SealedSubShare>> = dealers
             .iter()
             .enumerate()

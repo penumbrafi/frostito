@@ -517,7 +517,7 @@ mod tests {
         let public: RistrettoPoint = RistrettoPoint::generator().mul_scalar(&secret);
 
         // Create dealer and commitment
-        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 3, &mut rng);
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 3, &mut rng).expect("index is 1-indexed by construction");
         let commitment = dealer.commitment().clone();
 
         // Create liveness proof
@@ -553,7 +553,7 @@ mod tests {
         let secret = Scalar::random(&mut rng);
         let public: RistrettoPoint = RistrettoPoint::generator().mul_scalar(&secret);
 
-        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 3, &mut rng);
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 3, &mut rng).expect("index is 1-indexed by construction");
         let commitment = dealer.commitment().clone();
 
         // Recent checkpoint - should pass

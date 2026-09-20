@@ -193,7 +193,7 @@ mod tests {
                     y += coeff * x_pow;
                     x_pow *= x;
                 }
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }

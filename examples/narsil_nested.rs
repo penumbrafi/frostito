@@ -75,8 +75,8 @@ fn main() {
 
     println!("--- phase 1: buyer and seller generate outer polynomials ---");
 
-    let buyer_dealer: dkg::Dealer<Point> = dkg::Dealer::new(1, outer_t, &mut rng);
-    let seller_dealer: dkg::Dealer<Point> = dkg::Dealer::new(2, outer_t, &mut rng);
+    let buyer_dealer: dkg::Dealer<Point> = dkg::Dealer::new(1, outer_t, &mut rng).unwrap();
+    let seller_dealer: dkg::Dealer<Point> = dkg::Dealer::new(2, outer_t, &mut rng).unwrap();
 
     println!("  buyer  (position 1): polynomial ready");
     println!("  seller (position 2): polynomial ready\n");
@@ -96,14 +96,14 @@ fn main() {
 
     // Inner DKG #1: shares of a₃ (constant term)
     let dealers_a: Vec<dkg::Dealer<Point>> = (1..=inner_n)
-        .map(|k| dkg::Dealer::new(k, inner_t, &mut rng))
+        .map(|k| dkg::Dealer::new(k, inner_t, &mut rng).unwrap())
         .collect();
     let commitments_a: Vec<&DealerCommitment<Point>> =
         dealers_a.iter().map(|d| d.commitment()).collect();
 
     // Inner DKG #2: shares of b₃ (linear term)
     let dealers_b: Vec<dkg::Dealer<Point>> = (1..=inner_n)
-        .map(|k| dkg::Dealer::new(k, inner_t, &mut rng))
+        .map(|k| dkg::Dealer::new(k, inner_t, &mut rng).unwrap())
         .collect();
     let commitments_b: Vec<&DealerCommitment<Point>> =
         dealers_b.iter().map(|d| d.commitment()).collect();
@@ -118,11 +118,11 @@ fn main() {
         let mut agg_a: dkg::Aggregator<Point> = dkg::Aggregator::all_dealers(k, inner_n).unwrap();
         let mut agg_b: dkg::Aggregator<Point> = dkg::Aggregator::all_dealers(k, inner_n).unwrap();
         for dealer in &dealers_a {
-            let sub = dealer.generate_subshare(k);
+            let sub = dealer.generate_subshare(k).unwrap();
             agg_a.add_subshare(sub, commitments_a[(dealer.index() - 1) as usize]).unwrap();
         }
         for dealer in &dealers_b {
-            let sub = dealer.generate_subshare(k);
+            let sub = dealer.generate_subshare(k).unwrap();
             agg_b.add_subshare(sub, commitments_b[(dealer.index() - 1) as usize]).unwrap();
         }
         if k == 1 {
@@ -178,11 +178,11 @@ fn main() {
     println!("  f₃(2) sent to seller (reconstructed by 3 holders)");
 
     // 3b: buyer computes f₁(3) and Shamir-splits among inner holders
-    let f1_at_3 = buyer_dealer.generate_subshare(3);
+    let f1_at_3 = buyer_dealer.generate_subshare(3).unwrap();
     let f1_at_3_shares = shamir_split_scalar(f1_at_3.value(), inner_n, inner_t, &mut rng);
 
     // seller computes f₂(3) and Shamir-splits among inner holders
-    let f2_at_3 = seller_dealer.generate_subshare(3);
+    let f2_at_3 = seller_dealer.generate_subshare(3).unwrap();
     let f2_at_3_shares = shamir_split_scalar(f2_at_3.value(), inner_n, inner_t, &mut rng);
 
     println!("  buyer  Shamir-split f₁(3) into {} shares (threshold {})", inner_n, inner_t);
@@ -198,7 +198,7 @@ fn main() {
         let pi_1_k = f1_at_3_shares[k].1;         // Shamir share of f₁(3)
         let pi_2_k = f2_at_3_shares[k].1;         // Shamir share of f₂(3)
         let sigma_k = tau_k + pi_1_k + pi_2_k;    // Shamir share of s₃
-        escrow_shares.push(SecretShare::new((k + 1) as u32, sigma_k));
+        escrow_shares.push(SecretShare::new((k + 1) as u32, sigma_k).unwrap());
     }
 
     println!("  each holder computed σₖ = (αₖ + 3·βₖ) + π₁,ₖ + π₂,ₖ");
@@ -211,17 +211,17 @@ fn main() {
     println!("--- key derivation ---");
 
     // Buyer's outer share: s₁ = f₁(1) + f₂(1) + f₃(1)
-    let f1_at_1 = buyer_dealer.generate_subshare(1);
-    let f2_at_1 = seller_dealer.generate_subshare(1);
+    let f1_at_1 = buyer_dealer.generate_subshare(1).unwrap();
+    let f2_at_1 = seller_dealer.generate_subshare(1).unwrap();
     let s1 = *f1_at_1.value() + *f2_at_1.value() + f3_at_1;
 
     // Seller's outer share: s₂ = f₁(2) + f₂(2) + f₃(2)
-    let f1_at_2 = buyer_dealer.generate_subshare(2);
-    let f2_at_2 = seller_dealer.generate_subshare(2);
+    let f1_at_2 = buyer_dealer.generate_subshare(2).unwrap();
+    let f2_at_2 = seller_dealer.generate_subshare(2).unwrap();
     let s2 = *f1_at_2.value() + *f2_at_2.value() + f3_at_2;
 
-    let buyer_share = SecretShare::new(1, s1);
-    let seller_share = SecretShare::new(2, s2);
+    let buyer_share = SecretShare::new(1, s1).unwrap();
+    let seller_share = SecretShare::new(2, s2).unwrap();
 
     // Group public key: Y = g^{f₁(0)} · g^{f₂(0)} · g^{f₃(0)}
     // g^{f₁(0)} from buyer's commitment, g^{f₂(0)} from seller's, g^{f₃(0)} = g^{a₃}
@@ -232,8 +232,8 @@ fn main() {
 
     // Escrow's public verification share: Y₃ = g^{s₃}
     // We can compute this from outer polynomial commitments evaluated at 3
-    let y3_verify = buyer_dealer.commitment().evaluate_at(3)
-        .add(&seller_dealer.commitment().evaluate_at(3))
+    let y3_verify = buyer_dealer.commitment().evaluate_at(3).unwrap()
+        .add(&seller_dealer.commitment().evaluate_at(3).unwrap())
         .add(&a3_pubkey.add(&b3_pubkey.mul_scalar(&three))); // g^{a₃+3·b₃}
 
     // Outer verification shares for FROST
@@ -317,7 +317,7 @@ fn main() {
     println!("  escrow D₃ = Σ D₃,ₖ  (relay summed {} commitments)", inner_active.len());
 
     // 5b: outer FROST round 1 — buyer commits normally
-    let (buyer_nonces, buyer_commitments) = frost::commit::<Point, _>(1, &mut rng);
+    let (buyer_nonces, buyer_commitments) = frost::commit::<Point, _>(1, &mut rng).unwrap();
 
     // Build the outer signing package manually
     // We need escrow's commitments as a SigningCommitments struct

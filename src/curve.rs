@@ -20,12 +20,17 @@ pub trait OsstScalar: Clone + Debug + Sized + PartialEq + Send + Sync {
     ///
     /// # Security
     ///
-    /// This method MUST overwrite the scalar's internal representation.
-    /// Default implementation sets self to zero(), which may not actually
-    /// overwrite the original bytes in all implementations.
-    fn zeroize(&mut self) {
-        *self = Self::zero();
-    }
+    /// This method MUST overwrite the scalar's internal representation, and
+    /// has no default: until 0.4.0 the default was a plain `*self =
+    /// Self::zero()`, which three of the four backends inherited (Z-1). That
+    /// is a non-volatile assignment to a value the compiler can see is dead in
+    /// every `Drop` impl that calls it, so it is entitled to elide the store —
+    /// on the pallas (Zcash) and decaf377 (Penumbra) backends, i.e. the two
+    /// that carry value.
+    ///
+    /// Implement with `zeroize::Zeroize` where the backend's scalar provides
+    /// it, or with a volatile write plus a compiler fence.
+    fn zeroize(&mut self);
     /// The zero element
     fn zero() -> Self;
 
@@ -258,6 +263,13 @@ pub mod pallas {
     };
 
     impl OsstScalar for Scalar {
+        fn zeroize(&mut self) {
+            // Volatile so the compiler may not elide the store as dead: every
+            // caller is a `Drop` impl, where it provably is (Z-1).
+            unsafe { core::ptr::write_volatile(self, Self::zero()) };
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+
         fn zero() -> Self {
             Scalar::ZERO
         }
@@ -469,6 +481,13 @@ pub mod secp256k1 {
     };
 
     impl OsstScalar for Scalar {
+        fn zeroize(&mut self) {
+            // Volatile so the compiler may not elide the store as dead: every
+            // caller is a `Drop` impl, where it provably is (Z-1).
+            unsafe { core::ptr::write_volatile(self, Self::zero()) };
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+
         fn zero() -> Self {
             Scalar::ZERO
         }
@@ -615,6 +634,13 @@ pub mod decaf377 {
     use ::decaf377::{Element, Fr};
 
     impl OsstScalar for Fr {
+        fn zeroize(&mut self) {
+            // Volatile so the compiler may not elide the store as dead: every
+            // caller is a `Drop` impl, where it provably is (Z-1).
+            unsafe { core::ptr::write_volatile(self, Self::zero()) };
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+
         fn zero() -> Self {
             Fr::ZERO
         }

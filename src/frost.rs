@@ -421,8 +421,10 @@ fn compute_challenge<P: OsstPoint>(
 pub fn commit<P: OsstPoint, R: rand_core::RngCore + rand_core::CryptoRng>(
     index: u32,
     rng: &mut R,
-) -> (Nonces<P::Scalar>, SigningCommitments<P>) {
-    assert!(index > 0, "signer index must be 1-indexed");
+) -> Result<(Nonces<P::Scalar>, SigningCommitments<P>), OsstError> {
+    if index == 0 {
+        return Err(OsstError::InvalidIndex);
+    }
 
     let hiding = P::Scalar::random(rng);
     let binding = P::Scalar::random(rng);
@@ -433,7 +435,7 @@ pub fn commit<P: OsstPoint, R: rand_core::RngCore + rand_core::CryptoRng>(
         binding: P::generator().mul_scalar(&binding),
     };
 
-    (Nonces { hiding, binding }, commitments)
+    Ok((Nonces { hiding, binding }, commitments))
 }
 
 /// Round 2: produce a signature share.
@@ -481,9 +483,22 @@ pub fn sign<P: OsstPoint>(
     share: &SecretShare<P::Scalar>,
     group_pubkey: &P,
 ) -> Result<SignatureShare<P::Scalar>, OsstError> {
-    // verify our index is in the signing set
-    if package.get_commitments(share.index).is_none() {
-        return Err(OsstError::InvalidIndex);
+    // verify our index is in the signing set, and that the commitment the
+    // package carries under it is the one these nonces produced (F-1).
+    //
+    // Without this the coordinator chooses the binding factor an honest signer
+    // applies to its own binding nonce while holding the hiding nonce fixed.
+    // One session is one equation in three unknowns, so it is not by itself an
+    // extraction — but it becomes one for any signer whose nonce state
+    // survives a process restart, and it is a cheap, standard invariant that
+    // ZF `frost-core` enforces as `Error::IncorrectCommitment`.
+    let mine = package
+        .get_commitments(share.index)
+        .ok_or(OsstError::InvalidIndex)?;
+    if mine.hiding != P::generator().mul_scalar(&nonces.hiding)
+        || mine.binding != P::generator().mul_scalar(&nonces.binding)
+    {
+        return Err(OsstError::UnexpectedCommitment);
     }
 
     // binding factor for this signer
@@ -637,7 +652,7 @@ mod tests {
                     y += coeff * x_pow;
                     x_pow *= x;
                 }
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
@@ -663,7 +678,7 @@ mod tests {
         let mut all_nonces = Vec::new();
         let mut all_commitments = Vec::new();
         for share in &shares[0..t as usize] {
-            let (nonces, commitments) = commit::<RistrettoPoint, _>(share.index, &mut rng);
+            let (nonces, commitments) = commit::<RistrettoPoint, _>(share.index, &mut rng).expect("index is 1-indexed by construction");
             all_nonces.push(nonces);
             all_commitments.push(commitments);
         }
@@ -727,7 +742,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &active {
-            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng);
+            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
@@ -770,7 +785,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &shares[0..3] {
-            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng);
+            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
@@ -811,7 +826,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &shares[0..3] {
-            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng);
+            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
@@ -850,7 +865,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &shares[0..2] {
-            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng);
+            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
@@ -897,7 +912,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &shares[0..3] {
-            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng);
+            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
@@ -934,8 +949,8 @@ mod tests {
     #[test]
     fn test_frost_duplicate_commitments_rejected() {
         let mut rng = OsRng;
-        let (_, c1) = commit::<RistrettoPoint, _>(1, &mut rng);
-        let (_, c2) = commit::<RistrettoPoint, _>(1, &mut rng); // same index
+        let (_, c1) = commit::<RistrettoPoint, _>(1, &mut rng).expect("index is 1-indexed by construction");
+        let (_, c2) = commit::<RistrettoPoint, _>(1, &mut rng).expect("index is 1-indexed by construction"); // same index
         let result =
             SigningPackage::<RistrettoPoint>::new(b"test".to_vec(), vec![c1, c2]);
         assert!(matches!(result, Err(OsstError::DuplicateIndex(1))));
@@ -966,7 +981,7 @@ mod pallas_tests {
                     y += coeff * x_pow;
                     x_pow *= x;
                 }
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
@@ -987,7 +1002,7 @@ mod pallas_tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &shares[0..t as usize] {
-            let (nonces, commitments) = commit::<Point, _>(s.index, &mut rng);
+            let (nonces, commitments) = commit::<Point, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(nonces);
             commitments_vec.push(commitments);
         }
@@ -1023,7 +1038,7 @@ mod pallas_tests {
 
         // DKG
         let dealers: Vec<dkg::Dealer<Point>> =
-            (1..=n).map(|i| dkg::Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| dkg::Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let commitments: Vec<&crate::reshare::DealerCommitment<Point>> =
             dealers.iter().map(|d| d.commitment()).collect();
@@ -1035,7 +1050,7 @@ mod pallas_tests {
         for j in 1..=n {
             let mut agg: dkg::Aggregator<Point> = dkg::Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
-                let subshare = dealer.generate_subshare(j);
+                let subshare = dealer.generate_subshare(j).expect("index is 1-indexed by construction");
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
@@ -1043,7 +1058,7 @@ mod pallas_tests {
             if group_key.is_none() {
                 group_key = Some(agg.derive_group_key().unwrap());
             }
-            let ss = SecretShare::new(j, share_scalar);
+            let ss = SecretShare::new(j, share_scalar).expect("index is 1-indexed by construction");
             vshares.insert(j, Point::generator().mul_scalar(ss.scalar()));
             secret_shares.push(ss);
         }
@@ -1057,7 +1072,7 @@ mod pallas_tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in active {
-            let (n, c) = commit::<Point, _>(s.index, &mut rng);
+            let (n, c) = commit::<Point, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
