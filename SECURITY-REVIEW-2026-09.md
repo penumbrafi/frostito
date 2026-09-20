@@ -22,7 +22,21 @@ All are `#[ignore]`d with their finding id so CI stays green; run with
 `cargo test -- --ignored`. Two conventions are mixed and each test says which
 it uses: the nested PoCs assert *the attack succeeds* (they pass when run); the
 ElGamal, `frost::sign` and liveness PoCs assert *the property that should hold*
-(they fail when run). Existing suite: 63/63 pass, unchanged by this branch.
+(they fail when run).
+
+Test suites as found:
+
+- `osst`, default features (`ristretto255` + `std`): **63/63 pass**, unchanged by
+  this branch. The `pallas` and `decaf377` suites and the `reddsa` cross-test
+  were not exercised (the last needs a network fetch).
+- `zcli -p frost-spend`: **38/38 pass**, including
+  `frostito_v2_equals_flat_frost_signer` and
+  `dkg_2of3_completes_with_sealed_round2`.
+- `ghettobox-vault-pvm`: does not build offline (an unrelated `polkavm-linker` →
+  `regalloc2` fetch). Note for the record that it depends on a **vendored `osst`
+  0.1.1** at `zeratul/crates/osst`, not on frostito 0.3.0 — which is why
+  `recovery.rs` can reach `share.scalar` as a field. Findings E-1..E-3 are about
+  the construction and hold regardless of which osst it links.
 
 ---
 
@@ -36,14 +50,14 @@ ElGamal, `frost::sign` and liveness PoCs assert *the property that should hold*
 | W-1 | **High** | zcli `frostito_sign_v2` | Same as N-1, and worse: no `from_outer` equivalent exists at all |
 | E-1 | **High** | zeratul ElGamal | Partial decryptions carry no DLEQ; the OSST proof says nothing about `R^{x_i}` |
 | E-2 | **High** | zeratul ElGamal | OSST payload does not commit to the ciphertext — providers are a threshold CDH oracle |
-| R-1 | **High** | `osst::redpallas` | The Zcash/Orchard nested path still ships the v1 construction, unmarked |
+| R-1 | Medium | `osst::redpallas` | The Zcash/Orchard nested path still ships the v1 construction, unmarked |
 | C-1 | **High** (secp only) | `osst::curve::secp256k1` | `compress()` drops the y parity: not a round trip, and `P`/`−P` collide in every hash |
 | N-2 | Medium | `osst::nested` v2 | No API binds the outer package's nested commitment to the inner commitment round |
 | W-2 | Medium | zcli weighted | `FrostitoCommitment.weight` is self-asserted and drives the threshold check |
 | W-3 | Medium | zcli weighted | No invariant that any single validator's weight is below the threshold |
 | E-3 | Medium | zeratul ElGamal | Unauthenticated XOR-stream payload encoding; KDF omits `R` and `Y` |
 | L-1 | Medium | `osst::liveness` | Schnorr challenge omits the public key — related-key malleability |
-| K-1 | Medium | `osst::dkg` | No proof of knowledge of the constant term (RFC 9591 §5.1); `DkgState` has no complaint round |
+| K-1 | Medium | `osst::dkg` | No proof of knowledge of the constant term (Komlo–Goldberg SAC 2020 §5.1); `DkgState` has no complaint round |
 | F-1 | Low | `osst::frost` | `sign()` does not check the package's commitment for its own index |
 | N-3 | Low | `osst::nested` v2 | `aggregate_inner_shares_verified` does not require quorum coverage or reject duplicates |
 | N-4 | Low | `osst::nested` | `interleaved_dkg` is a single-process simulation, not a distributed protocol |
@@ -78,7 +92,7 @@ share `sigma_out`. The outer share never exists as one scalar.
 **Signing (v2).**
 
 1. Round 0: each holder publishes `H(k ‖ D_k ‖ E_k)` (`inner_precommit`,
-   `src/nested.rs:1185`), then reveals `(D_k, E_k)` (`inner_commit`,
+   `src/nested.rs:1188`), then reveals `(D_k, E_k)` (`inner_commit`,
    `src/nested.rs:255`).
 2. `aggregate_inner_commitment_pair` (`src/nested.rs:1226`) returns
    `D_nested = Σ D_k`, `E_nested = Σ E_k`. This **pair** is presented to the
@@ -242,8 +256,8 @@ guarantee and the crate is honest that it does not survive a process boundary
 For nested v2 this matters more than for flat FROST, because the nested
 position's nonce is `Σ` of `t_in` holders' nonces: a single holder that restores
 persisted state and signs twice under two different `(rho, c)` pairs yields
-`z¹ − z² = (rho¹ − rho²)e_k + (w¹ − w²)sigma_k`, two equations in three unknowns
-after one more replay. Recommend a durable spent-round store keyed by
+`z¹ − z² = (rho¹ − rho²)e_k + (w¹ − w²)sigma_k`, one equation in `(e_k, sigma_k)`;
+a third signing under the same nonce solves it. Recommend a durable spent-round store keyed by
 `(epoch, session_id, holder_index)`, checked before `inner_sign_v2` returns, and
 an explicit `session_id` field in the package that enters the binding factor.
 
@@ -253,7 +267,7 @@ Correct, and the absence of a distinct v2 tag is by design. v2's binding factor
 *is* plain FROST's `"frost-binding-v1"` (`src/frost.rs:362`) — that identity is
 what makes the position equal a flat signer. v1's inner factor is
 `"frostito-inner-bind"` (`src/nested.rs:285`) and the precommit is
-`"frostito-inner-precommit-v2"` (`src/nested.rs:1187`). No collisions.
+`"frostito-inner-precommit-v2"` (`src/nested.rs:1190`). No collisions.
 
 The residual risk is version confusion, not hash collision: v1's
 `aggregate_inner_commitments` and `inner_sign` are still exported with only a
@@ -281,8 +295,11 @@ than documenting "callers MUST".
 ### 1.8 (f) K-1 (Medium) — rogue key and bias in the DKG
 
 `dkg::Dealer::new` (`src/dkg.rs:55`) publishes a Feldman commitment and no proof
-of knowledge of `a_0`. RFC 9591 §5.1 requires a Schnorr PoK over the constant
-term in round 1.
+of knowledge of `a_0`. Komlo–Goldberg (SAC 2020) §5.1, KeyGen Round 1 step 2,
+requires a Schnorr PoK over the constant term; ZF `frost-core` implements it —
+`keys::dkg::part1` puts a `proof_of_knowledge` in the `round1::Package`. (RFC
+9591 itself specifies no DKG; its only key-generation text is the trusted-dealer
+construction in Appendix C.)
 
 Full key takeover is blocked here: `Aggregator::add_subshare`
 (`src/dkg.rs:203`) verifies every sub-share against its commitment, and
@@ -301,7 +318,7 @@ picks `C_{n,0}` as a target point cannot then deal. But two gaps remain:
   on-chain commitments *before* round 2 completes, a dealer that never delivers
   valid sub-shares still moves `Y`.
 
-**Fix.** Add the RFC 9591 PoK to `DealerCommitment` and verify it in
+**Fix.** Add the Komlo–Goldberg PoK to `DealerCommitment` and verify it in
 `submit_commitment`; add a complaint/disqualification path to `DkgState`.
 
 ### 1.9 N-3, N-4 (Low)
@@ -529,10 +546,11 @@ then interpolates the partials, which were never checked at all.
 
 A single provider therefore substitutes any point for its partial, passes
 verification, and corrupts the recovered shared secret — undetectably, and
-unattributably, since OSST verification is share-free (§1.10). Because the
-corruption is a *known* offset (`partial'_i = partial_i + delta·G` shifts the
-result by `lambda_i·delta·G`), a provider that can observe whether decryption
-succeeded also recovers the true shared secret from the corrupted one.
+unattributably, since OSST verification is share-free (§1.10). The corruption is also a *known* offset — `partial'_i = partial_i + delta·G`
+shifts the result by `lambda_i·delta·G` — so a provider that gets to see the
+combiner's output point recovers the true shared secret from the corrupted one.
+E-1 stands on integrity and attribution alone; that is an additional consequence
+where the output is visible.
 
 PoC: `tests/audit_threshold_elgamal.rs::corrupted_partial_decryption_is_accepted`.
 
@@ -681,7 +699,7 @@ signature, because it is the case where the mechanism silently does not apply.
 
 ## 5. Other findings in osst 0.3.0
 
-### 5.1 R-1 (High) — the RedPallas nested path is still v1
+### 5.1 R-1 (Medium) — the RedPallas nested path is still v1
 
 `src/redpallas.rs:624`, `nested_redpallas_sign`. At `:670`:
 
@@ -700,9 +718,18 @@ BLAKE2b inner binding factor (`redpallas_inner_binding_factor`, `:596`) with the
 same structure as v1's.
 
 It carries **no** deprecation notice, no `⚠️ INSECURE` banner — unlike
-`nested::aggregate_inner_commitments`, which does — and it is the
-Zcash/Orchard-compatible path, i.e. the one closest to mainnet value. The v2
-migration stopped at the generic module.
+`nested::aggregate_inner_commitments`, which does — and it sits in `pub mod
+zcash` (`src/redpallas.rs:29`) under the `pallas` feature, exported rather than
+test-gated. The v2 migration stopped at the generic module.
+
+Graded Medium rather than High because the function cannot be deployed
+distributed as written: it takes `&JuryNetwork`, which holds every `node_shares`
+entry, and drives the whole inner round in one process — the same class of
+single-process helper as `interleaved_dkg` (N-4), and the same limitation
+SECURITY-nested-frost.md §5 already records for `LocalJury`. What makes it a
+finding anyway is that it is an exported, unmarked v1 construction in the
+ciphersuite closest to mainnet value, and the obvious next step for anyone
+reading it is to distribute the jury.
 
 **Fix.** Either port `nested_redpallas_sign` to the v2 pair-presentation shape
 (the RedPallas `SigningPackage` already exposes `binding_factor`, `:141`), or
@@ -996,10 +1023,13 @@ gets the same thing.
 (`src/nested.rs:105`) runs one inner DKG per outer polynomial coefficient, so
 each dealer emits `outer_t` sub-shares per recipient instead of one. narsild's
 `DkgSubshareMsg` carries `coeff_index` precisely because of this. The wire
-therefore carries `outer_t` independent polynomials' worth of evaluations, and
-recovering all of them yields not just one inner secret but every coefficient of
-the *outer* polynomial — i.e. the outer group key, not only the nested
-position's share.
+therefore carries `outer_t` independent polynomials' worth of evaluations.
+Recovering all of them yields every coefficient of `f_p`, the nested position's
+*dealing* polynomial in the outer DKG — hence `f_p(0)`, position `p`'s additive
+contribution to the outer secret, and `f_p(j)` for every other outer participant
+`j`: position `p`'s entire outer dealing, including the sub-shares it sent to
+everyone else. That is strictly worse than losing one inner secret; it is not the
+outer group key unless `p` is the only outer dealer.
 
 ### 6.3 D-2 (High) — no sender authentication anywhere in the ceremony
 
@@ -1134,8 +1164,8 @@ and well-understood one.
 The v2 nested construction is the right fix for the v1 gap and the flat-signer
 equivalence is real. Three things should not ship in this state:
 
-- **R-1** — the RedPallas path still contains v1, unmarked, and it is the path
-  nearest to mainnet value.
+- **R-1** — the RedPallas path still contains v1, unmarked, in the ciphersuite
+  nearest to mainnet value (single-process as written, hence Medium).
 - **N-1** — the v2 API asks an inner holder to sign three scalars, which is
   weaker message binding than v1 offered. It is the single highest-value fix in
   this report and it also fixes W-1.
