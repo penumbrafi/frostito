@@ -427,6 +427,50 @@ mod tests {
 
     type Point = RistrettoPoint;
 
+    /// `from_outer` must reproduce, exactly, the derivation every call site
+    /// was hand-rolling — otherwise inner shares silently fail to verify.
+    #[test]
+    fn from_outer_matches_the_hand_rolled_derivation() {
+        let mut rng = OsRng;
+        let msg = b"outer context derivation";
+
+        let secret = <Scalar as OsstScalar>::random(&mut rng);
+        let group_pubkey = <Point as OsstPoint>::generator().mul_scalar(&secret);
+
+        let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng);
+        let (_, commits_2) = frost::commit::<Point, _>(2, &mut rng);
+        let package =
+            frost::SigningPackage::new(msg.to_vec(), vec![commits_1, commits_2]).unwrap();
+
+        // hand-rolled, as jury.rs / escrow.rs do it today
+        let rho_2 = package.binding_factor(2);
+        let r_outer = package.group_commitment();
+        let challenge = package.challenge(&r_outer, &group_pubkey);
+        let indices = package.signer_indices();
+        let outer_lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
+        let pos_2 = indices.iter().position(|&i| i == 2).unwrap();
+
+        let derived = InnerSigningParamsV2::from_outer::<Point>(&package, &group_pubkey, 2).unwrap();
+
+        assert_eq!(derived.outer_binding, rho_2);
+        assert_eq!(derived.outer_challenge, challenge);
+        assert_eq!(derived.outer_lambda, outer_lagrange[pos_2]);
+
+        // position 1 gets a different context, as it must
+        let derived_1 =
+            InnerSigningParamsV2::from_outer::<Point>(&package, &group_pubkey, 1).unwrap();
+        assert_ne!(derived_1.outer_binding, derived.outer_binding);
+        assert_ne!(derived_1.outer_lambda, derived.outer_lambda);
+        // the challenge is a property of the session, not the position
+        assert_eq!(derived_1.outer_challenge, derived.outer_challenge);
+
+        // an index outside the outer signing set has no context at all
+        assert!(matches!(
+            InnerSigningParamsV2::from_outer::<Point>(&package, &group_pubkey, 7),
+            Err(OsstError::InvalidIndex)
+        ));
+    }
+
     /// THE property that makes v2 reviewable: a nested position is
     /// indistinguishable from a flat FROST signer.
     ///
@@ -1202,6 +1246,44 @@ pub struct InnerSigningParamsV2<S: OsstScalar> {
     pub outer_challenge: S,
     /// outer lagrange coefficient for the nested position
     pub outer_lambda: S,
+}
+
+impl<S: OsstScalar> InnerSigningParamsV2<S> {
+    /// Derive the nested position's outer context from public data alone.
+    ///
+    /// This is the constructor every inner holder should use. All three fields
+    /// come out of the outer [`SigningPackage`](crate::frost::SigningPackage)
+    /// and the group public key, both of which the holder already has, so a
+    /// coordinator never gets to *assert* the challenge, binding factor or
+    /// Lagrange coefficient — it can only distribute commitments, and any
+    /// tampering shows up as a share that fails
+    /// [`verify_inner_share`](crate::nested::verify_inner_share).
+    ///
+    /// `nested_index` is the nested position's index in the OUTER signing set.
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::InvalidIndex`] if `nested_index` is not one of the outer
+    /// package's signers.
+    pub fn from_outer<P: OsstPoint<Scalar = S>>(
+        package: &crate::frost::SigningPackage<P>,
+        group_pubkey: &P,
+        nested_index: u32,
+    ) -> Result<Self, OsstError> {
+        let indices = package.signer_indices();
+        let pos = indices
+            .iter()
+            .position(|&i| i == nested_index)
+            .ok_or(OsstError::InvalidIndex)?;
+        let lagrange = compute_lagrange_coefficients::<S>(&indices)?;
+        let group_commitment = package.group_commitment();
+
+        Ok(Self {
+            outer_binding: package.binding_factor(nested_index),
+            outer_challenge: package.challenge(&group_commitment, group_pubkey),
+            outer_lambda: lagrange[pos].clone(),
+        })
+    }
 }
 
 /// Inner holder's partial signature under v2.
