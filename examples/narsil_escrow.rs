@@ -57,15 +57,15 @@ fn main() {
     let mut outer_group_key = Point::identity();
 
     for j in 1..=outer_n {
-        let mut agg: dkg::Aggregator<Point> = dkg::Aggregator::new(j);
+        let mut agg: dkg::Aggregator<Point> = dkg::Aggregator::all_dealers(j, outer_n).unwrap();
         for dealer in &outer_dealers {
             let subshare = dealer.generate_subshare(j);
             agg.add_subshare(subshare, outer_commitments[(dealer.index() - 1) as usize])
                 .unwrap();
         }
-        let share_scalar = agg.finalize(outer_n).unwrap();
+        let share_scalar = agg.finalize().unwrap();
         if j == 1 {
-            outer_group_key = agg.derive_group_key();
+            outer_group_key = agg.derive_group_key().unwrap();
         }
         let ss = SecretShare::new(j, share_scalar);
         outer_vshares.insert(j, Point::generator().mul_scalar(ss.scalar()));

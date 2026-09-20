@@ -64,7 +64,7 @@ pub use types::*;
 pub use curve::ristretto::Ristretto255;
 
 #[cfg(feature = "pallas")]
-pub use curve::pallas::PallasCurve;
+pub use curve::pallas::{OrchardSpendAuthCurve, PallasCurve};
 
 #[cfg(feature = "secp256k1")]
 pub use curve::secp256k1::Secp256k1Curve;
@@ -453,7 +453,6 @@ mod pallas_tests {
     use super::*;
     use pasta_curves::group::ff::Field;
     use pasta_curves::pallas::{Point, Scalar};
-    use crate::test_rng::OsRng10;
     use rand::rngs::OsRng;
 
     use crate::curve::OsstPoint;
@@ -463,10 +462,11 @@ mod pallas_tests {
         assert!(t <= n);
         assert!(t > 0);
 
+        let mut rng = OsRng;
 
         let mut coeffs = vec![*secret];
         for _ in 1..t {
-            coeffs.push(<Scalar as Field>::random(&mut OsRng10));
+            coeffs.push(<Scalar as crate::curve::OsstScalar>::random(&mut rng));
         }
 
         (1..=n)
@@ -489,7 +489,7 @@ mod pallas_tests {
     fn test_pallas_basic_osst() {
         let mut rng = OsRng;
 
-        let secret = <Scalar as Field>::random(&mut OsRng10);
+        let secret = <Scalar as crate::curve::OsstScalar>::random(&mut rng);
         let group_pubkey: Point = Point::generator().mul_scalar(&secret);
 
         let n = 5u32;
@@ -512,7 +512,7 @@ mod pallas_tests {
     fn test_pallas_wrong_payload() {
         let mut rng = OsRng;
 
-        let secret = <Scalar as Field>::random(&mut OsRng10);
+        let secret = <Scalar as crate::curve::OsstScalar>::random(&mut rng);
         let group_pubkey: Point = Point::generator().mul_scalar(&secret);
 
         let n = 5u32;
@@ -539,7 +539,7 @@ mod pallas_tests {
     fn test_pallas_serialization() {
         let mut rng = OsRng;
 
-        let secret = <Scalar as Field>::random(&mut OsRng10);
+        let secret = <Scalar as crate::curve::OsstScalar>::random(&mut rng);
         let shares = shamir_split(&secret, 3, 2);
 
         let payload = b"pallas serialization test";

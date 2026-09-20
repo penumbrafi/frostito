@@ -1041,7 +1041,6 @@ mod tests {
     use crate::SecretShare;
     use pasta_curves::group::ff::Field;
     use pasta_curves::pallas::{Point, Scalar};
-    use crate::test_rng::OsRng10;
     use rand::rngs::OsRng;
     use crate::curve::OsstPoint;
 
@@ -1050,7 +1049,7 @@ mod tests {
         let mut rng = OsRng;
 
         // manual Shamir split for testing
-        let secret = <Scalar as Field>::random(&mut OsRng10);
+        let secret = <Scalar as crate::curve::OsstScalar>::random(&mut rng);
         let group_pubkey: Point = Point::generator().mul_scalar(&secret);
 
         let n = 3u32;
@@ -1086,7 +1085,7 @@ mod tests {
     #[test]
     fn test_redpallas_frost_wrong_message_fails() {
         let mut rng = OsRng;
-        let secret = <Scalar as Field>::random(&mut OsRng10);
+        let secret = <Scalar as crate::curve::OsstScalar>::random(&mut rng);
         let group_pubkey: Point = Point::generator().mul_scalar(&secret);
 
         let shares = test_shamir_split(&secret, 3, 2);
@@ -1490,9 +1489,10 @@ mod tests {
     // test helper
     fn test_shamir_split(secret: &Scalar, n: u32, t: u32) -> Vec<SecretShare<Scalar>> {
         use crate::curve::OsstScalar;
+        let mut rng = OsRng;
         let mut coeffs = vec![*secret];
         for _ in 1..t {
-            coeffs.push(<Scalar as Field>::random(&mut OsRng10));
+            coeffs.push(<Scalar as crate::curve::OsstScalar>::random(&mut rng));
         }
         (1..=n)
             .map(|i| {

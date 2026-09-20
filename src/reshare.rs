@@ -341,6 +341,90 @@ impl<P: OsstPoint> core::fmt::Debug for Dealer<P> {
 }
 
 // ============================================================================
+// Reshared polynomial (public key package for the new epoch)
+// ============================================================================
+
+/// The reshared polynomial in the exponent: `F' = Σ_{i∈S} λ_i^S · C_i`,
+/// summed coefficient-wise over the agreed dealer set `S`.
+///
+/// `F'(0)` is the (invariant) group key and `F'(j)` is the verifying share of
+/// new player `j`. Every new player derives the same `F'` because `S` is fixed
+/// before aggregation, so this is the epoch's public key package: what a FROST
+/// coordinator needs to verify partial signatures and identify a faulty
+/// signer by index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SharePolynomial<P: OsstPoint> {
+    coefficients: Vec<P>,
+}
+
+impl<P: OsstPoint> SharePolynomial<P> {
+    /// Threshold (degree + 1) of the reshared polynomial
+    #[inline]
+    pub fn threshold(&self) -> u32 {
+        self.coefficients.len() as u32
+    }
+
+    #[inline]
+    pub fn coefficients(&self) -> &[P] {
+        &self.coefficients
+    }
+
+    /// Group public key `Y = F'(0)`
+    #[inline]
+    pub fn group_key(&self) -> &P {
+        &self.coefficients[0]
+    }
+
+    /// Evaluate `F'(index)` with Horner's method
+    pub fn evaluate_at(&self, index: u32) -> P {
+        assert!(index > 0, "index must be 1-indexed");
+        let x = P::Scalar::from_u32(index);
+        let mut result = P::identity();
+        for coeff in self.coefficients.iter().rev() {
+            result = result.mul_scalar(&x);
+            result = result.add(coeff);
+        }
+        result
+    }
+
+    /// Verifying share of player `j`: `Y_j = F'(j) = g^{s'_j}`
+    #[inline]
+    pub fn verifying_share(&self, player_index: u32) -> P {
+        self.evaluate_at(player_index)
+    }
+
+    /// Check that `share` is player `j`'s share on this polynomial
+    pub fn verify_share(&self, player_index: u32, share: &P::Scalar) -> bool {
+        if player_index == 0 {
+            return false;
+        }
+        P::generator().mul_scalar(share) == self.evaluate_at(player_index)
+    }
+
+    /// Serialize as concatenated compressed points
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 * self.coefficients.len());
+        for c in &self.coefficients {
+            buf.extend_from_slice(&c.compress());
+        }
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8], threshold: u32) -> Result<Self, OsstError> {
+        let expected = 32 * threshold as usize;
+        if threshold == 0 || bytes.len() != expected {
+            return Err(OsstError::InvalidCommitment);
+        }
+        let mut coefficients = Vec::with_capacity(threshold as usize);
+        for chunk in bytes.chunks_exact(32) {
+            let arr: [u8; 32] = chunk.try_into().unwrap();
+            coefficients.push(P::decompress(&arr).ok_or(OsstError::InvalidCommitment)?);
+        }
+        Ok(Self { coefficients })
+    }
+}
+
+// ============================================================================
 // Aggregator (New Custodian)
 // ============================================================================
 
@@ -350,32 +434,70 @@ struct VerifiedSubShare<S: OsstScalar> {
     value: S,
 }
 
-/// Aggregator collects and combines sub-shares
+/// Aggregator collects and combines sub-shares from a **fixed** dealer set.
 ///
-/// Designed for async collection - sub-shares can arrive in any order.
+/// The dealer set `S` must be agreed by every new player before anyone
+/// aggregates (for example by a signed epoch manifest). Two players who
+/// combine sub-shares from different dealer subsets end up on different
+/// polynomials with the same constant term: the group-key check passes for
+/// each of them and signing later fails with nobody to blame. Making `S` an
+/// input rather than an observation is what prevents that.
+///
+/// Sub-shares can still arrive in any order; the aggregator only refuses
+/// dealers outside `S` and refuses to finalize until all of `S` has arrived.
 pub struct Aggregator<P: OsstPoint> {
     player_index: u32,
-    /// Verified sub-shares from dealers
+    /// Agreed dealer set, sorted ascending, no duplicates
+    dealer_set: Vec<u32>,
+    /// Verified sub-shares from dealers in `dealer_set`
     subshares: Vec<VerifiedSubShare<P::Scalar>>,
-    /// Dealer commitments (for group key derivation)
+    /// Dealer commitments (for polynomial / group key derivation)
     commitments: Vec<DealerCommitment<P>>,
     _marker: PhantomData<P>,
 }
 
 impl<P: OsstPoint> Aggregator<P> {
-    pub fn new(player_index: u32) -> Self {
-        assert!(player_index > 0, "player index must be 1-indexed");
-        Self {
+    /// Create an aggregator for `player_index` that will combine sub-shares
+    /// from exactly the dealers in `dealer_set`.
+    ///
+    /// `dealer_set` is normally the `t_old` dealers named by the epoch
+    /// manifest. Any size ≥ `t_old` is mathematically fine as long as every
+    /// player uses the same set.
+    pub fn new(player_index: u32, dealer_set: &[u32]) -> Result<Self, OsstError> {
+        if player_index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        if dealer_set.is_empty() {
+            return Err(OsstError::EmptyContributions);
+        }
+        let mut sorted = dealer_set.to_vec();
+        sorted.sort_unstable();
+        for w in sorted.windows(2) {
+            if w[0] == w[1] {
+                return Err(OsstError::DuplicateIndex(w[0]));
+            }
+        }
+        if sorted[0] == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        Ok(Self {
             player_index,
+            dealer_set: sorted,
             subshares: Vec::new(),
             commitments: Vec::new(),
             _marker: PhantomData,
-        }
+        })
     }
 
     #[inline]
     pub fn player_index(&self) -> u32 {
         self.player_index
+    }
+
+    /// The agreed dealer set (sorted)
+    #[inline]
+    pub fn dealer_set(&self) -> &[u32] {
+        &self.dealer_set
     }
 
     /// Number of verified sub-shares collected
@@ -384,15 +506,25 @@ impl<P: OsstPoint> Aggregator<P> {
         self.subshares.len()
     }
 
-    /// Check if we have enough sub-shares
+    /// True once a verified sub-share has arrived from every dealer in the set
     #[inline]
-    pub fn has_threshold(&self, old_threshold: u32) -> bool {
-        self.subshares.len() >= old_threshold as usize
+    pub fn is_complete(&self) -> bool {
+        self.subshares.len() == self.dealer_set.len()
+    }
+
+    /// Dealers in the set whose sub-share has not arrived yet
+    pub fn missing_dealers(&self) -> Vec<u32> {
+        self.dealer_set
+            .iter()
+            .copied()
+            .filter(|d| !self.subshares.iter().any(|s| s.dealer_index == *d))
+            .collect()
     }
 
     /// Add a sub-share with verification
     ///
-    /// Returns Ok(true) if added, Ok(false) if duplicate, Err if invalid.
+    /// Returns Ok(true) if added, Ok(false) if duplicate, Err if invalid or
+    /// from a dealer outside the agreed set.
     pub fn add_subshare(
         &mut self,
         subshare: SubShare<P::Scalar>,
@@ -407,6 +539,21 @@ impl<P: OsstPoint> Aggregator<P> {
         }
         if subshare.dealer_index == 0 {
             return Err(OsstError::InvalidIndex);
+        }
+
+        // Dealer must be in the agreed set
+        if self.dealer_set.binary_search(&subshare.dealer_index).is_err() {
+            return Err(OsstError::UnexpectedDealer(subshare.dealer_index));
+        }
+
+        // All dealers must have committed to the same new threshold
+        if let Some(first) = self.commitments.first() {
+            if first.threshold() != commitment.threshold() {
+                return Err(OsstError::ThresholdMismatch {
+                    expected: first.threshold(),
+                    got: commitment.threshold(),
+                });
+            }
         }
 
         // Check for duplicate
@@ -435,7 +582,8 @@ impl<P: OsstPoint> Aggregator<P> {
 
     /// Batch add sub-shares (more efficient for multiple)
     ///
-    /// Verifies all, adds only valid ones. Returns count of added.
+    /// Verifies all, adds only valid ones from dealers in the set. Returns
+    /// count of added.
     pub fn add_subshares_batch(
         &mut self,
         subshares: Vec<SubShare<P::Scalar>>,
@@ -450,72 +598,88 @@ impl<P: OsstPoint> Aggregator<P> {
         added
     }
 
-    /// Aggregate sub-shares into final share
-    ///
-    /// Computes: s'_j = Σ λ_i * σ_{i,j}
-    /// where λ_i are Lagrange coefficients for dealer indices
-    pub fn aggregate(&self, old_threshold: u32) -> Result<P::Scalar, OsstError> {
-        if !self.has_threshold(old_threshold) {
+    /// Lagrange coefficients over the agreed dealer set, in `dealer_set` order.
+    /// Errors until every dealer in the set has delivered.
+    fn lagrange(&self) -> Result<Vec<P::Scalar>, OsstError> {
+        if !self.is_complete() {
             return Err(OsstError::InsufficientContributions {
                 got: self.subshares.len(),
-                need: old_threshold as usize,
+                need: self.dealer_set.len(),
             });
         }
+        compute_lagrange_coefficients::<P::Scalar>(&self.dealer_set)
+    }
 
-        let dealer_indices: Vec<u32> = self.subshares.iter().map(|s| s.dealer_index).collect();
+    fn subshare_of(&self, dealer_index: u32) -> &VerifiedSubShare<P::Scalar> {
+        self.subshares
+            .iter()
+            .find(|s| s.dealer_index == dealer_index)
+            .expect("complete aggregator has every dealer")
+    }
 
-        let lagrange = compute_lagrange_coefficients::<P::Scalar>(&dealer_indices)?;
+    fn commitment_of(&self, dealer_index: u32) -> &DealerCommitment<P> {
+        self.commitments
+            .iter()
+            .find(|c| c.dealer_index == dealer_index)
+            .expect("complete aggregator has every dealer")
+    }
 
+    /// Aggregate sub-shares into the new secret share
+    ///
+    /// Computes: s'_j = Σ_{i∈S} λ_i^S · σ_{i,j}
+    pub fn aggregate(&self) -> Result<P::Scalar, OsstError> {
+        let lagrange = self.lagrange()?;
         let mut new_share = P::Scalar::zero();
-        for (subshare, lambda) in self.subshares.iter().zip(lagrange.iter()) {
-            let term = lambda.mul(&subshare.value);
+        for (dealer, lambda) in self.dealer_set.iter().zip(lagrange.iter()) {
+            let term = lambda.mul(&self.subshare_of(*dealer).value);
             new_share = new_share.add(&term);
         }
-
         Ok(new_share)
     }
 
-    /// Derive group public key from dealer commitments
+    /// The reshared polynomial in the exponent: F' = Σ_{i∈S} λ_i^S · C_i
     ///
-    /// Returns: Y = Σ λ_i * C_{i,0} = g^s
-    ///
-    /// This should equal the original group key (invariant check).
-    pub fn derive_group_key(&self, old_threshold: u32) -> Result<P, OsstError> {
-        if !self.has_threshold(old_threshold) {
-            return Err(OsstError::InsufficientContributions {
-                got: self.commitments.len(),
-                need: old_threshold as usize,
-            });
+    /// Identical for every player using the same dealer set. Publish it as
+    /// the epoch's public key package.
+    pub fn polynomial(&self) -> Result<SharePolynomial<P>, OsstError> {
+        let lagrange = self.lagrange()?;
+        let threshold = self.commitments[0].threshold() as usize;
+        let mut coefficients = vec![P::identity(); threshold];
+        for (dealer, lambda) in self.dealer_set.iter().zip(lagrange.iter()) {
+            let commitment = self.commitment_of(*dealer);
+            for (k, c) in commitment.coefficients.iter().enumerate() {
+                coefficients[k] = coefficients[k].add(&c.mul_scalar(lambda));
+            }
         }
-
-        let dealer_indices: Vec<u32> = self.commitments.iter().map(|c| c.dealer_index).collect();
-
-        let lagrange = compute_lagrange_coefficients::<P::Scalar>(&dealer_indices)?;
-
-        let mut group_key = P::identity();
-        for (commitment, lambda) in self.commitments.iter().zip(lagrange.iter()) {
-            let term = commitment.share_commitment().mul_scalar(lambda);
-            group_key = group_key.add(&term);
-        }
-
-        Ok(group_key)
+        Ok(SharePolynomial { coefficients })
     }
 
-    /// Finalize reshare: aggregate share and verify group key
+    /// Derive group public key from dealer commitments: Y = F'(0)
     ///
-    /// Returns (new_share, derived_group_key) if successful.
+    /// This must equal the original group key (invariant check).
+    pub fn derive_group_key(&self) -> Result<P, OsstError> {
+        Ok(self.polynomial()?.group_key().clone())
+    }
+
+    /// Finalize reshare: derive the polynomial, verify the group-key
+    /// invariant, aggregate the share, and verify the share lies on the
+    /// polynomial.
+    ///
+    /// Returns `(new_share, polynomial)`. The polynomial's `verifying_share(j)`
+    /// gives every new member's public share.
     pub fn finalize(
         &self,
-        old_threshold: u32,
         expected_group_key: &P,
-    ) -> Result<P::Scalar, OsstError> {
-        let derived_key = self.derive_group_key(old_threshold)?;
-
-        if &derived_key != expected_group_key {
+    ) -> Result<(P::Scalar, SharePolynomial<P>), OsstError> {
+        let polynomial = self.polynomial()?;
+        if polynomial.group_key() != expected_group_key {
             return Err(OsstError::InvalidCommitment);
         }
-
-        self.aggregate(old_threshold)
+        let share = self.aggregate()?;
+        if !polynomial.verify_share(self.player_index, &share) {
+            return Err(OsstError::InvalidResponse);
+        }
+        Ok((share, polynomial))
     }
 }
 
@@ -523,6 +687,7 @@ impl<P: OsstPoint> core::fmt::Debug for Aggregator<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Aggregator")
             .field("player_index", &self.player_index)
+            .field("dealer_set", &self.dealer_set)
             .field("count", &self.subshares.len())
             .finish()
     }
@@ -613,21 +778,37 @@ impl<P: OsstPoint> ReshareState<P> {
         self.commitments.iter().filter_map(|c| c.as_ref()).collect()
     }
 
-    /// Verify group key from submitted commitments
-    pub fn verify_group_key(&self) -> Result<bool, OsstError> {
+    /// The deterministic dealer set for this round: the `old_threshold`
+    /// lowest dealer indices that have committed. `None` until quorum.
+    ///
+    /// Every player must aggregate over exactly this set; put it in the
+    /// signed epoch manifest and pass it to [`Aggregator::new`].
+    pub fn dealer_set(&self) -> Option<Vec<u32>> {
         if !self.has_quorum() {
-            return Err(OsstError::InsufficientContributions {
-                got: self.commitment_count(),
-                need: self.old_threshold as usize,
-            });
+            return None;
         }
+        Some(
+            self.commitments
+                .iter()
+                .filter_map(|c| c.as_ref().map(|c| c.dealer_index))
+                .take(self.old_threshold as usize)
+                .collect(),
+        )
+    }
 
-        let commitments: Vec<&DealerCommitment<P>> = self.get_commitments();
-        let dealer_indices: Vec<u32> = commitments.iter().map(|c| c.dealer_index).collect();
+    /// Verify group key from the deterministic dealer set's commitments
+    pub fn verify_group_key(&self) -> Result<bool, OsstError> {
+        let dealer_indices = self.dealer_set().ok_or(OsstError::InsufficientContributions {
+            got: self.commitment_count(),
+            need: self.old_threshold as usize,
+        })?;
         let lagrange = compute_lagrange_coefficients::<P::Scalar>(&dealer_indices)?;
 
         let mut derived_key = P::identity();
-        for (commitment, lambda) in commitments.iter().zip(lagrange.iter()) {
+        for (idx, lambda) in dealer_indices.iter().zip(lagrange.iter()) {
+            let commitment = self.commitments[(*idx - 1) as usize]
+                .as_ref()
+                .expect("dealer_set only names committed dealers");
             let term = commitment.share_commitment().mul_scalar(lambda);
             derived_key = derived_key.add(&term);
         }
@@ -712,6 +893,55 @@ mod tests {
             .collect()
     }
 
+    /// Old-set members holding `old_shares`, re-dealing to `new_n` players
+    /// with new threshold `new_t`. Returns dealers keyed by index.
+    fn make_dealers(
+        old_shares: &[SecretShare<Scalar>],
+        new_t: u32,
+    ) -> Vec<Dealer<RistrettoPoint>> {
+        let mut rng = OsRng;
+        old_shares
+            .iter()
+            .map(|s| Dealer::new(s.index, s.scalar().clone(), new_t, &mut rng))
+            .collect()
+    }
+
+    fn dealer_by_index(dealers: &[Dealer<RistrettoPoint>], idx: u32) -> &Dealer<RistrettoPoint> {
+        dealers.iter().find(|d| d.index() == idx).unwrap()
+    }
+
+    /// Run a full reshare for players `1..=new_n` over dealer set `set`.
+    fn reshare_all(
+        dealers: &[Dealer<RistrettoPoint>],
+        set: &[u32],
+        new_n: u32,
+        group_pubkey: &RistrettoPoint,
+    ) -> Vec<(Scalar, SharePolynomial<RistrettoPoint>)> {
+        (1..=new_n)
+            .map(|j| {
+                let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(j, set).unwrap();
+                for &i in set {
+                    let d = dealer_by_index(dealers, i);
+                    assert!(agg
+                        .add_subshare(d.generate_subshare(j), d.commitment().clone())
+                        .unwrap());
+                }
+                assert!(agg.is_complete());
+                agg.finalize(group_pubkey).unwrap()
+            })
+            .collect()
+    }
+
+    fn reconstruct(shares: &[(u32, Scalar)]) -> Scalar {
+        let indices: Vec<u32> = shares.iter().map(|(i, _)| *i).collect();
+        let lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
+        let mut acc = Scalar::ZERO;
+        for ((_, s), l) in shares.iter().zip(lagrange.iter()) {
+            acc += l * s;
+        }
+        acc
+    }
+
     #[test]
     fn test_basic_reshare() {
         let mut rng = OsRng;
@@ -719,47 +949,20 @@ mod tests {
         let secret = Scalar::random(&mut rng);
         let group_pubkey: RistrettoPoint = RistrettoPoint::generator().mul_scalar(&secret);
 
-        // Old: 5/3, New: 7/5
+        // Old: 5/3, New: 7/5. Dealer set = all five (any size ≥ t_old works
+        // as long as every player uses the same set).
         let old_shares = shamir_split(&secret, 5, 3);
-        let new_n = 7u32;
-        let new_t = 5u32;
+        let dealers = make_dealers(&old_shares, 5);
+        let set = [1, 2, 3, 4, 5];
 
-        // Create dealers
-        let dealers: Vec<Dealer<RistrettoPoint>> = old_shares
+        let out = reshare_all(&dealers, &set, 7, &group_pubkey);
+
+        // Any 5 of the 7 new shares reconstruct the secret
+        let five: Vec<(u32, Scalar)> = [1u32, 3, 4, 6, 7]
             .iter()
-            .map(|s| Dealer::new(s.index, s.scalar().clone(), new_t, &mut rng))
+            .map(|&j| (j, out[(j - 1) as usize].0))
             .collect();
-
-        // Create aggregators for new players
-        let mut aggregators: Vec<Aggregator<RistrettoPoint>> =
-            (1..=new_n).map(Aggregator::new).collect();
-
-        // Distribute sub-shares
-        for dealer in &dealers {
-            let commitment = dealer.commitment().clone();
-            for agg in &mut aggregators {
-                let subshare = dealer.generate_subshare(agg.player_index());
-                assert!(agg.add_subshare(subshare, commitment.clone()).unwrap());
-            }
-        }
-
-        // Finalize and verify
-        let mut new_shares = Vec::new();
-        for agg in &aggregators {
-            let share = agg.finalize(3, &group_pubkey).unwrap();
-            new_shares.push(share);
-        }
-
-        // Verify new shares reconstruct secret
-        let indices: Vec<u32> = (1..=new_t).collect();
-        let lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
-
-        let mut reconstructed = Scalar::ZERO;
-        for (i, lambda) in lagrange.iter().enumerate() {
-            reconstructed += lambda * new_shares[i];
-        }
-
-        assert_eq!(reconstructed, secret);
+        assert_eq!(reconstruct(&five), secret);
     }
 
     #[test]
@@ -769,32 +972,190 @@ mod tests {
         let secret = Scalar::random(&mut rng);
         let group_pubkey: RistrettoPoint = RistrettoPoint::generator().mul_scalar(&secret);
 
+        // Only 3 of 5 old members deal: S = {1, 3, 5}
         let old_shares = shamir_split(&secret, 5, 3);
-        let new_t = 3u32;
+        let dealers = make_dealers(&old_shares, 3);
+        let set = [1, 3, 5];
 
-        // Only 3 of 5 dealers participate
-        let active_dealers: Vec<Dealer<RistrettoPoint>> = old_shares[0..3]
+        let out = reshare_all(&dealers, &set, 5, &group_pubkey);
+        assert_eq!(*out[0].1.group_key(), group_pubkey);
+
+        let three: Vec<(u32, Scalar)> = [2u32, 4, 5]
             .iter()
-            .map(|s| Dealer::new(s.index, s.scalar().clone(), new_t, &mut rng))
+            .map(|&j| (j, out[(j - 1) as usize].0))
             .collect();
+        assert_eq!(reconstruct(&three), secret);
+    }
 
-        let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(1);
+    #[test]
+    fn test_polynomial_and_verifying_shares_consistent_across_players() {
+        let mut rng = OsRng;
+        let secret = Scalar::random(&mut rng);
+        let group_pubkey: RistrettoPoint = RistrettoPoint::generator().mul_scalar(&secret);
 
-        for dealer in &active_dealers {
-            let commitment = dealer.commitment().clone();
-            let subshare = dealer.generate_subshare(1);
-            agg.add_subshare(subshare, commitment).unwrap();
+        let old_shares = shamir_split(&secret, 5, 3);
+        let dealers = make_dealers(&old_shares, 4);
+        let set = [2, 3, 5];
+        let out = reshare_all(&dealers, &set, 6, &group_pubkey);
+
+        // Every player derived the same polynomial = the epoch's public key package
+        let poly = &out[0].1;
+        assert_eq!(poly.threshold(), 4);
+        assert_eq!(*poly.group_key(), group_pubkey);
+        for (_, p) in &out {
+            assert_eq!(p, poly);
         }
 
-        // Should succeed with threshold dealers
-        let share = agg.finalize(3, &group_pubkey).unwrap();
+        // Each player's share sits on it: g^{s'_j} == F'(j)
+        for (j, (share, _)) in out.iter().enumerate() {
+            let j = j as u32 + 1;
+            assert!(poly.verify_share(j, share));
+            assert_eq!(
+                poly.verifying_share(j),
+                RistrettoPoint::generator().mul_scalar(share)
+            );
+            // and not on a neighbour's slot
+            assert!(!poly.verify_share(j % 6 + 1, share));
+        }
 
-        // Verify public share matches
-        let _public_share: RistrettoPoint = RistrettoPoint::generator().mul_scalar(&share);
-        let derived_key = agg.derive_group_key(3).unwrap();
+        // Round-trips
+        let bytes = poly.to_bytes();
+        let back = SharePolynomial::<RistrettoPoint>::from_bytes(&bytes, 4).unwrap();
+        assert_eq!(&back, poly);
+    }
 
-        // This player's public share contributes to group key
-        assert_eq!(derived_key, group_pubkey);
+    /// The failure the fixed dealer set exists to prevent.
+    ///
+    /// Players who aggregate over different dealer subsets each pass the
+    /// group-key invariant, but their shares lie on different polynomials and
+    /// do not combine. The public polynomials differ, which is how a
+    /// coordinator would now detect it.
+    #[test]
+    fn test_split_dealer_sets_are_incompatible_and_detectable() {
+        let mut rng = OsRng;
+        let secret = Scalar::random(&mut rng);
+        let group_pubkey: RistrettoPoint = RistrettoPoint::generator().mul_scalar(&secret);
+
+        let old_shares = shamir_split(&secret, 5, 3);
+        let dealers = make_dealers(&old_shares, 3);
+
+        // Players 1..3 saw S1, players 4..5 saw S2
+        let s1 = [1, 2, 3];
+        let s2 = [1, 2, 4];
+        let group_a = reshare_all(&dealers, &s1, 3, &group_pubkey);
+        let group_b: Vec<_> = (4..=5u32)
+            .map(|j| {
+                let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(j, &s2).unwrap();
+                for &i in &s2 {
+                    let d = dealer_by_index(&dealers, i);
+                    agg.add_subshare(d.generate_subshare(j), d.commitment().clone())
+                        .unwrap();
+                }
+                agg.finalize(&group_pubkey).unwrap()
+            })
+            .collect();
+
+        // Both groups pass the invariant individually...
+        assert_eq!(*group_a[0].1.group_key(), group_pubkey);
+        assert_eq!(*group_b[0].1.group_key(), group_pubkey);
+        // ...but hold different polynomials
+        assert_ne!(group_a[0].1, group_b[0].1);
+
+        // Homogeneous quorums reconstruct
+        assert_eq!(
+            reconstruct(&[(1, group_a[0].0), (2, group_a[1].0), (3, group_a[2].0)]),
+            secret
+        );
+        // A mixed quorum does not
+        assert_ne!(
+            reconstruct(&[(1, group_a[0].0), (2, group_a[1].0), (4, group_b[0].0)]),
+            secret
+        );
+        // and the stray member fails verification against group A's package
+        assert!(!group_a[0].1.verify_share(4, &group_b[0].0));
+    }
+
+    #[test]
+    fn test_unexpected_dealer_rejected_even_if_valid() {
+        let mut rng = OsRng;
+        let secret = Scalar::random(&mut rng);
+        let old_shares = shamir_split(&secret, 5, 3);
+        let dealers = make_dealers(&old_shares, 3);
+
+        let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(1, &[1, 2, 3]).unwrap();
+        let d4 = dealer_by_index(&dealers, 4);
+        // Perfectly valid sub-share from dealer 4, but 4 is not in S
+        assert_eq!(
+            agg.add_subshare(d4.generate_subshare(1), d4.commitment().clone()),
+            Err(OsstError::UnexpectedDealer(4))
+        );
+        assert_eq!(agg.count(), 0);
+    }
+
+    #[test]
+    fn test_incomplete_dealer_set_cannot_finalize() {
+        let mut rng = OsRng;
+        let secret = Scalar::random(&mut rng);
+        let group_pubkey: RistrettoPoint = RistrettoPoint::generator().mul_scalar(&secret);
+        let old_shares = shamir_split(&secret, 5, 3);
+        let dealers = make_dealers(&old_shares, 3);
+
+        let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(2, &[1, 2, 3]).unwrap();
+        for &i in &[1u32, 3] {
+            let d = dealer_by_index(&dealers, i);
+            agg.add_subshare(d.generate_subshare(2), d.commitment().clone())
+                .unwrap();
+        }
+        assert!(!agg.is_complete());
+        assert_eq!(agg.missing_dealers(), vec![2]);
+        // Two of three arrived. Old code would have interpolated over {1,3}
+        // with the wrong Lagrange set; now it refuses.
+        assert_eq!(
+            agg.finalize(&group_pubkey),
+            Err(OsstError::InsufficientContributions { got: 2, need: 3 })
+        );
+    }
+
+    #[test]
+    fn test_threshold_mismatch_rejected() {
+        let mut rng = OsRng;
+        let secret = Scalar::random(&mut rng);
+        let old_shares = shamir_split(&secret, 5, 3);
+
+        let d1: Dealer<RistrettoPoint> =
+            Dealer::new(1, old_shares[0].scalar().clone(), 3, &mut rng);
+        let d2: Dealer<RistrettoPoint> =
+            Dealer::new(2, old_shares[1].scalar().clone(), 4, &mut rng);
+
+        let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(1, &[1, 2, 3]).unwrap();
+        agg.add_subshare(d1.generate_subshare(1), d1.commitment().clone())
+            .unwrap();
+        assert_eq!(
+            agg.add_subshare(d2.generate_subshare(1), d2.commitment().clone()),
+            Err(OsstError::ThresholdMismatch { expected: 3, got: 4 })
+        );
+    }
+
+    #[test]
+    fn test_aggregator_dealer_set_validation() {
+        assert_eq!(
+            Aggregator::<RistrettoPoint>::new(0, &[1]).err(),
+            Some(OsstError::InvalidIndex)
+        );
+        assert_eq!(
+            Aggregator::<RistrettoPoint>::new(1, &[]).err(),
+            Some(OsstError::EmptyContributions)
+        );
+        assert_eq!(
+            Aggregator::<RistrettoPoint>::new(1, &[3, 1, 3]).err(),
+            Some(OsstError::DuplicateIndex(3))
+        );
+        assert_eq!(
+            Aggregator::<RistrettoPoint>::new(1, &[0, 2]).err(),
+            Some(OsstError::InvalidIndex)
+        );
+        let agg = Aggregator::<RistrettoPoint>::new(1, &[5, 2, 9]).unwrap();
+        assert_eq!(agg.dealer_set(), &[2, 5, 9]);
     }
 
     #[test]
@@ -866,7 +1227,21 @@ mod tests {
         }
 
         assert!(state.has_quorum());
+        assert_eq!(state.dealer_set(), Some(vec![1, 2, 3]));
         assert!(state.verify_group_key().unwrap());
+
+        // Only dealers 2, 4, 5 commit: the set is the three lowest committed
+        let mut partial: ReshareState<RistrettoPoint> =
+            ReshareState::new(2, 5, 3, 3, 5, group_pubkey);
+        assert_eq!(partial.dealer_set(), None);
+        for &i in &[5usize, 2, 4] {
+            let share = &old_shares[i - 1];
+            let dealer: Dealer<RistrettoPoint> =
+                Dealer::new(share.index, share.scalar().clone(), 3, &mut rng);
+            partial.submit_commitment(dealer.commitment().clone()).unwrap();
+        }
+        assert_eq!(partial.dealer_set(), Some(vec![2, 4, 5]));
+        assert!(partial.verify_group_key().unwrap());
     }
 
     #[test]

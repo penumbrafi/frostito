@@ -37,3 +37,23 @@ impl rand_core_10::TryRng for OsRng10 {
 }
 
 impl rand_core_10::TryCryptoRng for OsRng10 {}
+
+#[cfg(all(test, feature = "pallas"))]
+mod tests {
+    use super::OsRng10;
+
+    /// The bridge is the only way to reach ff 0.14's `Field::random` from this
+    /// crate's rand 0.8 test RNG. osst's own `OsstScalar::random` deliberately
+    /// does not go through it (see `curve::pallas`), so this test is what keeps
+    /// the adapter honest.
+    #[test]
+    fn os_rng10_drives_ff_014_field_random() {
+        use pasta_curves::group::ff::Field;
+        use pasta_curves::pallas::Scalar;
+
+        let a = <Scalar as Field>::random(&mut OsRng10);
+        let b = <Scalar as Field>::random(&mut OsRng10);
+        assert_ne!(a, b, "two draws must not collide");
+        assert!(bool::from(!<Scalar as Field>::is_zero(&a)));
+    }
+}

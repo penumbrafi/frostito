@@ -61,7 +61,7 @@ fn main() {
 
     println!("=== narsil nested: interleaved DKG, s₃ never exists ===\n");
 
-    let outer_n = 3u32;
+    let _outer_n = 3u32;
     let outer_t = 2u32;
     let inner_n = 5u32;
     let inner_t = 3u32;
@@ -115,8 +115,8 @@ fn main() {
     let mut b3_pubkey = Point::identity();
 
     for k in 1..=inner_n {
-        let mut agg_a: dkg::Aggregator<Point> = dkg::Aggregator::new(k);
-        let mut agg_b: dkg::Aggregator<Point> = dkg::Aggregator::new(k);
+        let mut agg_a: dkg::Aggregator<Point> = dkg::Aggregator::all_dealers(k, inner_n).unwrap();
+        let mut agg_b: dkg::Aggregator<Point> = dkg::Aggregator::all_dealers(k, inner_n).unwrap();
         for dealer in &dealers_a {
             let sub = dealer.generate_subshare(k);
             agg_a.add_subshare(sub, commitments_a[(dealer.index() - 1) as usize]).unwrap();
@@ -126,11 +126,11 @@ fn main() {
             agg_b.add_subshare(sub, commitments_b[(dealer.index() - 1) as usize]).unwrap();
         }
         if k == 1 {
-            a3_pubkey = agg_a.derive_group_key(); // g^{a₃}
-            b3_pubkey = agg_b.derive_group_key(); // g^{b₃}
+            a3_pubkey = agg_a.derive_group_key().unwrap(); // g^{a₃}
+            b3_pubkey = agg_b.derive_group_key().unwrap(); // g^{b₃}
         }
-        alpha.push(agg_a.finalize(inner_n).unwrap());
-        beta.push(agg_b.finalize(inner_n).unwrap());
+        alpha.push(agg_a.finalize().unwrap());
+        beta.push(agg_b.finalize().unwrap());
     }
 
     println!("  inner DKG #1 (a₃): {} holders, threshold {}", inner_n, inner_t);

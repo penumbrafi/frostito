@@ -137,12 +137,17 @@ pub fn interleaved_dkg<P: OsstPoint, R: rand_core::RngCore + rand_core::CryptoRn
             let commitments: Vec<&DealerCommitment<P>> =
                 dkg_j.dealers.iter().map(|d| d.commitment()).collect();
 
-            let mut agg: dkg::Aggregator<P> = dkg::Aggregator::new(k);
+            // new dkg::Aggregator API: the agreed dealer set is fixed at
+            // construction (here, exactly this DKG's dealers) and finalize()
+            // takes no args - it sums the verified sub-shares once every dealer
+            // in the set has delivered.
+            let dealer_set: Vec<u32> = dkg_j.dealers.iter().map(|d| d.index()).collect();
+            let mut agg: dkg::Aggregator<P> = dkg::Aggregator::new(k, &dealer_set)?;
             for dealer in &dkg_j.dealers {
                 let subshare = dealer.generate_subshare(k);
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])?;
             }
-            coefficient_shares.push(agg.finalize(inner_n)?);
+            coefficient_shares.push(agg.finalize()?);
         }
         inner_shares.push(InnerShare {
             holder_index: k,

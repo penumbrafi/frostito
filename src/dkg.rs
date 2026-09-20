@@ -122,12 +122,18 @@ impl<P: OsstPoint> core::fmt::Debug for Dealer<P> {
 // Aggregator
 // ============================================================================
 
-/// DKG aggregator: collects sub-shares from all dealers, sums directly.
+/// DKG aggregator: collects sub-shares from a **fixed** dealer set, sums directly.
 ///
 /// Unlike reshare::Aggregator, no Lagrange coefficients needed —
-/// every participant deals, so the final share is a plain sum.
+/// every dealer's contribution is simply summed. But the dealer set still
+/// has to be agreed up front: a player that sums one dealer more (or fewer)
+/// than its peers derives a different group key and an incompatible share.
+/// With a subset of participants dealing (narsild style), `dealer_set` is
+/// the set fixed when round 1 closes, and it must be the same on every node.
 pub struct Aggregator<P: OsstPoint> {
     player_index: u32,
+    /// Agreed dealer set, sorted ascending, no duplicates
+    dealer_set: Vec<u32>,
     /// Verified sub-share values keyed by dealer index
     subshares: Vec<(u32, P::Scalar)>,
     /// Constant-term commitments for group key derivation
@@ -136,14 +142,37 @@ pub struct Aggregator<P: OsstPoint> {
 }
 
 impl<P: OsstPoint> Aggregator<P> {
-    pub fn new(player_index: u32) -> Self {
-        assert!(player_index > 0, "player_index must be 1-indexed");
-        Self {
+    /// Create an aggregator for `player_index` summing exactly `dealer_set`.
+    pub fn new(player_index: u32, dealer_set: &[u32]) -> Result<Self, OsstError> {
+        if player_index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        if dealer_set.is_empty() {
+            return Err(OsstError::EmptyContributions);
+        }
+        let mut sorted = dealer_set.to_vec();
+        sorted.sort_unstable();
+        for w in sorted.windows(2) {
+            if w[0] == w[1] {
+                return Err(OsstError::DuplicateIndex(w[0]));
+            }
+        }
+        if sorted[0] == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        Ok(Self {
             player_index,
+            dealer_set: sorted,
             subshares: Vec::new(),
             constant_commitments: Vec::new(),
             _marker: PhantomData,
-        }
+        })
+    }
+
+    /// Aggregator over all dealers `1..=n` (the classic everyone-deals DKG).
+    pub fn all_dealers(player_index: u32, n: u32) -> Result<Self, OsstError> {
+        let set: alloc::vec::Vec<u32> = (1..=n).collect();
+        Self::new(player_index, &set)
     }
 
     #[inline]
@@ -152,11 +181,31 @@ impl<P: OsstPoint> Aggregator<P> {
     }
 
     #[inline]
+    pub fn dealer_set(&self) -> &[u32] {
+        &self.dealer_set
+    }
+
+    #[inline]
     pub fn count(&self) -> usize {
         self.subshares.len()
     }
 
-    /// Add a verified sub-share. Returns Ok(true) if added, Ok(false) if duplicate.
+    #[inline]
+    pub fn is_complete(&self) -> bool {
+        self.subshares.len() == self.dealer_set.len()
+    }
+
+    /// Dealers in the set whose sub-share has not arrived yet
+    pub fn missing_dealers(&self) -> Vec<u32> {
+        self.dealer_set
+            .iter()
+            .copied()
+            .filter(|d| !self.subshares.iter().any(|(i, _)| i == d))
+            .collect()
+    }
+
+    /// Add a verified sub-share. Returns Ok(true) if added, Ok(false) if
+    /// duplicate, Err if invalid or from a dealer outside the set.
     pub fn add_subshare(
         &mut self,
         subshare: SubShare<P::Scalar>,
@@ -170,6 +219,9 @@ impl<P: OsstPoint> Aggregator<P> {
         }
         if subshare.dealer_index == 0 {
             return Err(OsstError::InvalidIndex);
+        }
+        if self.dealer_set.binary_search(&subshare.dealer_index).is_err() {
+            return Err(OsstError::UnexpectedDealer(subshare.dealer_index));
         }
 
         // duplicate check
@@ -194,29 +246,34 @@ impl<P: OsstPoint> Aggregator<P> {
         Ok(true)
     }
 
-    /// Derive group public key: Y = sum(C_{i,0})
-    pub fn derive_group_key(&self) -> P {
+    /// Derive group public key: Y = sum(C_{i,0}) over the dealer set.
+    /// Errors until every dealer in the set has delivered.
+    pub fn derive_group_key(&self) -> Result<P, OsstError> {
+        self.require_complete()?;
         let mut key = P::identity();
         for c0 in &self.constant_commitments {
             key = key.add(c0);
         }
-        key
+        Ok(key)
     }
 
-    /// Aggregate final share: s_j = sum_i(f_i(j))
-    pub fn finalize(&self, num_dealers: u32) -> Result<P::Scalar, OsstError> {
-        if (self.subshares.len() as u32) < num_dealers {
+    fn require_complete(&self) -> Result<(), OsstError> {
+        if !self.is_complete() {
             return Err(OsstError::InsufficientContributions {
                 got: self.subshares.len(),
-                need: num_dealers as usize,
+                need: self.dealer_set.len(),
             });
         }
+        Ok(())
+    }
 
+    /// Aggregate final share: s_j = sum_{i in S} f_i(j)
+    pub fn finalize(&self) -> Result<P::Scalar, OsstError> {
+        self.require_complete()?;
         let mut share = P::Scalar::zero();
         for (_, value) in &self.subshares {
             share = share.add(value);
         }
-
         Ok(share)
     }
 }
@@ -225,6 +282,7 @@ impl<P: OsstPoint> core::fmt::Debug for Aggregator<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("dkg::Aggregator")
             .field("player_index", &self.player_index)
+            .field("dealer_set", &self.dealer_set)
             .field("count", &self.subshares.len())
             .finish()
     }
@@ -385,14 +443,14 @@ mod tests {
         // phase 3: each player collects sub-shares from all dealers
         let mut shares = Vec::new();
         for j in 1..=n {
-            let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(j);
+            let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
                 let subshare = dealer.generate_subshare(j);
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
-            let share = agg.finalize(n).unwrap();
-            let group_key = agg.derive_group_key();
+            let share = agg.finalize().unwrap();
+            let group_key = agg.derive_group_key().unwrap();
             shares.push((share, group_key));
         }
 
@@ -445,12 +503,12 @@ mod tests {
         let state_key = state.derive_group_key().unwrap();
 
         // derive group key from aggregator
-        let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(1);
+        let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(1, n).unwrap();
         for dealer in &dealers {
             let subshare = dealer.generate_subshare(1);
             agg.add_subshare(subshare, dealer.commitment()).unwrap();
         }
-        let agg_key = agg.derive_group_key();
+        let agg_key = agg.derive_group_key().unwrap();
 
         assert_eq!(state_key, agg_key);
     }
@@ -464,7 +522,7 @@ mod tests {
         let dealers: Vec<Dealer<RistrettoPoint>> =
             (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
 
-        let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(1);
+        let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(1, n).unwrap();
 
         // good sub-share
         let subshare = dealers[0].generate_subshare(1);
@@ -481,7 +539,7 @@ mod tests {
         let mut rng = OsRng;
         let dealer: Dealer<RistrettoPoint> = Dealer::new(1, 2, &mut rng);
 
-        let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(1);
+        let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(1, &[1]).unwrap();
         let subshare = dealer.generate_subshare(1);
         assert!(agg.add_subshare(subshare, dealer.commitment()).unwrap());
 
@@ -505,16 +563,16 @@ mod tests {
         let mut secret_shares = Vec::new();
         let mut group_key = None;
         for j in 1..=n {
-            let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(j);
+            let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
                 let subshare = dealer.generate_subshare(j);
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
             if group_key.is_none() {
-                group_key = Some(agg.derive_group_key());
+                group_key = Some(agg.derive_group_key().unwrap());
             }
-            secret_shares.push(SecretShare::new(j, agg.finalize(n).unwrap()));
+            secret_shares.push(SecretShare::new(j, agg.finalize().unwrap()));
         }
 
         let group_key = group_key.unwrap();
@@ -528,6 +586,48 @@ mod tests {
 
         assert!(verify(&group_key, &contributions, t, payload).unwrap());
     }
+    /// Subset DKG (narsild style): the dealer set must be agreed. A node
+    /// that sums one dealer more than its peers gets a different key.
+    #[test]
+    fn test_dkg_subset_dealer_set_enforced() {
+        let mut rng = OsRng;
+        let n = 5u32;
+        let t = 3u32;
+        let dealers: Vec<Dealer<RistrettoPoint>> =
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+
+        let set = [1u32, 3, 4];
+        let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(2, &set).unwrap();
+        // dealer 5 committed too, but is not in the agreed set
+        assert_eq!(
+            agg.add_subshare(dealers[4].generate_subshare(2), dealers[4].commitment()),
+            Err(OsstError::UnexpectedDealer(5))
+        );
+        for &i in &set {
+            let d = &dealers[(i - 1) as usize];
+            agg.add_subshare(d.generate_subshare(2), d.commitment()).unwrap();
+        }
+        assert!(agg.is_complete());
+
+        // Group key is the sum over exactly the set
+        let mut expected = RistrettoPoint::identity();
+        for &i in &set {
+            expected = expected.add(dealers[(i - 1) as usize].commitment().share_commitment());
+        }
+        assert_eq!(agg.derive_group_key().unwrap(), expected);
+
+        // An incomplete aggregator refuses to finalize
+        let mut partial: Aggregator<RistrettoPoint> = Aggregator::new(2, &set).unwrap();
+        partial
+            .add_subshare(dealers[0].generate_subshare(2), dealers[0].commitment())
+            .unwrap();
+        assert_eq!(partial.missing_dealers(), vec![3, 4]);
+        assert!(matches!(
+            partial.finalize(),
+            Err(OsstError::InsufficientContributions { got: 1, need: 3 })
+        ));
+    }
+
 }
 
 #[cfg(all(test, feature = "pallas"))]
@@ -552,16 +652,16 @@ mod pallas_tests {
         let mut shares = Vec::new();
         let mut group_key = None;
         for j in 1..=n {
-            let mut agg: Aggregator<Point> = Aggregator::new(j);
+            let mut agg: Aggregator<Point> = Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
                 let subshare = dealer.generate_subshare(j);
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
             if group_key.is_none() {
-                group_key = Some(agg.derive_group_key());
+                group_key = Some(agg.derive_group_key().unwrap());
             }
-            shares.push(SecretShare::new(j, agg.finalize(n).unwrap()));
+            shares.push(SecretShare::new(j, agg.finalize().unwrap()));
         }
 
         let group_key = group_key.unwrap();

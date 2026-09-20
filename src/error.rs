@@ -28,6 +28,12 @@ pub enum OsstError {
 
     /// Index out of valid range (must be > 0)
     InvalidIndex,
+
+    /// Sub-share from a dealer outside the agreed dealer set
+    UnexpectedDealer(u32),
+
+    /// Dealers committed to different new thresholds
+    ThresholdMismatch { expected: u32, got: u32 },
 }
 
 impl fmt::Display for OsstError {
@@ -43,6 +49,12 @@ impl fmt::Display for OsstError {
             Self::InvalidResponse => write!(f, "invalid response scalar"),
             Self::LagrangeError => write!(f, "lagrange coefficient computation failed"),
             Self::InvalidIndex => write!(f, "index must be greater than 0"),
+            Self::UnexpectedDealer(idx) => {
+                write!(f, "dealer {} is not in the agreed dealer set", idx)
+            }
+            Self::ThresholdMismatch { expected, got } => {
+                write!(f, "dealer committed to threshold {}, expected {}", got, expected)
+            }
         }
     }
 }

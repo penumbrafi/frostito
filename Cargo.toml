@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "frostito: nested FROST with OSST identification, DKG, and proactive resharing"
-repository = "https://github.com/rotkonetworks/frostito"
+repository = "https://github.com/penumbrafi/frostito"
 documentation = "https://docs.rs/osst"
 readme = "README.md"
 keywords = ["threshold", "cryptography", "schnorr", "mpc", "reshare"]
@@ -36,11 +36,11 @@ zeroize = { version = "1.8", default-features = false, features = ["derive"] }
 # ristretto255 - for Polkadot/sr25519 compatibility
 curve25519-dalek = { version = "4.1", default-features = false, features = ["digest", "group", "alloc", "rand_core", "zeroize"], optional = true }
 
-# pallas - for Zcash Orchard compatibility
+# pallas - for Zcash Orchard compatibility.
 # Zakura Common 1.0 fork (pasta-1.0 / ff+group 0.14). Package rename keeps the
 # `use pasta_curves` paths working; the pallas backend only touches stable
-# ff/group traits (Field/PrimeField/FromUniformBytes/Group/GroupEncoding) that
-# are unchanged across the 0.13 -> 0.14 bump.
+# ff/group traits (Field/PrimeField/FromUniformBytes/Group/GroupEncoding) -
+# except `Field::random`, which ff 0.14 moved onto rand_core 0.10 (see curve.rs).
 pasta_curves = { package = "zakura-pasta-curves", version = "=1.0.0", default-features = false, features = ["alloc"], optional = true }
 
 # secp256k1 - for Bitcoin compatibility
@@ -67,5 +67,22 @@ rand = "0.8"
 hex = "0.4"
 # Zakura Common 1.0's ff 0.14 bounds `Field::random` on rand_core 0.10's `Rng`,
 # which rand 0.8's `OsRng` does not implement. The pallas tests bridge the two
-# with a local adapter; see the `OsRng10` in `frost.rs`.
+# with a local adapter; see `src/test_rng.rs`.
 rand_core_10 = { package = "rand_core", version = "0.10", default-features = false }
+
+# end-to-end: ZF FROST(Pallas) DKG -> osst reshare -> ZF FROST signing
+reddsa = { git = "https://github.com/ZcashFoundation/reddsa.git", rev = "475a552", features = ["frost"] }
+
+# The narsil examples are ristretto255 walkthroughs.
+[[example]]
+name = "narsil_escrow"
+required-features = ["ristretto255"]
+
+[[example]]
+name = "narsil_nested"
+required-features = ["ristretto255"]
+
+# The ZF FROST cross-test needs the Orchard spend-auth (pallas) backend.
+[[test]]
+name = "reshare_zf_frost"
+required-features = ["pallas", "std"]

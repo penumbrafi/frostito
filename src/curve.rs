@@ -339,13 +339,95 @@ pub mod pallas {
         }
     }
 
-    /// Pallas curve backend (Zcash Orchard)
+    /// Pallas curve backend using the *curve* generator.
+    ///
+    /// Not Zcash-compatible on its own: Orchard spend authorization
+    /// (RedPallas `SpendAuth`) uses a hash-to-curve basepoint, not the Pallas
+    /// generator. Use [`OrchardSpendAuthCurve`] for anything that must agree
+    /// with ZF `reddsa` / `frost-core` FROST(Pallas) key material.
     #[derive(Clone, Debug, Default)]
     pub struct PallasCurve;
 
     impl OsstCurve for PallasCurve {
         type Scalar = Scalar;
         type Point = Point;
+    }
+
+    /// Byte encoding of the Orchard `SpendAuthSig` basepoint.
+    /// Reproducible by `pallas::Point::hash_to_curve("z.cash:Orchard")(b"G").to_bytes()`.
+    /// Same constant as `reddsa::orchard::ORCHARD_SPENDAUTHSIG_BASEPOINT_BYTES`.
+    pub const ORCHARD_SPENDAUTHSIG_BASEPOINT_BYTES: [u8; 32] = [
+        99, 201, 117, 184, 132, 114, 26, 141, 12, 161, 112, 123, 227, 12, 127, 12, 95, 68, 95,
+        62, 124, 24, 141, 59, 6, 214, 241, 40, 179, 35, 85, 183,
+    ];
+
+    /// A Pallas point whose group generator is the Orchard spend-auth
+    /// basepoint. This is the group ZF `reddsa` FROST(Pallas, BLAKE2b-512)
+    /// operates in, so shares, commitments and verifying shares produced with
+    /// this backend load directly into `frost-core` key packages.
+    ///
+    /// Byte encoding is the plain Pallas point encoding, so values convert to
+    /// and from the `PallasCurve` backend and ZF types losslessly.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SpendAuthPoint(pub Point);
+
+    impl SpendAuthPoint {
+        pub fn basepoint() -> Self {
+            SpendAuthPoint(
+                Point::from_bytes(&ORCHARD_SPENDAUTHSIG_BASEPOINT_BYTES)
+                    .expect("constant is a valid Pallas point"),
+            )
+        }
+
+        pub fn inner(&self) -> &Point {
+            &self.0
+        }
+    }
+
+    impl OsstPoint for SpendAuthPoint {
+        type Scalar = Scalar;
+
+        const COMPRESSED_SIZE: usize = 32;
+
+        fn identity() -> Self {
+            SpendAuthPoint(<Point as Group>::identity())
+        }
+
+        fn generator() -> Self {
+            Self::basepoint()
+        }
+
+        fn mul_scalar(&self, scalar: &Self::Scalar) -> Self {
+            SpendAuthPoint(self.0 * scalar)
+        }
+
+        fn add(&self, other: &Self) -> Self {
+            SpendAuthPoint(self.0 + other.0)
+        }
+
+        fn multiscalar_mul(scalars: &[Self::Scalar], points: &[Self]) -> Self {
+            scalars
+                .iter()
+                .zip(points.iter())
+                .fold(Self::identity(), |acc, (s, p)| acc.add(&p.mul_scalar(s)))
+        }
+
+        fn compress(&self) -> [u8; 32] {
+            self.0.to_bytes()
+        }
+
+        fn decompress(bytes: &[u8; 32]) -> Option<Self> {
+            Point::from_bytes(bytes).into_option().map(SpendAuthPoint)
+        }
+    }
+
+    /// Pallas backend in the Orchard spend-auth group. Zcash-compatible.
+    #[derive(Clone, Debug, Default)]
+    pub struct OrchardSpendAuthCurve;
+
+    impl OsstCurve for OrchardSpendAuthCurve {
+        type Scalar = Scalar;
+        type Point = SpendAuthPoint;
     }
 }
 

@@ -1,6 +1,7 @@
-# osst
+# frostito
 
-one-step schnorr threshold identification with proactive resharing.
+nested FROST threshold signatures with OSST (one-step schnorr threshold)
+identification, DKG, and proactive resharing.
 
 implementation of the OSST protocol from ["One-Step Schnorr Threshold Identification"](https://eprint.iacr.org/2025/722) by Foteinos Mergoupis-Anagnou (GRNET).
 
@@ -128,11 +129,21 @@ let dealer = Dealer::new(index, current_share, new_threshold, &mut rng);
 let commitment = dealer.commitment();
 let subshare = dealer.generate_subshare(player_index);
 
-// new custodians aggregate subshares
-let mut aggregator = Aggregator::new(player_index);
-aggregator.add_subshare(subshare, commitment)?;
-let new_share = aggregator.finalize(old_threshold, &group_pubkey)?;
+// every new custodian must agree on the dealer set S *before* aggregating
+// (e.g. via a signed epoch manifest). players that aggregate over different
+// subsets land on different polynomials that pass the group-key check
+// individually but never sign together.
+let mut aggregator = Aggregator::new(player_index, &dealer_set)?;
+aggregator.add_subshare(subshare, commitment)?;   // rejects dealers outside S
+let (new_share, polynomial) = aggregator.finalize(&group_pubkey)?;
+
+// `polynomial` is the epoch's public key package, identical on every player:
+let verifying_share_j = polynomial.verifying_share(j);   // g^{s'_j}
+assert!(polynomial.verify_share(player_index, &new_share));
 ```
+
+`ReshareState::dealer_set()` gives the deterministic choice (the `t_old`
+lowest committed dealer indices) for coordinators to put in the manifest.
 
 ## modules
 

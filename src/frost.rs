@@ -907,12 +907,11 @@ mod pallas_tests {
     use pasta_curves::pallas::{Point, Scalar};
     use rand::rngs::OsRng;
 
-    use crate::test_rng::OsRng10;
-
     fn shamir_split(secret: &Scalar, n: u32, t: u32) -> Vec<SecretShare<Scalar>> {
+        let mut rng = OsRng;
         let mut coeffs = vec![*secret];
         for _ in 1..t {
-            coeffs.push(<Scalar as Field>::random(&mut OsRng10));
+            coeffs.push(<Scalar as crate::curve::OsstScalar>::random(&mut rng));
         }
         (1..=n)
             .map(|i| {
@@ -932,7 +931,7 @@ mod pallas_tests {
     fn test_pallas_frost() {
         let mut rng = OsRng;
 
-        let secret = <Scalar as Field>::random(&mut OsRng10);
+        let secret = <Scalar as crate::curve::OsstScalar>::random(&mut rng);
         let group_pubkey: Point = Point::generator().mul_scalar(&secret);
 
         let n = 5u32;
@@ -990,15 +989,15 @@ mod pallas_tests {
         let mut vshares = BTreeMap::new();
 
         for j in 1..=n {
-            let mut agg: dkg::Aggregator<Point> = dkg::Aggregator::new(j);
+            let mut agg: dkg::Aggregator<Point> = dkg::Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
                 let subshare = dealer.generate_subshare(j);
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
-            let share_scalar = agg.finalize(n).unwrap();
+            let share_scalar = agg.finalize().unwrap();
             if group_key.is_none() {
-                group_key = Some(agg.derive_group_key());
+                group_key = Some(agg.derive_group_key().unwrap());
             }
             let ss = SecretShare::new(j, share_scalar);
             vshares.insert(j, Point::generator().mul_scalar(ss.scalar()));
