@@ -1,22 +1,69 @@
 # changelog
 
-## [0.4.0] - unreleased
+## [0.4.0] - 2026-09-20
 
 Security release addressing SECURITY-REVIEW-2026-09.md. **Breaking**, and on
 secp256k1 **wire- and signature-incompatible with 0.3.x** — see C-1.
 
-### fixed
+Every PoC in `tests/audit_*.rs` that targets this crate is now an un-ignored
+regression test asserting the attack fails. The three that remain `#[ignore]`d
+are about `ghettobox-vault-pvm`'s threshold ElGamal (E-1..E-3), which is not
+this crate.
 
-- **C-1 (High, secp256k1)** — `OsstPoint::compress` returned the bare
-  x-coordinate and `decompress` always rebuilt the even-y point. It was neither
-  a round trip (half of all serialized commitments came back negated) nor
-  injective (`P` and `-P` hashed identically, so binding factors and challenges
-  could not separate a commitment set from its sign-flipped variants — the
-  exact coupling the binding factor exists to create).
+### fixed — nested FROST v2
+
+- **N-1 (High)** — `inner_sign_v2` bound the signer to no message. It took
+  three scalars and an index list, so an inner holder had no input from which
+  to tell what it was authorising, and a malicious coordinator could derive the
+  outer context honestly over a message of its own choosing, collect inner
+  shares, and assemble a valid signature over a payload the inner group never
+  saw. In the intended deployments — a bridge position, a jury — gating *which*
+  payload gets signed is the entire security property.
+
+  `inner_sign_v2` now takes the approved message and a `NestedSigningRequest`
+  (outer package, group key, nested index, session id, inner commitment set,
+  quorum), recomputes the binding factor and challenge locally, and returns
+  `MessageMismatch` when the package's message is not the approved one.
+  `inner_sign_v2_with_context` takes a `SigningContext` instead of raw bytes;
+  `frost::sign_with_context` does the same for the flat path (S-1).
+
+  `InnerSigningParamsV2`'s fields are private and `from_outer` is the only
+  derivation, so a coordinator cannot supply a challenge at all; where a wire
+  format distributes one anyway, `from_coordinator_checked` recomputes and
+  returns `ChallengeMismatch`.
+
+- **N-2 (Medium)** — nothing tied the outer package's nested commitment to the
+  inner round. Round 1 now carries a `session_id` through `inner_commit`,
+  `InnerNonces` and `InnerCommitments`, and `inner_sign_v2` checks that the
+  nonces belong to this session, that the published set contains this holder's
+  own round-1 commitment, and that the package's entry for the nested position
+  is exactly (ΣD_k, ΣE_k) over that set. `verify_nested_commitment` exposes the
+  last check. `aggregate_inner_commitment_pair` returns a `Result` and rejects
+  empty lists, duplicate holders and mixed sessions.
+
+- **N-3 (Low)** — `aggregate_inner_shares_verified` requires the multiset of
+  `holder_index` to equal `active_indices`; a missing or duplicated holder is
+  named instead of silently producing a wrong scalar.
+
+- **R-1 (Medium)** — nested v1 is gone from the default build. The RedPallas
+  path (`zcash::nested_redpallas_sign`) shipped the v1 construction unmarked in
+  the ciphersuite closest to mainnet value; it, `aggregate_inner_commitments`,
+  `inner_sign`, `InnerSigningParams`, `aggregate_inner_shares` and the inner
+  binding factors are now behind the off-by-default `legacy-v1` feature,
+  documented as insecure and retained only so an existing deployment compiles
+  while it migrates. The RedPallas FVK seed derivation is marked demo-only.
+
+### fixed — curve backends
+
+- **C-1 (High, secp256k1)** — `compress()` returned the bare x-coordinate and
+  `decompress()` always rebuilt the even-y point, so the encoding was neither a
+  round trip (half of all serialized commitments came back negated) nor
+  injective (`P` and `-P` hashed identically, breaking the very coupling the
+  binding factor exists to create).
 
   `compress` now returns SEC1 compressed, 33 bytes, parity byte included;
   `decompress` takes a slice and rejects anything that is not a canonical
-  encoding of that exact length — the 32-byte x-only form 0.3.0 accepted
+  encoding of exactly `COMPRESSED_SIZE` bytes, the 32-byte x-only form
   included. The identity encodes as 33 zero bytes.
 
   **Compatibility, secp256k1 only.** The compressed encoding feeds
@@ -32,10 +79,100 @@ secp256k1 **wire- and signature-incompatible with 0.3.x** — see C-1.
   (`[u8; 32]`, or `[u8; 33]` on secp256k1), `compress_vec`/`decompress_slice`
   are gone, and every fixed-width serializer that embedded a point
   (`Contribution`, `frost::SigningCommitments`, `frost::Signature`,
-  `liveness::ContributionSignature`, `reshare::DealerCommitment`) now produces
-  and consumes `Vec<u8>`/`&[u8]` sized by `COMPRESSED_SIZE`.
-  `liveness::ContributionSignature` is generic over the point, holding `R` as a
-  point rather than 32 bytes.
+  `liveness::ContributionSignature`, `reshare::DealerCommitment`,
+  `reshare::SharePolynomial`) produces and consumes `Vec<u8>`/`&[u8]` sized by
+  `COMPRESSED_SIZE`.
+
+- **Z-1 (Low)** — `OsstScalar::zeroize` no longer has a default. The old
+  default was a non-volatile `*self = Self::zero()` that three of the four
+  backends inherited — including the Zcash and Penumbra ones — and that the
+  compiler was entitled to elide in every `Drop` impl calling it. Pallas,
+  secp256k1 and decaf377 now use a volatile write plus a compiler fence.
+
+### fixed — DKG and resharing
+
+- **K-1 (Medium)** — dealers publish a Schnorr proof of knowledge of their
+  constant term (Komlo–Goldberg SAC 2020 §5.1) in a new `dkg::Round1Package`,
+  verified by `DkgState::submit_commitment` before anything is recorded. Both
+  failure modes name the dealer — `InvalidProofOfKnowledge(i)` and
+  `InvalidSubShare(i)` — and `DkgState::disqualify(i)` drops that dealer from
+  the group key and every verification share, returning `DkgAborted` when too
+  few remain. `derive_group_key` documents the two caveats that remain: it does
+  not witness round 2, and Pedersen DKG without commit–reveal carries the
+  GJKR99 last-publisher bias.
+
+- **D-1 (Critical) / D-2 (High)** — new `osst::sealed`, behind a `sealed`
+  feature gated on `std`. Round-2 sub-shares were plaintext scalars with no
+  sealed alternative in the crate, and `narsild` accordingly put them on the
+  wire as JSON over HTTP and broadcast each to every peer, so any single
+  participant could reconstruct the group key. Sealing uses
+  `Noise_K_25519_ChaChaPoly_BLAKE2s` via `snow` — the pattern ZF's
+  `frost-client` and zcli's `frost-spend` both use — binding recipient (the
+  responder's static key), sender (the `ss` mix, which is what closes D-2),
+  ceremony (roster, session id and round as the Noise prologue) and the
+  dealer's Feldman commitment (digest inside the sealed plaintext, so a
+  sub-share and a commitment cannot be sourced separately). API:
+  `SealedRoster`, `seal_subshare`/`open_subshare` — the Feldman check runs
+  inside `open_subshare` and its failure names the dealer — `seal_round2`, and
+  `x25519_{secret,public}_from_seed` deriving the static key from the
+  participant's existing identity seed.
+
+- **B-1 (Low)** — `batch_verify_subshares` pairs sub-shares with commitments by
+  `dealer_index` rather than by position.
+
+### fixed — hashing and API hygiene
+
+- **L-1 (Medium)** — the liveness signature challenge is
+  `H("osst/liveness-sig/v1" ‖ R ‖ Y ‖ message)`. Without the key it was
+  malleable: `(R, s)` valid under `Y` became `(R, s + e·delta)` valid under
+  `Y + delta·G`. Liveness signatures made by 0.3.x do not verify under 0.4.0.
+- **H-1 (Low)** — the OSST contribution challenge carries
+  `"osst/contribution/v1"`. It used to be byte-identical to the liveness
+  challenge, so a liveness signature over a 64-byte message *was* an OSST
+  contribution over that payload. The OSST challenge therefore changes on every
+  backend.
+- **F-1 (Low)** — `frost::sign` rejects a package whose commitment under the
+  signer's own index is not the one its nonces produced
+  (`UnexpectedCommitment`), as ZF `frost-core` does.
+- **P-1 (Low)** — `assert!` on wire-parsed indices and thresholds became
+  `Result`. `SecretShare::new`, `frost::commit`, `redpallas::commit`,
+  `dkg::Dealer::{new, generate_subshare, generate_subshares}`,
+  `reshare::Dealer::{new, generate_subshare}`, `reshare::SubShare::new`,
+  `DealerCommitment::{from_polynomial, evaluate_at}` and
+  `SharePolynomial::evaluate_at` all return `OsstError`. A zero index from a
+  peer used to abort a validator.
+- `liveness::ContributionVerifier::verify_batch` takes `&[(u32, P)]` and looks
+  keys up by dealer index; `ContributionError::IndexMismatch` is finally
+  constructed.
+
+### documentation
+
+- `SECURITY-nested-frost.md` §4.1 no longer claims v2's security "reduces to
+  FROST's existing proof" — the equivalence test establishes honest-transcript
+  equality, not a reduction. §4.2 no longer presents commit–reveal as the
+  replacement for the removed inner binding factor. §5 replaces the "far below
+  the ROS threshold" comparison with the actual sub-exponential cost at ℓ = 4.
+
+### not addressed
+
+- **W-1..W-4** are against zcli's weighted `frost-spend`, not this crate. W-1
+  is fixed here in the form N-1 takes; the weighted wrapper must adopt the new
+  `inner_sign_v2` shape. W-4 has no analogue in osst: its only "weights" are
+  the OSST verification scalars, not integer stake.
+- **E-1..E-3** are against `ghettobox-vault-pvm`'s threshold ElGamal, which
+  needs a Chaum–Pedersen DLEQ per partial and an AEAD. Their PoCs stay
+  `#[ignore]`d here as the record.
+- **N-4** — `interleaved_dkg` is still a single-process simulation. Renaming it
+  and splitting it into dealer-side and holder-side halves is a design change,
+  not a fix, and is left open.
+- **A-2** — the binding factor still omits the group public key, where RFC 9591
+  includes it. The challenge does include `Y`, so cross-group confusion at the
+  signature level is prevented; changing it is a wire break for every backend
+  with no security gain that has been demonstrated, so it is left open.
+- **A-3** — a durable spent-round store keyed by `(epoch, session_id,
+  holder_index)`. The session id now exists to key one with, but the store
+  itself is the caller's, and where it belongs is a deployment decision.
+- `threshold > n` is still unchecked: a `Dealer` does not know `n`.
 
 ## [0.3.0] - 2026-09-20
 
