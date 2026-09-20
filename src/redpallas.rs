@@ -1039,7 +1039,6 @@ mod tests {
     use super::zcash::*;
     use crate::frost::Signature;
     use crate::SecretShare;
-    use pasta_curves::group::ff::Field;
     use pasta_curves::pallas::{Point, Scalar};
     use rand::rngs::OsRng;
     use crate::curve::OsstPoint;

@@ -51,7 +51,7 @@ pub mod liveness;
 pub mod nested;
 pub mod redpallas;
 pub mod reshare;
-#[cfg(test)]
+#[cfg(all(test, feature = "pallas"))]
 pub(crate) mod test_rng;
 mod types;
 

@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features
+      - run: cargo test --all-features
+      - run: cargo doc --no-deps --all-features
+
+  backends:
+    name: backend ${{ matrix.backend }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [ristretto255, pallas, secp256k1, decaf377]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # no_std build of the single backend.
+      # pallas is excluded: its redpallas helpers use rand_core::OsRng, which
+      # needs getrandom/std (pre-existing since 0.1.0).
+      - name: build (no_std)
+        if: matrix.backend != 'pallas'
+        run: cargo build --no-default-features --features ${{ matrix.backend }}
+      - name: test (std + backend)
+        run: cargo test --no-default-features --features std,${{ matrix.backend }}

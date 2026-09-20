@@ -38,7 +38,7 @@ impl rand_core_10::TryRng for OsRng10 {
 
 impl rand_core_10::TryCryptoRng for OsRng10 {}
 
-#[cfg(all(test, feature = "pallas"))]
+#[cfg(test)]
 mod tests {
     use super::OsRng10;
 

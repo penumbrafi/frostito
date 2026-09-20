@@ -5,6 +5,19 @@ identification, DKG, and proactive resharing.
 
 implementation of the OSST protocol from ["One-Step Schnorr Threshold Identification"](https://eprint.iacr.org/2025/722) by Foteinos Mergoupis-Anagnou (GRNET).
 
+## canonical repo
+
+the canonical source for this crate lives at
+**https://github.com/penumbrafi/frostito**. the cargo package is named
+`osst` (dependents `use osst::...`); the repository is named after the
+protocol stack.
+
+the vendored copies in `zcli` (`crates/osst`) and `zk.poker`
+(`crates/frostito`) are being removed in favour of a git dependency on this
+repo. `github.com/rotkonetworks/frostito` is kept as a mirror of `main` so
+existing pins (`rev = "14e38da"`) keep resolving; new work goes to
+penumbrafi.
+
 ## security warning
 
 this crate has not been audited. use at your own risk.
@@ -91,14 +104,18 @@ if you need identifiable aborts:
 - **threshold**: requires t-of-n provers to verify
 - **proactive resharing**: rotate custodian sets without changing the group public key
 - **multi-curve**: ristretto255, pallas, secp256k1, decaf377
-- **no_std**: works in constrained environments (wasm, polkavm)
+- **no_std**: works in constrained environments (wasm, polkavm). exception:
+  the `redpallas` helpers reach for `rand_core::OsRng`, so `pallas` needs
+  `std` for those (`--features std,pallas`); the core protocol is no_std on
+  every backend.
 
 ## curves
 
 | feature | curve | compatibility |
 |---------|-------|---------------|
 | `ristretto255` | curve25519 | polkadot, sr25519 |
-| `pallas` | pallas | zcash orchard |
+| `pallas` | pallas (curve generator) | generic pallas |
+| `pallas` | pallas in the orchard spend-auth group (`OrchardSpendAuthCurve`) | zcash orchard, ZF `reddsa` / `frost-core` FROST(Pallas) |
 | `secp256k1` | secp256k1 | bitcoin, ethereum |
 | `decaf377` | decaf377 | penumbra |
 
@@ -151,6 +168,9 @@ lowest committed dealer indices) for coordinators to put in the manifest.
 - `osst::reshare` - proactive secret sharing
 - `osst::liveness` - checkpoint proofs for custodian participation
 - `osst::curve` - curve backend traits
+- `osst::dkg` - distributed key generation over an agreed dealer set
+- `osst::nested` - nested FROST (see `SECURITY-nested-frost.md`)
+- `osst::redpallas` - zcash orchard spend-auth signing helpers
 
 ## license
 
