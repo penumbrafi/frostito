@@ -15,32 +15,37 @@
 //!   OSST gates authorization, inner FROST produces the partial signature
 //! ```
 //!
-//! # signing protocol
+//! # signing protocol (v2)
 //!
-//! inner holders run a full FROST commitment round among themselves before
-//! the outer commitment list is assembled. this prevents adaptive commitment
-//! selection attacks at the inner level (the same attack that outer FROST's
-//! binding factors prevent at the outer level).
-//!
-//! 1. inner holders generate nonce pairs and broadcast commitments
-//! 2. inner binding factors computed from inner commitment list + outer message
-//! 3. inner bound commitments: R_k = D_k + ρ_inner_k · E_k
-//! 4. relay sums: R_nested = Σ R_k (single point for outer protocol)
-//! 5. outer FROST uses R_nested as the nested position's commitment
-//! 6. inner holders compute: z_k = d_k + ρ_inner_k·e_k + (λ_out·c·μ_k)·σ_k
-//! 7. relay sums: z_nested = Σ z_k
+//! 1. inner holders agree a `session_id`, generate nonce pairs, publish
+//!    H(k ‖ session ‖ D_k ‖ E_k), then reveal (D_k, E_k)
+//! 2. the aggregate PAIR (Σ D_k, Σ E_k) is presented to the outer protocol as
+//!    the nested position's ordinary `SigningCommitments`
+//! 3. the outer protocol computes ρ = H(index, m, B) over the full outer
+//!    commitment list and c = H(R, Y, m) exactly as for any other signer
+//! 4. each inner holder recomputes ρ and c itself from the outer package —
+//!    it holds the message it approved, and refuses to sign any other — and
+//!    produces z_k = d_k + ρ·e_k + (λ_out·c·μ_k)·σ_k
+//! 5. shares are verified individually, then summed: z_nested = Σ z_k
 //!
 //! # security
 //!
-//! inner binding factors ensure no inner holder can adaptively choose their
-//! commitment after seeing others'. the outer binding factor is not applied
-//! to inner nonces — instead, the inner group presents a single pre-bound
-//! commitment to the outer protocol. the outer protocol treats this like
-//! any other signer's commitment (applying outer binding on top).
+//! The nested position is presented to the outer protocol exactly as a flat
+//! signer would be, so it receives a real outer binding factor: ρ moves
+//! whenever any honest inner commitment moves, and an adversary cannot hold an
+//! honest effective nonce fixed while sweeping the challenge.
 //!
-//! the security composition (inner FROST feeding into outer FROST) is
-//! believed correct by linearity but has not been formally proven in a
-//! game-based reduction. this is an open problem.
+//! What the in-crate equivalence test establishes is honest-transcript
+//! equality — the nested position's response is bit-for-bit a flat signer's —
+//! **not** a reduction. A reduction from an adversary against the nested
+//! scheme to one against FROST is plausible and is the right question for a
+//! cryptographer; it has not been done. The inner group must be treated as one
+//! trust unit: `t_in` corrupt holders are a corrupt outer signer, with no
+//! further guarantee.
+//!
+//! v1 — a pre-bound single point with an identity binding commitment — is
+//! insecure (SECURITY-nested-frost.md §2) and is available only behind the
+//! off-by-default `legacy-v1` feature.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -291,11 +296,14 @@ pub fn inner_commit<P: OsstPoint, R: rand_core::RngCore + rand_core::CryptoRng>(
 
 /// inner binding factor: prevents adaptive commitment selection among inner holders.
 ///
+/// # ⚠️ v1 — INSECURE. See the `legacy-v1` feature.
+///
 /// ρ_inner_k = H("frostito-inner-bind" || k || msg || inner_commitment_list)
 ///
 /// this mirrors FROST's binding factor but operates at the inner level.
 /// each inner holder's binding nonce is mixed with the full inner commitment
 /// list so that no holder can choose their commitment after seeing others'.
+#[cfg(feature = "legacy-v1")]
 fn inner_binding_factor<P: OsstPoint>(
     holder_index: u32,
     outer_message: &[u8],
@@ -339,6 +347,7 @@ fn inner_binding_factor<P: OsstPoint>(
 /// this means the outer binding factor for the nested position is effectively
 /// unused (binding commitment is identity). the inner binding factors provide
 /// the equivalent security at the inner level.
+#[cfg(feature = "legacy-v1")]
 pub fn aggregate_inner_commitments<P: OsstPoint>(
     inner_commitments: &[InnerCommitments<P>],
     outer_message: &[u8],
@@ -355,9 +364,12 @@ pub fn aggregate_inner_commitments<P: OsstPoint>(
 
 /// parameters distributed to inner holders for signing.
 ///
+/// # ⚠️ v1 — INSECURE. See the `legacy-v1` feature.
+///
 /// the relay computes these from the outer FROST context. inner holders
 /// can independently verify them against public data (outer commitment list,
 /// group public key, message).
+#[cfg(feature = "legacy-v1")]
 #[derive(Clone)]
 pub struct InnerSigningParams<S: OsstScalar> {
     /// outer schnorr challenge: c = H(R_outer, Y, m)
@@ -394,6 +406,7 @@ impl<S: OsstScalar> core::fmt::Debug for InnerSignatureShare<S> {
 ///             = R_nested_scalar + λ_outer·c·s_p
 ///
 /// which is a valid FROST partial signature for the nested position.
+#[cfg(feature = "legacy-v1")]
 pub fn inner_sign<P: OsstPoint>(
     nonces: InnerNonces<P::Scalar>,
     share: &SecretShare<P::Scalar>,
@@ -426,6 +439,10 @@ pub fn inner_sign<P: OsstPoint>(
 }
 
 /// aggregate inner signature shares into the nested position's outer share
+///
+/// # ⚠️ v1 — unverified summation. v2 callers use
+/// [`aggregate_inner_shares_verified`], which names a faulty holder.
+#[cfg(feature = "legacy-v1")]
 pub fn aggregate_inner_shares<S: OsstScalar>(
     shares: &[InnerSignatureShare<S>],
 ) -> S {
@@ -852,6 +869,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "legacy-v1")]
     fn test_nested_frost_2of3_with_3of5_inner() {
         let mut rng = OsRng;
 
@@ -1041,6 +1059,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "legacy-v1")]
     fn test_nested_frost_different_subsets() {
         let mut rng = OsRng;
 
@@ -1183,6 +1202,7 @@ mod tests {
     }
 
     /// helper: compute outer binding factor (mirrors frost.rs internals)
+    #[cfg(feature = "legacy-v1")]
     fn compute_outer_binding_factor<P: OsstPoint>(
         index: u32,
         message: &[u8],

@@ -119,8 +119,10 @@ their absence: this was code review, not cryptanalysis.
 
 ## 4. v2 — the fix
 
-Implemented in `osst::nested` alongside v1 (v1 retained, marked insecure, so
-existing deployments compile while they migrate).
+Implemented in `osst::nested`. As of 0.4.0 v1 is gone from the default build:
+it survives only behind the off-by-default `legacy-v1` feature, so a caller has
+to name it in its own `Cargo.toml` to reach it, and the RedPallas path
+(`zcash::nested_redpallas_sign`) is gated the same way.
 
 **Present a commitment PAIR, not a pre-bound point.**
 
@@ -148,21 +150,42 @@ produces.
 ### 4.1 Why this is easier to trust
 
 The nested position becomes **indistinguishable from a flat FROST signer** whose
-nonce and key happen to be additively shared. Security therefore reduces to
-FROST's existing proof plus inner-group honesty, instead of requiring a novel
-composition argument.
+nonce and key happen to be additively shared, on honest inputs.
 
 `nested_v2_equals_flat_frost` asserts this on real values: it builds an outer
 2-of-2, splits position 2's key 3-of-5, and checks the nested signature share is
 bit-for-bit equal to the flat share and that the assembled signature verifies.
 A reviewer can check that property in minutes.
 
+**What that test establishes, precisely.** Honest-transcript equality: the two
+transcripts coincide when everyone follows the protocol. It is **not** a
+reduction — it does not show that an adversary against the nested scheme yields
+an adversary against FROST. An earlier version of this note said "security
+therefore reduces to FROST's existing proof"; that overstated what has been
+demonstrated. The reduction is plausible, it is the right question to put to a
+cryptographer, and it has not been done. What the equality does buy is that a
+reviewer checking v2 is checking a construction whose output is a FROST
+transcript, rather than a novel composition — and the obligation that comes with
+it is that the inner group is one trust unit: `t_in` corrupt holders are a
+corrupt outer signer, with no further guarantee.
+
 ### 4.2 Inner adaptive selection
 
-Removing ρ_inner reopens the concern it addressed, so v2 adds an explicit
-commit–reveal round: every holder publishes H(k ‖ D_k ‖ E_k) before any
-commitment is revealed (`inner_precommit` / `verify_inner_precommit`). No holder
-sees another's commitment before fixing its own.
+v2 adds an explicit commit–reveal round: every holder publishes
+H(k ‖ session_id ‖ D_k ‖ E_k) before any commitment is revealed
+(`inner_precommit` / `verify_inner_precommit`), so no holder sees another's
+commitment before fixing its own.
+
+**It is not the replacement for ρ_inner, and should not be described as one.**
+Once the outer ρ applies to E_nested — which is exactly what presenting a pair
+rather than a pre-bound point achieves — adaptive inner commitment selection
+gains an adversary nothing: the concrete restoration of the v1 gap, setting
+E_nested to the identity by choosing E_adv = −Σ_honest E_k, fails because the
+adversary would then have to answer with z_adv for a commitment whose discrete
+log it does not know. D_nested = Σ D_k is still a k-sum that a holder revealing
+last can steer, and closing that in general is what the round is for. Keep it —
+it is cheap and it is defence in depth — but the reason v2 is sound is the outer
+binding factor, not the commit–reveal.
 
 ### 4.3 Share verification
 
@@ -188,8 +211,16 @@ coordinator.
 
 - **Concurrency bound.** `poker-server::jury` caps concurrent signing sessions at
   `MAX_CONCURRENT_JURY_SESSIONS = 4`, held for the whole session, refusing rather
-  than queueing. ROS needs ℓ > ~256; 4 is far below. Mitigation, not a fix —
-  raise only after migrating to v2.
+  than queueing. Mitigation, not a fix — raise only after migrating to v2.
+
+  The earlier phrasing here compared 4 against the ℓ > log2(q) ≈ 256 threshold
+  and called it "far below", which implies a cliff that does not exist. For
+  Wagner-style attacks the cost of forging against ℓ concurrent sessions falls
+  *smoothly* with ℓ: the k-sum problem at ℓ sessions costs roughly
+  2^(2·256/(1+log2(ℓ))) — about 2^171 at ℓ = 4 — and only becomes polynomial
+  once ℓ passes the threshold. So 4 sessions is comfortably outside the
+  polynomial-time ROS regime, and that sub-exponential figure, not the
+  comparison to 256, is the number the bound is buying.
 - Nonce pairs remain consume-by-value and zeroize on drop.
 
 Still outstanding:

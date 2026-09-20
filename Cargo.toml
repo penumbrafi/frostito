@@ -16,6 +16,16 @@ std = [
     "sha2/std",
     "rand_core/std",
 ]
+# Nested FROST v1 — INSECURE, off by default.
+#
+# v1 pre-binds the inner nonces and hands the outer protocol a single point
+# with an identity binding commitment, which severs the outer binding coupling
+# and admits a ROS-style forgery (SECURITY-nested-frost.md §2, finding R-1 of
+# SECURITY-REVIEW-2026-09.md). It is retained ONLY so an existing deployment
+# can compile while it migrates to v2, and a caller has to say so in its own
+# Cargo.toml to reach it. Do not enable for new code.
+legacy-v1 = []
+
 # Curve backends
 ristretto255 = ["dep:curve25519-dalek"]
 pallas = ["dep:pasta_curves", "dep:blake2b_simd"]

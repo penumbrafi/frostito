@@ -433,6 +433,13 @@ pub mod zcash {
 
         // derive FVK seed from private DKG material
         //
+        // DEMO ONLY (SECURITY-REVIEW-2026-09.md §5.1). This computes a
+        // BLAKE2b over BOTH players' secret shares, so it needs both secrets
+        // in one address space, makes the spending key recoverable from any
+        // two shares, and changes the FVK on a key-preserving reshare. It is
+        // here to make the walkthrough runnable; a deployment must derive the
+        // FVK by a route that never gathers the shares.
+        //
         // the seed MUST include secret material that only DKG participants know.
         // using only the group pubkey (public) would let anyone derive the
         // spending key and steal funds. instead, hash the players' secret
@@ -593,6 +600,9 @@ pub mod zcash {
     // ========================================================================
 
     /// Inner binding factor using BLAKE2b for Zcash protocol consistency.
+    ///
+    /// # ⚠️ v1 — INSECURE. See the `legacy-v1` feature.
+    #[cfg(feature = "legacy-v1")]
     fn redpallas_inner_binding_factor(
         holder_index: u32,
         outer_message: &[u8],
@@ -616,11 +626,22 @@ pub mod zcash {
 
     /// Complete nested RedPallas signing for escrow disputes.
     ///
+    /// # ⚠️ v1 — INSECURE, and single-process. Behind `legacy-v1`.
+    ///
+    /// This is the v1 construction: it hands the outer protocol a single
+    /// pre-bound point with an identity binding commitment, so the outer
+    /// binding factor multiplies the identity and vanishes
+    /// (SECURITY-nested-frost.md §2.1, finding R-1). It also takes the whole
+    /// `JuryNetwork` — every jury share in one address space — so it is a
+    /// single-process helper, not a distributed protocol. Do not distribute
+    /// the jury onto it.
+    ///
     /// Combines OSST authorization + nested FROST signing with RedPallas
     /// (BLAKE2b) hashes throughout. Produces a standard Zcash Orchard
     /// SpendAuth signature.
     ///
     /// s₃ is NEVER reconstructed. Returns None if OSST fails or signing fails.
+    #[cfg(feature = "legacy-v1")]
     pub fn nested_redpallas_sign(
         jury: &JuryNetwork,
         player_share: &SecretShare<Scalar>,
@@ -1519,6 +1540,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "legacy-v1")]
     fn test_nested_redpallas_sign() {
         let mut rng = rand::rngs::OsRng;
         let jury_n = 5u32;
