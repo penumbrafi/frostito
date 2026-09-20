@@ -60,6 +60,14 @@ pub enum OsstError {
     /// The ceremony cannot continue: too few dealers remain after
     /// disqualification.
     DkgAborted { qualified: usize, need: usize },
+
+    /// A sealed package did not open. Carries the dealer it claimed to come
+    /// from. Which of wrong-sender, wrong-recipient, wrong-ceremony or
+    /// tampering caused it is deliberately not reported.
+    SealedOpenFailed(u32),
+
+    /// A participant is not on the sealed roster.
+    UnknownParticipant(u32),
 }
 
 impl fmt::Display for OsstError {
@@ -96,6 +104,12 @@ impl fmt::Display for OsstError {
             }
             Self::InvalidSubShare(idx) => {
                 write!(f, "dealer {} sent an invalid sub-share", idx)
+            }
+            Self::SealedOpenFailed(idx) => {
+                write!(f, "sealed package from dealer {} did not open", idx)
+            }
+            Self::UnknownParticipant(idx) => {
+                write!(f, "participant {} is not on the roster", idx)
             }
             Self::DkgAborted { qualified, need } => write!(
                 f,
