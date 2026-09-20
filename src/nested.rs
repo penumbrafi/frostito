@@ -1257,7 +1257,7 @@ impl<S: OsstScalar> InnerSigningParamsV2<S> {
     /// coordinator never gets to *assert* the challenge, binding factor or
     /// Lagrange coefficient — it can only distribute commitments, and any
     /// tampering shows up as a share that fails
-    /// [`verify_inner_share`](crate::nested::verify_inner_share).
+    /// [`verify_inner_share`].
     ///
     /// `nested_index` is the nested position's index in the OUTER signing set.
     ///
