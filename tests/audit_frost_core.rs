@@ -56,22 +56,17 @@ fn sign_accepts_a_foreign_commitment_for_its_own_index() {
     );
 }
 
-/// L-1 (Medium) — the liveness contribution signature omits the public key from
-/// the challenge, so it is malleable in the key.
+/// L-1 (Medium, FIXED) — the liveness contribution signature binds the public
+/// key, so it is no longer malleable in the key.
 ///
-/// `challenge_hash(R, m) = SHA512(R || m)` has no key prefix and no domain tag.
-/// Verification is `g^s == R + e*Y`. Because `e` does not depend on `Y`, a
-/// signature `(R, s)` valid under `Y` transforms into `(R, s + e*delta)` valid
-/// under `Y + delta*G` for any `delta` the adversary picks, over the SAME
-/// message. Any registry that admits a public key without a proof of possession
-/// therefore admits a party that can exhibit valid liveness contributions for a
-/// key nobody controls, derived from someone else's.
-///
-/// RFC 8032 and BIP340 both bind the key into the challenge for exactly this
-/// reason.
+/// The challenge is now
+/// `e = H("osst/liveness-sig/v1" || R || Y || message)`. Verification is
+/// `g^s == R + e*Y`; because `e` moves with `Y`, the shift that used to carry
+/// a signature onto a related key — `(R, s) -> (R, s + e*delta)` under
+/// `Y + delta*G` — no longer verifies. RFC 8032 and BIP340 bind the key for
+/// exactly this reason.
 #[test]
-#[ignore = "L-1: liveness signature challenge omits the public key (related-key malleability)"]
-fn liveness_signature_is_malleable_in_the_public_key() {
+fn liveness_signature_does_not_transfer_to_a_related_key() {
     let mut rng = OsRng;
 
     let sk = <Scalar as OsstScalar>::random(&mut rng);
@@ -86,77 +81,85 @@ fn liveness_signature_is_malleable_in_the_public_key() {
         DealerContribution::sign(dealer.commitment().clone(), liveness, &sk, context, &mut rng);
     assert!(contribution.verify_signature(&pk, context));
 
-    // e is recomputable by anyone: it depends only on (R, message).
     let message = DealerContribution::<Point>::signing_message(
         &contribution.commitment,
         &contribution.liveness,
         context,
     );
-    let e = {
-        use sha2::{Digest, Sha512};
-        let mut h = Sha512::new();
-        h.update(OsstPoint::compress(&contribution.signature.r));
-        h.update(message);
-        let full: [u8; 64] = h.finalize().into();
-        <Scalar as OsstScalar>::from_bytes_wide(&full)
-    };
 
-    // Shift the key by delta and the response by e*delta.
+    // The adversary recomputes e with the CURRENT formula — it is public — and
+    // applies the related-key shift that used to work.
     let delta = <Scalar as OsstScalar>::random(&mut rng);
     let pk_shifted = pk.add(&<Point as OsstPoint>::generator().mul_scalar(&delta));
+    let e = DealerContribution::<Point>::challenge_hash(&contribution.signature.r, &pk, &message);
     let forged = DealerContribution {
         commitment: contribution.commitment.clone(),
         liveness: contribution.liveness.clone(),
         signature: osst::liveness::ContributionSignature::new(
-            contribution.signature.r,
+            contribution.signature.r.clone(),
             contribution.signature.s.add(&e.mul(&delta)),
         ),
     };
-
     assert!(
         !forged.verify_signature(&pk_shifted, context),
         "a signature must not transfer to a related key"
     );
+
+    // Nor does re-deriving e under the shifted key help: that changes the
+    // challenge the forged response would have to satisfy.
+    let e_shifted =
+        DealerContribution::<Point>::challenge_hash(&contribution.signature.r, &pk_shifted, &message);
+    let forged2 = DealerContribution {
+        commitment: contribution.commitment.clone(),
+        liveness: contribution.liveness.clone(),
+        signature: osst::liveness::ContributionSignature::new(
+            contribution.signature.r.clone(),
+            contribution.signature.s.add(&e_shifted.mul(&delta)),
+        ),
+    };
+    assert!(!forged2.verify_signature(&pk_shifted, context));
+
+    // The honest signature still verifies, and only under its own key.
+    assert!(contribution.verify_signature(&pk, context));
+    assert!(!contribution.verify_signature(&pk_shifted, context));
 }
 
-/// H-1 (Low) — the OSST contribution challenge and the liveness signature
-/// challenge are the same unlabelled hash, so the two protocols share a
-/// challenge space.
+/// H-1 (Low, FIXED) — the OSST contribution challenge and the liveness
+/// signature challenge are now separate hashes.
 ///
-/// `osst::hash_to_challenge(u, payload) = SHA512(compress(u) || payload)` and
-/// `liveness::challenge_hash(R, m) = SHA512(R || m)` are byte-identical
-/// functions. A liveness signature `(R, s)` over a 64-byte message `m` IS an
-/// OSST contribution `(u = R, s)` over payload `m`, and vice versa. Nothing in
-/// the crate stops the two from being instantiated on the same key; a
-/// deployment that signs liveness with a key that is also an OSST share hands
-/// over OSST contributions for free.
-///
-/// Not ignored: it is a true statement about the current code and stays true
-/// until a domain tag is added, at which point this test should start failing
-/// and be deleted.
+/// They used to be byte-identical (`SHA512(R || m)` both), so a liveness
+/// signature over a 64-byte message WAS an OSST contribution over that
+/// payload. They now carry `"osst/contribution/v1"` and
+/// `"osst/liveness-sig/v1"` respectively, and the liveness one also binds the
+/// key.
 #[test]
-fn osst_and_liveness_challenges_are_the_same_hash() {
+fn osst_and_liveness_challenges_are_domain_separated() {
     use sha2::{Digest, Sha512};
 
     let mut rng = OsRng;
     let u = <Point as OsstPoint>::generator()
         .mul_scalar(&<Scalar as OsstScalar>::random(&mut rng));
+    let y = <Point as OsstPoint>::generator()
+        .mul_scalar(&<Scalar as OsstScalar>::random(&mut rng));
     let payload = [7u8; 64];
 
     let osst_c: Scalar = osst::hash_to_challenge::<Scalar, Point>(&u, &payload);
+    let liveness_c = DealerContribution::<Point>::challenge_hash(&u, &y, &payload);
+    assert_ne!(
+        osst_c, liveness_c,
+        "the two protocols must not share a challenge space"
+    );
 
-    let liveness_c: Scalar = {
+    // And the old, undomained hash is now neither of them.
+    let legacy: Scalar = {
         let mut h = Sha512::new();
-        h.update(OsstPoint::compress(&u)); // this is the `r` field of a ContributionSignature
-        h.update(payload); // this is the 64-byte `signing_message`
+        h.update(OsstPoint::compress(&u));
+        h.update(payload);
         let full: [u8; 64] = h.finalize().into();
         <Scalar as OsstScalar>::from_bytes_wide(&full)
     };
-
-    assert_eq!(
-        osst_c, liveness_c,
-        "OSST and liveness use the same undomained SHA-512 challenge"
-    );
+    assert_ne!(legacy, osst_c);
+    assert_ne!(legacy, liveness_c);
 }
 
 /// P-1 (Low) — adversarial indices panic rather than erroring.

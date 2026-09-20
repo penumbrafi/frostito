@@ -98,13 +98,26 @@ pub fn random_scalar<S: OsstScalar, R: rand_core::RngCore + rand_core::CryptoRng
     S::random(rng)
 }
 
+/// Domain tag for the OSST contribution challenge.
+pub const OSST_CONTRIBUTION_DOMAIN: &[u8] = b"osst/contribution/v1";
+
 /// Hash a point and payload to a scalar challenge
-/// H(u_i || payload) -> c_i
+///
+/// `c_i = H(OSST_CONTRIBUTION_DOMAIN || u_i || payload)`
+///
+/// # Domain separation
+///
+/// Until 0.4.0 this was `SHA512(compress(u) || payload)`, byte-identical to
+/// `liveness::challenge_hash` (H-1): a liveness signature `(R, s)` over a
+/// 64-byte message *was* an OSST contribution over that payload, and vice
+/// versa, so a dealer holding one key for both handed over contributions for
+/// free. The two are now separated by tag.
 pub fn hash_to_challenge<S: OsstScalar, P: OsstPoint<Scalar = S>>(
     commitment: &P,
     payload: &[u8],
 ) -> S {
     let mut hasher = Sha512::new();
+    hasher.update(OSST_CONTRIBUTION_DOMAIN);
     hasher.update(commitment.compress());
     hasher.update(payload);
     let hash: [u8; 64] = hasher.finalize().into();
