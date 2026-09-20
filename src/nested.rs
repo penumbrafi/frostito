@@ -1192,8 +1192,8 @@ mod tests {
         for idx in package.signer_indices() {
             let c = package.get_commitments(idx).unwrap();
             encoded.extend_from_slice(&c.index.to_le_bytes());
-            encoded.extend_from_slice(&c.hiding.compress());
-            encoded.extend_from_slice(&c.binding.compress());
+            encoded.extend_from_slice(c.hiding.compress().as_ref());
+            encoded.extend_from_slice(c.binding.compress().as_ref());
         }
         let mut h = Sha512::new();
         h.update(b"frost-binding-v1");

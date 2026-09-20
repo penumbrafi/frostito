@@ -155,42 +155,57 @@ pub struct DealerContribution<P: OsstPoint> {
     /// Proof of infrastructure participation
     pub liveness: LivenessProof,
     /// Schnorr signature binding commitment + liveness
-    pub signature: ContributionSignature<P::Scalar>,
+    pub signature: ContributionSignature<P>,
 }
 
 /// Schnorr signature over contribution
+///
+/// `r` is held as a point, not as bytes: the curve's canonical compressed
+/// encoding is not 32 bytes on every backend (secp256k1 is 33), and carrying
+/// bytes meant re-deriving a point from a possibly non-canonical encoding on
+/// every verification.
 #[derive(Clone)]
-pub struct ContributionSignature<S: OsstScalar> {
+pub struct ContributionSignature<P: OsstPoint> {
     /// R = g^k
-    pub r: [u8; 32],
+    pub r: P,
     /// s = k + e * x
-    pub s: S,
+    pub s: P::Scalar,
 }
 
-impl<S: OsstScalar> ContributionSignature<S> {
-    pub fn new(r: [u8; 32], s: S) -> Self {
+impl<P: OsstPoint> ContributionSignature<P> {
+    pub fn new(r: P, s: P::Scalar) -> Self {
         Self { r, s }
     }
 
-    pub fn to_bytes(&self) -> [u8; 64] {
-        let mut buf = [0u8; 64];
-        buf[0..32].copy_from_slice(&self.r);
-        buf[32..64].copy_from_slice(&self.s.to_bytes());
+    /// Byte length of the serialized form.
+    #[inline]
+    pub fn byte_size() -> usize {
+        P::COMPRESSED_SIZE + 32
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::byte_size());
+        buf.extend_from_slice(self.r.compress().as_ref());
+        buf.extend_from_slice(&self.s.to_bytes());
         buf
     }
 
-    pub fn from_bytes(bytes: &[u8; 64]) -> Result<Self, OsstError> {
-        let r: [u8; 32] = bytes[0..32].try_into().unwrap();
-        let s = S::from_canonical_bytes(&bytes[32..64].try_into().unwrap())
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, OsstError> {
+        if bytes.len() != Self::byte_size() {
+            return Err(OsstError::InvalidCommitment);
+        }
+        let n = P::COMPRESSED_SIZE;
+        let r = P::decompress(&bytes[0..n]).ok_or(OsstError::InvalidCommitment)?;
+        let s = P::Scalar::from_canonical_bytes(&bytes[n..n + 32].try_into().unwrap())
             .ok_or(OsstError::InvalidResponse)?;
         Ok(Self { r, s })
     }
 }
 
-impl<S: OsstScalar> core::fmt::Debug for ContributionSignature<S> {
+impl<P: OsstPoint> core::fmt::Debug for ContributionSignature<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ContributionSignature")
-            .field("r", &hex_short(&self.r))
+            .field("r", &hex_short(self.r.compress().as_ref()))
             .field("s", &"[SCALAR]")
             .finish()
     }
@@ -220,7 +235,7 @@ impl<P: OsstPoint> DealerContribution<P> {
     pub fn new(
         commitment: DealerCommitment<P>,
         liveness: LivenessProof,
-        signature: ContributionSignature<P::Scalar>,
+        signature: ContributionSignature<P>,
     ) -> Self {
         Self {
             commitment,
@@ -266,15 +281,14 @@ impl<P: OsstPoint> DealerContribution<P> {
         // Schnorr signature
         let k = P::Scalar::random(rng);
         let r_point = P::generator().mul_scalar(&k);
-        let r = r_point.compress();
 
         // e = H(R || message)
-        let e = Self::challenge_hash(&r, &message);
+        let e = Self::challenge_hash(&r_point, &message);
 
         // s = k + e * x
         let s = k.add(&e.mul(secret_key));
 
-        let signature = ContributionSignature::new(r, s);
+        let signature = ContributionSignature::new(r_point, s);
 
         Self {
             commitment,
@@ -287,27 +301,21 @@ impl<P: OsstPoint> DealerContribution<P> {
     pub fn verify_signature(&self, public_key: &P, context: &[u8]) -> bool {
         let message = Self::signing_message(&self.commitment, &self.liveness, context);
 
-        // Decompress R
-        let r_point = match P::decompress(&self.signature.r) {
-            Some(p) => p,
-            None => return false,
-        };
-
         // e = H(R || message)
         let e = Self::challenge_hash(&self.signature.r, &message);
 
         // Verify: g^s == R + Y^e
         let lhs = P::generator().mul_scalar(&self.signature.s);
-        let rhs = r_point.add(&public_key.mul_scalar(&e));
+        let rhs = self.signature.r.add(&public_key.mul_scalar(&e));
 
         lhs == rhs
     }
 
-    fn challenge_hash(r: &[u8; 32], message: &[u8; 64]) -> P::Scalar {
+    fn challenge_hash(r: &P, message: &[u8; 64]) -> P::Scalar {
         use sha2::{Digest, Sha512};
 
         let mut hasher = Sha512::new();
-        hasher.update(r);
+        hasher.update(r.compress());
         hasher.update(message);
 
         let hash: [u8; 64] = hasher.finalize().into();

@@ -117,7 +117,7 @@ impl<P: OsstPoint> DealerCommitment<P> {
     /// Compressed byte size
     #[inline]
     pub fn byte_size(&self) -> usize {
-        4 + self.coefficients.len() * 32
+        4 + self.coefficients.len() * P::COMPRESSED_SIZE
     }
 
     /// Serialize to bytes (for on-chain storage)
@@ -125,14 +125,14 @@ impl<P: OsstPoint> DealerCommitment<P> {
         let mut buf = Vec::with_capacity(self.byte_size());
         buf.extend_from_slice(&self.dealer_index.to_le_bytes());
         for c in &self.coefficients {
-            buf.extend_from_slice(&c.compress());
+            buf.extend_from_slice(c.compress().as_ref());
         }
         buf
     }
 
     /// Deserialize from bytes
     pub fn from_bytes(bytes: &[u8], threshold: u32) -> Result<Self, OsstError> {
-        let expected_len = 4 + (threshold as usize) * 32;
+        let expected_len = 4 + (threshold as usize) * P::COMPRESSED_SIZE;
         if bytes.len() != expected_len {
             return Err(OsstError::InvalidCommitment);
         }
@@ -144,9 +144,9 @@ impl<P: OsstPoint> DealerCommitment<P> {
 
         let mut coefficients = Vec::with_capacity(threshold as usize);
         for i in 0..threshold as usize {
-            let offset = 4 + i * 32;
-            let point_bytes: [u8; 32] = bytes[offset..offset + 32].try_into().unwrap();
-            let point = P::decompress(&point_bytes).ok_or(OsstError::InvalidCommitment)?;
+            let offset = 4 + i * P::COMPRESSED_SIZE;
+            let point = P::decompress(&bytes[offset..offset + P::COMPRESSED_SIZE])
+                .ok_or(OsstError::InvalidCommitment)?;
             coefficients.push(point);
         }
 
@@ -403,22 +403,21 @@ impl<P: OsstPoint> SharePolynomial<P> {
 
     /// Serialize as concatenated compressed points
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32 * self.coefficients.len());
+        let mut buf = Vec::with_capacity(P::COMPRESSED_SIZE * self.coefficients.len());
         for c in &self.coefficients {
-            buf.extend_from_slice(&c.compress());
+            buf.extend_from_slice(c.compress().as_ref());
         }
         buf
     }
 
     pub fn from_bytes(bytes: &[u8], threshold: u32) -> Result<Self, OsstError> {
-        let expected = 32 * threshold as usize;
+        let expected = P::COMPRESSED_SIZE * threshold as usize;
         if threshold == 0 || bytes.len() != expected {
             return Err(OsstError::InvalidCommitment);
         }
         let mut coefficients = Vec::with_capacity(threshold as usize);
-        for chunk in bytes.chunks_exact(32) {
-            let arr: [u8; 32] = chunk.try_into().unwrap();
-            coefficients.push(P::decompress(&arr).ok_or(OsstError::InvalidCommitment)?);
+        for chunk in bytes.chunks_exact(P::COMPRESSED_SIZE) {
+            coefficients.push(P::decompress(chunk).ok_or(OsstError::InvalidCommitment)?);
         }
         Ok(Self { coefficients })
     }

@@ -39,7 +39,7 @@ fn scalar_to_zf(s: &S) -> keys::SigningShare {
 }
 
 fn point_to_zf_share(p: &P) -> keys::VerifyingShare {
-    keys::VerifyingShare::deserialize(&p.compress()).unwrap()
+    keys::VerifyingShare::deserialize(p.compress().as_ref()).unwrap()
 }
 
 /// Rebuild ZF key material for new member `j` from the frostito outputs.
@@ -129,7 +129,7 @@ fn zf_dkg_then_frostito_reshare_then_zf_sign() {
         })
         .collect();
 
-    let group_key_point = P::decompress(&group_key.serialize().unwrap().try_into().unwrap()).unwrap();
+    let group_key_point = P::decompress(&group_key.serialize().unwrap()).unwrap();
 
     let mut new_key_packages = BTreeMap::new();
     let mut polys = Vec::new();

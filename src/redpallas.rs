@@ -164,8 +164,8 @@ pub mod zcash {
         let mut buf = Vec::with_capacity(commitments.len() * 68);
         for (_, c) in commitments {
             buf.extend_from_slice(&c.index.to_le_bytes());
-            buf.extend_from_slice(&c.hiding.compress());
-            buf.extend_from_slice(&c.binding.compress());
+            buf.extend_from_slice(c.hiding.compress().as_ref());
+            buf.extend_from_slice(c.binding.compress().as_ref());
         }
         buf
     }

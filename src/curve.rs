@@ -70,6 +70,21 @@ pub trait OsstPoint: Clone + Debug + Sized + PartialEq + Send + Sync {
     /// Compressed point size in bytes (32 for pallas/ristretto, 33 for secp256k1)
     const COMPRESSED_SIZE: usize;
 
+    /// The canonical compressed encoding of a point.
+    ///
+    /// `[u8; 32]` for the prime-order-group backends, `[u8; 33]` for secp256k1
+    /// (SEC1 compressed, parity byte included). Always exactly
+    /// [`COMPRESSED_SIZE`](Self::COMPRESSED_SIZE) bytes.
+    ///
+    /// # Security
+    ///
+    /// The encoding MUST be injective: `compress(P) == compress(Q)` implies
+    /// `P == Q`. Everything the protocol binds — the FROST binding factor, the
+    /// Schnorr challenge, the inner precommitment — is a hash over these
+    /// bytes, so an encoding that identifies `P` with `-P` destroys the
+    /// coupling those hashes exist to create.
+    type Compressed: AsRef<[u8]> + Copy + PartialEq + Debug + Send + Sync;
+
     /// The identity element
     fn identity() -> Self;
 
@@ -85,25 +100,21 @@ pub trait OsstPoint: Clone + Debug + Sized + PartialEq + Send + Sync {
     /// Multiscalar multiplication (optimized)
     fn multiscalar_mul(scalars: &[Self::Scalar], points: &[Self]) -> Self;
 
-    /// Compress to bytes (32 bytes for most curves)
-    fn compress(&self) -> [u8; 32];
+    /// Compress to this curve's canonical encoding.
+    fn compress(&self) -> Self::Compressed;
 
-    /// Decompress from bytes (32 bytes for most curves)
-    fn decompress(bytes: &[u8; 32]) -> Option<Self>;
+    /// Decompress from a canonical encoding.
+    ///
+    /// Returns `None` for any input that is not exactly
+    /// [`COMPRESSED_SIZE`](Self::COMPRESSED_SIZE) bytes of a canonical
+    /// encoding of a point in the group. Non-canonical encodings — a
+    /// short/long slice, a bad SEC1 prefix, an x-coordinate with no
+    /// y-coordinate supplied — are rejected rather than coerced.
+    fn decompress(bytes: &[u8]) -> Option<Self>;
 
-    /// Compress to variable-size bytes (for secp256k1 compatibility)
+    /// Compress to an owned byte vector.
     fn compress_vec(&self) -> alloc::vec::Vec<u8> {
-        self.compress().to_vec()
-    }
-
-    /// Decompress from variable-size bytes (for secp256k1 compatibility)
-    fn decompress_slice(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() == 32 {
-            let arr: [u8; 32] = bytes.try_into().ok()?;
-            Self::decompress(&arr)
-        } else {
-            None
-        }
+        self.compress().as_ref().to_vec()
     }
 }
 
@@ -189,6 +200,8 @@ pub mod ristretto {
 
         const COMPRESSED_SIZE: usize = 32;
 
+        type Compressed = [u8; 32];
+
         fn identity() -> Self {
             curve25519_dalek::traits::Identity::identity()
         }
@@ -209,12 +222,13 @@ pub mod ristretto {
             <RistrettoPoint as MultiscalarMul>::multiscalar_mul(scalars, points)
         }
 
-        fn compress(&self) -> [u8; 32] {
+        fn compress(&self) -> Self::Compressed {
             RistrettoPoint::compress(self).to_bytes()
         }
 
-        fn decompress(bytes: &[u8; 32]) -> Option<Self> {
-            CompressedRistretto::from_slice(bytes).ok()?.decompress()
+        fn decompress(bytes: &[u8]) -> Option<Self> {
+            let arr: [u8; 32] = bytes.try_into().ok()?;
+            CompressedRistretto::from_slice(&arr).ok()?.decompress()
         }
     }
 
@@ -304,6 +318,8 @@ pub mod pallas {
 
         const COMPRESSED_SIZE: usize = 32;
 
+        type Compressed = [u8; 32];
+
         fn identity() -> Self {
             <Point as Group>::identity()
         }
@@ -330,12 +346,13 @@ pub mod pallas {
                 })
         }
 
-        fn compress(&self) -> [u8; 32] {
+        fn compress(&self) -> Self::Compressed {
             self.to_bytes()
         }
 
-        fn decompress(bytes: &[u8; 32]) -> Option<Self> {
-            Point::from_bytes(bytes).into_option()
+        fn decompress(bytes: &[u8]) -> Option<Self> {
+            let arr: [u8; 32] = bytes.try_into().ok()?;
+            Point::from_bytes(&arr).into_option()
         }
     }
 
@@ -389,6 +406,8 @@ pub mod pallas {
 
         const COMPRESSED_SIZE: usize = 32;
 
+        type Compressed = [u8; 32];
+
         fn identity() -> Self {
             SpendAuthPoint(<Point as Group>::identity())
         }
@@ -412,12 +431,13 @@ pub mod pallas {
                 .fold(Self::identity(), |acc, (s, p)| acc.add(&p.mul_scalar(s)))
         }
 
-        fn compress(&self) -> [u8; 32] {
+        fn compress(&self) -> Self::Compressed {
             self.0.to_bytes()
         }
 
-        fn decompress(bytes: &[u8; 32]) -> Option<Self> {
-            Point::from_bytes(bytes).into_option().map(SpendAuthPoint)
+        fn decompress(bytes: &[u8]) -> Option<Self> {
+            let arr: [u8; 32] = bytes.try_into().ok()?;
+            Point::from_bytes(&arr).into_option().map(SpendAuthPoint)
         }
     }
 
@@ -438,7 +458,6 @@ pub mod pallas {
 #[cfg(feature = "secp256k1")]
 pub mod secp256k1 {
     use super::*;
-    use alloc::vec::Vec;
     use k256::{
         elliptic_curve::{
             bigint::U512,
@@ -509,6 +528,8 @@ pub mod secp256k1 {
         // secp256k1 uses 33-byte compressed points
         const COMPRESSED_SIZE: usize = 33;
 
+        type Compressed = [u8; 33];
+
         fn identity() -> Self {
             Self::IDENTITY
         }
@@ -532,50 +553,42 @@ pub mod secp256k1 {
                 .fold(Self::IDENTITY, |acc, (s, p)| acc + p.mul_scalar(s))
         }
 
-        // for secp256k1, compress returns first 32 bytes (x-coord)
-        // use compress_vec for full 33-byte representation
-        fn compress(&self) -> [u8; 32] {
+        /// SEC1 compressed: `0x02`/`0x03` parity byte followed by the
+        /// x-coordinate. The identity encodes as 33 zero bytes (SEC1 gives it
+        /// a single `0x00`, which is not a fixed-width encoding).
+        ///
+        /// Until 0.4.0 this returned the bare x-coordinate, which is neither a
+        /// round trip nor injective: `P` and `-P` had the same 32 bytes, so
+        /// binding factors and challenges could not separate a commitment set
+        /// from its sign-flipped variants (C-1).
+        fn compress(&self) -> Self::Compressed {
+            let mut out = [0u8; 33];
             let affine = self.to_affine();
             let encoded = affine.to_encoded_point(true);
             let bytes = encoded.as_bytes();
-            // return x-coordinate (skip the 0x02/0x03 prefix)
-            let mut result = [0u8; 32];
-            if bytes.len() >= 33 {
-                result.copy_from_slice(&bytes[1..33]);
-            }
-            result
-        }
-
-        fn decompress(bytes: &[u8; 32]) -> Option<Self> {
-            // try to decompress assuming even y (0x02 prefix)
-            let mut compressed = [0u8; 33];
-            compressed[0] = 0x02;
-            compressed[1..].copy_from_slice(bytes);
-            Self::decompress_slice(&compressed)
-        }
-
-        fn compress_vec(&self) -> Vec<u8> {
-            let affine = self.to_affine();
-            let encoded = affine.to_encoded_point(true);
-            encoded.as_bytes().to_vec()
-        }
-
-        fn decompress_slice(bytes: &[u8]) -> Option<Self> {
-            use k256::EncodedPoint;
             if bytes.len() == 33 {
-                let encoded = EncodedPoint::from_bytes(bytes).ok()?;
-                let affine = k256::AffinePoint::from_encoded_point(&encoded);
-                if affine.is_some().into() {
-                    Some(ProjectivePoint::from(affine.unwrap()))
-                } else {
-                    None
-                }
-            } else if bytes.len() == 32 {
-                // assume even y
-                let mut compressed = [0u8; 33];
-                compressed[0] = 0x02;
-                compressed[1..].copy_from_slice(bytes);
-                Self::decompress_slice(&compressed)
+                out.copy_from_slice(bytes);
+            }
+            // identity: SEC1 emits a single 0x00 byte; keep the all-zero
+            // fixed-width form, which `decompress` maps back to the identity.
+            out
+        }
+
+        fn decompress(bytes: &[u8]) -> Option<Self> {
+            use k256::EncodedPoint;
+            if bytes.len() != 33 {
+                return None;
+            }
+            if bytes == [0u8; 33] {
+                return Some(Self::IDENTITY);
+            }
+            // EncodedPoint::from_bytes rejects anything but a 0x02/0x03
+            // prefix at this length, and from_encoded_point rejects an
+            // x-coordinate that is not on the curve.
+            let encoded = EncodedPoint::from_bytes(bytes).ok()?;
+            let affine = k256::AffinePoint::from_encoded_point(&encoded);
+            if affine.is_some().into() {
+                Some(ProjectivePoint::from(affine.unwrap()))
             } else {
                 None
             }
@@ -660,6 +673,8 @@ pub mod decaf377 {
 
         const COMPRESSED_SIZE: usize = 32;
 
+        type Compressed = [u8; 32];
+
         fn identity() -> Self {
             Element::IDENTITY
         }
@@ -683,12 +698,13 @@ pub mod decaf377 {
                 .fold(Element::IDENTITY, |acc, (s, p)| acc + (*p * *s))
         }
 
-        fn compress(&self) -> [u8; 32] {
+        fn compress(&self) -> Self::Compressed {
             self.vartime_compress().0
         }
 
-        fn decompress(bytes: &[u8; 32]) -> Option<Self> {
-            ::decaf377::Encoding(*bytes).vartime_decompress().ok()
+        fn decompress(bytes: &[u8]) -> Option<Self> {
+            let arr: [u8; 32] = bytes.try_into().ok()?;
+            ::decaf377::Encoding(arr).vartime_decompress().ok()
         }
     }
 

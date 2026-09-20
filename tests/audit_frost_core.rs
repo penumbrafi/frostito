@@ -95,7 +95,7 @@ fn liveness_signature_is_malleable_in_the_public_key() {
     let e = {
         use sha2::{Digest, Sha512};
         let mut h = Sha512::new();
-        h.update(contribution.signature.r);
+        h.update(OsstPoint::compress(&contribution.signature.r));
         h.update(message);
         let full: [u8; 64] = h.finalize().into();
         <Scalar as OsstScalar>::from_bytes_wide(&full)

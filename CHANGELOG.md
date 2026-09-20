@@ -1,5 +1,42 @@
 # changelog
 
+## [0.4.0] - unreleased
+
+Security release addressing SECURITY-REVIEW-2026-09.md. **Breaking**, and on
+secp256k1 **wire- and signature-incompatible with 0.3.x** — see C-1.
+
+### fixed
+
+- **C-1 (High, secp256k1)** — `OsstPoint::compress` returned the bare
+  x-coordinate and `decompress` always rebuilt the even-y point. It was neither
+  a round trip (half of all serialized commitments came back negated) nor
+  injective (`P` and `-P` hashed identically, so binding factors and challenges
+  could not separate a commitment set from its sign-flipped variants — the
+  exact coupling the binding factor exists to create).
+
+  `compress` now returns SEC1 compressed, 33 bytes, parity byte included;
+  `decompress` takes a slice and rejects anything that is not a canonical
+  encoding of that exact length — the 32-byte x-only form 0.3.0 accepted
+  included. The identity encodes as 33 zero bytes.
+
+  **Compatibility, secp256k1 only.** The compressed encoding feeds
+  `encode_commitments`, the binding factor, the challenge, the OSST
+  contribution challenge and the inner precommitment, so **every one of those
+  values changes**: a 0.3.x signer and a 0.4.0 signer cannot co-sign, and
+  0.3.x-serialized commitments, contributions, signatures and dealer
+  commitments do not parse. There is no migration path other than re-running
+  the affected round; existing *keys* are unaffected. The other three backends
+  are byte-identical to 0.3.0.
+
+  Mechanically: `OsstPoint` gains an associated type `Compressed`
+  (`[u8; 32]`, or `[u8; 33]` on secp256k1), `compress_vec`/`decompress_slice`
+  are gone, and every fixed-width serializer that embedded a point
+  (`Contribution`, `frost::SigningCommitments`, `frost::Signature`,
+  `liveness::ContributionSignature`, `reshare::DealerCommitment`) now produces
+  and consumes `Vec<u8>`/`&[u8]` sized by `COMPRESSED_SIZE`.
+  `liveness::ContributionSignature` is generic over the point, holding `R` as a
+  point rather than 32 bytes.
+
 ## [0.3.0] - 2026-09-20
 
 sweep release: pull generic threshold-signing utilities that had drifted

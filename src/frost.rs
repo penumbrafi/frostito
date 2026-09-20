@@ -128,25 +128,35 @@ pub struct SigningCommitments<P: OsstPoint> {
 }
 
 impl<P: OsstPoint> SigningCommitments<P> {
-    /// Serialize to bytes: [index:4][D:32][E:32] = 68 bytes
-    pub fn to_bytes(&self) -> [u8; 68] {
-        let mut buf = [0u8; 68];
-        buf[0..4].copy_from_slice(&self.index.to_le_bytes());
-        buf[4..36].copy_from_slice(&self.hiding.compress());
-        buf[36..68].copy_from_slice(&self.binding.compress());
+    /// Byte length of the serialized form.
+    #[inline]
+    pub fn byte_size() -> usize {
+        4 + 2 * P::COMPRESSED_SIZE
+    }
+
+    /// Serialize: `index:4 || D || E`, the points in this curve's canonical
+    /// compressed encoding (32 bytes each, 33 on secp256k1).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::byte_size());
+        buf.extend_from_slice(&self.index.to_le_bytes());
+        buf.extend_from_slice(self.hiding.compress().as_ref());
+        buf.extend_from_slice(self.binding.compress().as_ref());
         buf
     }
 
     /// Deserialize from bytes.
-    pub fn from_bytes(bytes: &[u8; 68]) -> Result<Self, OsstError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, OsstError> {
+        if bytes.len() != Self::byte_size() {
+            return Err(OsstError::InvalidCommitment);
+        }
         let index = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
         if index == 0 {
             return Err(OsstError::InvalidIndex);
         }
-        let hiding_bytes: [u8; 32] = bytes[4..36].try_into().unwrap();
-        let binding_bytes: [u8; 32] = bytes[36..68].try_into().unwrap();
-        let hiding = P::decompress(&hiding_bytes).ok_or(OsstError::InvalidCommitment)?;
-        let binding = P::decompress(&binding_bytes).ok_or(OsstError::InvalidCommitment)?;
+        let n = P::COMPRESSED_SIZE;
+        let hiding = P::decompress(&bytes[4..4 + n]).ok_or(OsstError::InvalidCommitment)?;
+        let binding =
+            P::decompress(&bytes[4 + n..4 + 2 * n]).ok_or(OsstError::InvalidCommitment)?;
         Ok(Self {
             index,
             hiding,
@@ -315,19 +325,28 @@ pub struct Signature<P: OsstPoint> {
 }
 
 impl<P: OsstPoint> Signature<P> {
-    /// Serialize: [R:32][z:32] = 64 bytes
-    pub fn to_bytes(&self) -> [u8; 64] {
-        let mut buf = [0u8; 64];
-        buf[0..32].copy_from_slice(&self.r.compress());
-        buf[32..64].copy_from_slice(&self.z.to_bytes());
+    /// Byte length of the serialized form.
+    #[inline]
+    pub fn byte_size() -> usize {
+        P::COMPRESSED_SIZE + 32
+    }
+
+    /// Serialize: `R || z`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::byte_size());
+        buf.extend_from_slice(self.r.compress().as_ref());
+        buf.extend_from_slice(&self.z.to_bytes());
         buf
     }
 
     /// Deserialize.
-    pub fn from_bytes(bytes: &[u8; 64]) -> Result<Self, OsstError> {
-        let r_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
-        let z_bytes: [u8; 32] = bytes[32..64].try_into().unwrap();
-        let r = P::decompress(&r_bytes).ok_or(OsstError::InvalidCommitment)?;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, OsstError> {
+        if bytes.len() != Self::byte_size() {
+            return Err(OsstError::InvalidCommitment);
+        }
+        let n = P::COMPRESSED_SIZE;
+        let r = P::decompress(&bytes[0..n]).ok_or(OsstError::InvalidCommitment)?;
+        let z_bytes: [u8; 32] = bytes[n..n + 32].try_into().unwrap();
         let z = P::Scalar::from_canonical_bytes(&z_bytes)
             .ok_or(OsstError::InvalidResponse)?;
         Ok(Self { r, z })
@@ -344,11 +363,11 @@ impl<P: OsstPoint> Signature<P> {
 fn encode_commitments<P: OsstPoint>(
     commitments: &BTreeMap<u32, SigningCommitments<P>>,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(commitments.len() * 68);
+    let mut buf = Vec::with_capacity(commitments.len() * (4 + 2 * P::COMPRESSED_SIZE));
     for (_, c) in commitments {
         buf.extend_from_slice(&c.index.to_le_bytes());
-        buf.extend_from_slice(&c.hiding.compress());
-        buf.extend_from_slice(&c.binding.compress());
+        buf.extend_from_slice(c.hiding.compress().as_ref());
+        buf.extend_from_slice(c.binding.compress().as_ref());
     }
     buf
 }
