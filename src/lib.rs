@@ -42,6 +42,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use sha2::{Digest, Sha512};
 
+pub mod context;
 pub mod curve;
 pub mod dkg;
 mod error;
@@ -55,6 +56,7 @@ pub mod reshare;
 pub(crate) mod test_rng;
 mod types;
 
+pub use context::{SigningContext, SIGNING_CONTEXT_DOMAIN};
 pub use curve::{OsstCurve, OsstPoint, OsstScalar};
 pub use error::OsstError;
 pub use lagrange::compute_lagrange_coefficients;
