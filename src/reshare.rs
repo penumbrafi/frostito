@@ -52,19 +52,26 @@ pub struct DealerCommitment<P: OsstPoint> {
 
 impl<P: OsstPoint> DealerCommitment<P> {
     /// Create commitment from polynomial coefficients
-    pub fn from_polynomial(dealer_index: u32, coefficients: &[P::Scalar]) -> Self {
-        assert!(dealer_index > 0, "dealer_index must be 1-indexed");
-        assert!(!coefficients.is_empty(), "coefficients must not be empty");
+    pub fn from_polynomial(
+        dealer_index: u32,
+        coefficients: &[P::Scalar],
+    ) -> Result<Self, OsstError> {
+        if dealer_index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        if coefficients.is_empty() {
+            return Err(OsstError::EmptyContributions);
+        }
 
         let committed: Vec<P> = coefficients
             .iter()
             .map(|a| P::generator().mul_scalar(a))
             .collect();
 
-        Self {
+        Ok(Self {
             dealer_index,
             coefficients: committed,
-        }
+        })
     }
 
     /// Threshold (degree + 1) of the committed polynomial
@@ -84,8 +91,10 @@ impl<P: OsstPoint> DealerCommitment<P> {
     /// Returns g^{f(j)} = Π_{k=0}^{t-1} C_k^{j^k}
     ///
     /// Uses Horner's method for efficiency: O(t) scalar muls
-    pub fn evaluate_at(&self, player_index: u32) -> P {
-        assert!(player_index > 0, "player_index must be 1-indexed");
+    pub fn evaluate_at(&self, player_index: u32) -> Result<P, OsstError> {
+        if player_index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
 
         let j = P::Scalar::from_u32(player_index);
 
@@ -95,7 +104,7 @@ impl<P: OsstPoint> DealerCommitment<P> {
             result = result.mul_scalar(&j);
             result = result.add(coeff);
         }
-        result
+        Ok(result)
     }
 
     /// Verify a sub-share against this commitment
@@ -107,7 +116,10 @@ impl<P: OsstPoint> DealerCommitment<P> {
             return false;
         }
 
-        let expected = self.evaluate_at(player_index);
+        let expected = match self.evaluate_at(player_index) {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
         let actual = P::generator().mul_scalar(sub_share);
 
         // Constant-time comparison via point equality
@@ -117,7 +129,7 @@ impl<P: OsstPoint> DealerCommitment<P> {
     /// Compressed byte size
     #[inline]
     pub fn byte_size(&self) -> usize {
-        4 + self.coefficients.len() * 32
+        4 + self.coefficients.len() * P::COMPRESSED_SIZE
     }
 
     /// Serialize to bytes (for on-chain storage)
@@ -125,14 +137,14 @@ impl<P: OsstPoint> DealerCommitment<P> {
         let mut buf = Vec::with_capacity(self.byte_size());
         buf.extend_from_slice(&self.dealer_index.to_le_bytes());
         for c in &self.coefficients {
-            buf.extend_from_slice(&c.compress());
+            buf.extend_from_slice(c.compress().as_ref());
         }
         buf
     }
 
     /// Deserialize from bytes
     pub fn from_bytes(bytes: &[u8], threshold: u32) -> Result<Self, OsstError> {
-        let expected_len = 4 + (threshold as usize) * 32;
+        let expected_len = 4 + (threshold as usize) * P::COMPRESSED_SIZE;
         if bytes.len() != expected_len {
             return Err(OsstError::InvalidCommitment);
         }
@@ -144,9 +156,9 @@ impl<P: OsstPoint> DealerCommitment<P> {
 
         let mut coefficients = Vec::with_capacity(threshold as usize);
         for i in 0..threshold as usize {
-            let offset = 4 + i * 32;
-            let point_bytes: [u8; 32] = bytes[offset..offset + 32].try_into().unwrap();
-            let point = P::decompress(&point_bytes).ok_or(OsstError::InvalidCommitment)?;
+            let offset = 4 + i * P::COMPRESSED_SIZE;
+            let point = P::decompress(&bytes[offset..offset + P::COMPRESSED_SIZE])
+                .ok_or(OsstError::InvalidCommitment)?;
             coefficients.push(point);
         }
 
@@ -174,14 +186,15 @@ pub struct SubShare<S: OsstScalar> {
 
 impl<S: OsstScalar> SubShare<S> {
     #[inline]
-    pub fn new(dealer_index: u32, player_index: u32, value: S) -> Self {
-        assert!(dealer_index > 0, "dealer_index must be 1-indexed");
-        assert!(player_index > 0, "player_index must be 1-indexed");
-        Self {
+    pub fn new(dealer_index: u32, player_index: u32, value: S) -> Result<Self, OsstError> {
+        if dealer_index == 0 || player_index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        Ok(Self {
             dealer_index,
             player_index,
             value,
-        }
+        })
     }
 
     /// Access the secret value (use sparingly)
@@ -271,9 +284,13 @@ impl<P: OsstPoint> Dealer<P> {
         share: P::Scalar,
         new_threshold: u32,
         rng: &mut R,
-    ) -> Self {
-        assert!(index > 0, "dealer index must be 1-indexed");
-        assert!(new_threshold > 0, "threshold must be positive");
+    ) -> Result<Self, OsstError> {
+        if index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        if new_threshold == 0 {
+            return Err(OsstError::ThresholdMismatch { expected: 1, got: 0 });
+        }
 
         let mut polynomial = Vec::with_capacity(new_threshold as usize);
         polynomial.push(share);
@@ -282,13 +299,13 @@ impl<P: OsstPoint> Dealer<P> {
             polynomial.push(P::Scalar::random(rng));
         }
 
-        let commitment = DealerCommitment::from_polynomial(index, &polynomial);
+        let commitment = DealerCommitment::from_polynomial(index, &polynomial)?;
 
-        Self {
+        Ok(Self {
             index,
             polynomial,
             commitment,
-        }
+        })
     }
 
     #[inline]
@@ -304,8 +321,10 @@ impl<P: OsstPoint> Dealer<P> {
     /// Generate sub-share for a specific player
     ///
     /// Evaluates polynomial at player's index using Horner's method.
-    pub fn generate_subshare(&self, player_index: u32) -> SubShare<P::Scalar> {
-        assert!(player_index > 0, "player_index must be 1-indexed");
+    pub fn generate_subshare(&self, player_index: u32) -> Result<SubShare<P::Scalar>, OsstError> {
+        if player_index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
 
         let j = P::Scalar::from_u32(player_index);
 
@@ -324,7 +343,7 @@ impl<P: OsstPoint> Dealer<P> {
     /// Returns sub-shares for players 1..=num_players
     pub fn generate_subshares(&self, num_players: u32) -> Vec<SubShare<P::Scalar>> {
         (1..=num_players)
-            .map(|j| self.generate_subshare(j))
+            .map(|j| self.generate_subshare(j).expect("index is 1-indexed by construction"))
             .collect()
     }
 }
@@ -376,21 +395,23 @@ impl<P: OsstPoint> SharePolynomial<P> {
     }
 
     /// Evaluate `F'(index)` with Horner's method
-    pub fn evaluate_at(&self, index: u32) -> P {
-        assert!(index > 0, "index must be 1-indexed");
+    pub fn evaluate_at(&self, index: u32) -> Result<P, OsstError> {
+        if index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
         let x = P::Scalar::from_u32(index);
         let mut result = P::identity();
         for coeff in self.coefficients.iter().rev() {
             result = result.mul_scalar(&x);
             result = result.add(coeff);
         }
-        result
+        Ok(result)
     }
 
     /// Verifying share of player `j`: `Y_j = F'(j) = g^{s'_j}`
     #[inline]
     pub fn verifying_share(&self, player_index: u32) -> P {
-        self.evaluate_at(player_index)
+        self.evaluate_at(player_index).expect("index is 1-indexed by construction")
     }
 
     /// Check that `share` is player `j`'s share on this polynomial
@@ -398,27 +419,26 @@ impl<P: OsstPoint> SharePolynomial<P> {
         if player_index == 0 {
             return false;
         }
-        P::generator().mul_scalar(share) == self.evaluate_at(player_index)
+        P::generator().mul_scalar(share) == self.evaluate_at(player_index).expect("index is 1-indexed by construction")
     }
 
     /// Serialize as concatenated compressed points
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32 * self.coefficients.len());
+        let mut buf = Vec::with_capacity(P::COMPRESSED_SIZE * self.coefficients.len());
         for c in &self.coefficients {
-            buf.extend_from_slice(&c.compress());
+            buf.extend_from_slice(c.compress().as_ref());
         }
         buf
     }
 
     pub fn from_bytes(bytes: &[u8], threshold: u32) -> Result<Self, OsstError> {
-        let expected = 32 * threshold as usize;
+        let expected = P::COMPRESSED_SIZE * threshold as usize;
         if threshold == 0 || bytes.len() != expected {
             return Err(OsstError::InvalidCommitment);
         }
         let mut coefficients = Vec::with_capacity(threshold as usize);
-        for chunk in bytes.chunks_exact(32) {
-            let arr: [u8; 32] = chunk.try_into().unwrap();
-            coefficients.push(P::decompress(&arr).ok_or(OsstError::InvalidCommitment)?);
+        for chunk in bytes.chunks_exact(P::COMPRESSED_SIZE) {
+            coefficients.push(P::decompress(chunk).ok_or(OsstError::InvalidCommitment)?);
         }
         Ok(Self { coefficients })
     }
@@ -824,7 +844,13 @@ impl<P: OsstPoint> ReshareState<P> {
 /// Batch verify multiple sub-shares against their commitments
 ///
 /// More efficient than individual verification when verifying many.
-/// Uses randomized linear combination for batch verification.
+/// Uses randomized linear combination for batch verification — independent
+/// random weights per sub-share, so a single bad share is caught with
+/// overwhelming probability.
+///
+/// Sub-shares are paired with commitments by `dealer_index`, not by position
+/// (B-1): the previous version zipped the two slices, so misaligned inputs
+/// verified the wrong pairs and reported success.
 pub fn batch_verify_subshares<P: OsstPoint, R: rand_core::RngCore + rand_core::CryptoRng>(
     player_index: u32,
     subshares: &[SubShare<P::Scalar>],
@@ -840,23 +866,28 @@ pub fn batch_verify_subshares<P: OsstPoint, R: rand_core::RngCore + rand_core::C
         .map(|_| P::Scalar::random(rng))
         .collect();
 
-    // LHS: g^{Σ w_i * σ_i}
+    // LHS: g^{Σ w_i * σ_i}   RHS: Σ w_i * C_i(j), paired by dealer index.
     let mut lhs_exponent = P::Scalar::zero();
+    let mut rhs = P::identity();
     for (subshare, w) in subshares.iter().zip(weights.iter()) {
         if subshare.player_index != player_index {
             return false;
         }
-        let term = w.mul(subshare.value());
-        lhs_exponent = lhs_exponent.add(&term);
-    }
-    let lhs = P::generator().mul_scalar(&lhs_exponent);
-
-    // RHS: Σ w_i * C_i(j)
-    let mut rhs = P::identity();
-    for (commitment, w) in commitments.iter().zip(weights.iter()) {
-        let eval = commitment.evaluate_at(player_index);
+        let commitment = match commitments
+            .iter()
+            .find(|c| c.dealer_index == subshare.dealer_index)
+        {
+            Some(c) => c,
+            None => return false,
+        };
+        let eval = match commitment.evaluate_at(player_index) {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        lhs_exponent = lhs_exponent.add(&w.mul(subshare.value()));
         rhs = rhs.add(&eval.mul_scalar(w));
     }
+    let lhs = P::generator().mul_scalar(&lhs_exponent);
 
     lhs == rhs
 }
@@ -888,7 +919,7 @@ mod tests {
                     y += coeff * x_pow;
                     x_pow *= x;
                 }
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
@@ -902,7 +933,7 @@ mod tests {
         let mut rng = OsRng;
         old_shares
             .iter()
-            .map(|s| Dealer::new(s.index, s.scalar().clone(), new_t, &mut rng))
+            .map(|s| Dealer::new(s.index, s.scalar().clone(), new_t, &mut rng).expect("index is 1-indexed by construction"))
             .collect()
     }
 
@@ -923,7 +954,7 @@ mod tests {
                 for &i in set {
                     let d = dealer_by_index(dealers, i);
                     assert!(agg
-                        .add_subshare(d.generate_subshare(j), d.commitment().clone())
+                        .add_subshare(d.generate_subshare(j).expect("index is 1-indexed by construction"), d.commitment().clone())
                         .unwrap());
                 }
                 assert!(agg.is_complete());
@@ -1048,7 +1079,7 @@ mod tests {
                 let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(j, &s2).unwrap();
                 for &i in &s2 {
                     let d = dealer_by_index(&dealers, i);
-                    agg.add_subshare(d.generate_subshare(j), d.commitment().clone())
+                    agg.add_subshare(d.generate_subshare(j).expect("index is 1-indexed by construction"), d.commitment().clone())
                         .unwrap();
                 }
                 agg.finalize(&group_pubkey).unwrap()
@@ -1086,7 +1117,7 @@ mod tests {
         let d4 = dealer_by_index(&dealers, 4);
         // Perfectly valid sub-share from dealer 4, but 4 is not in S
         assert_eq!(
-            agg.add_subshare(d4.generate_subshare(1), d4.commitment().clone()),
+            agg.add_subshare(d4.generate_subshare(1).expect("index is 1-indexed by construction"), d4.commitment().clone()),
             Err(OsstError::UnexpectedDealer(4))
         );
         assert_eq!(agg.count(), 0);
@@ -1103,7 +1134,7 @@ mod tests {
         let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(2, &[1, 2, 3]).unwrap();
         for &i in &[1u32, 3] {
             let d = dealer_by_index(&dealers, i);
-            agg.add_subshare(d.generate_subshare(2), d.commitment().clone())
+            agg.add_subshare(d.generate_subshare(2).expect("index is 1-indexed by construction"), d.commitment().clone())
                 .unwrap();
         }
         assert!(!agg.is_complete());
@@ -1123,15 +1154,15 @@ mod tests {
         let old_shares = shamir_split(&secret, 5, 3);
 
         let d1: Dealer<RistrettoPoint> =
-            Dealer::new(1, old_shares[0].scalar().clone(), 3, &mut rng);
+            Dealer::new(1, old_shares[0].scalar().clone(), 3, &mut rng).expect("index is 1-indexed by construction");
         let d2: Dealer<RistrettoPoint> =
-            Dealer::new(2, old_shares[1].scalar().clone(), 4, &mut rng);
+            Dealer::new(2, old_shares[1].scalar().clone(), 4, &mut rng).expect("index is 1-indexed by construction");
 
         let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(1, &[1, 2, 3]).unwrap();
-        agg.add_subshare(d1.generate_subshare(1), d1.commitment().clone())
+        agg.add_subshare(d1.generate_subshare(1).expect("index is 1-indexed by construction"), d1.commitment().clone())
             .unwrap();
         assert_eq!(
-            agg.add_subshare(d2.generate_subshare(1), d2.commitment().clone()),
+            agg.add_subshare(d2.generate_subshare(1).expect("index is 1-indexed by construction"), d2.commitment().clone()),
             Err(OsstError::ThresholdMismatch { expected: 3, got: 4 })
         );
     }
@@ -1158,6 +1189,47 @@ mod tests {
         assert_eq!(agg.dealer_set(), &[2, 5, 9]);
     }
 
+    /// B-1: sub-shares are paired with commitments by dealer index, not by
+    /// position, so a caller that passes the two slices in different orders
+    /// still verifies the right pairs — and a sub-share whose dealer has no
+    /// commitment is rejected rather than checked against someone else's.
+    #[test]
+    fn batch_verification_pairs_by_dealer_index() {
+        let mut rng = OsRng;
+        let secret = Scalar::random(&mut rng);
+        let old_shares = shamir_split(&secret, 3, 3);
+        let dealers: Vec<Dealer<RistrettoPoint>> = old_shares
+            .iter()
+            .map(|s| Dealer::new(s.index, s.scalar().clone(), 3, &mut rng).unwrap())
+            .collect();
+
+        let player_index = 1u32;
+        let subshares: Vec<SubShare<Scalar>> = dealers
+            .iter()
+            .map(|d| d.generate_subshare(player_index).unwrap())
+            .collect();
+        let mut commitments: Vec<DealerCommitment<RistrettoPoint>> =
+            dealers.iter().map(|d| d.commitment().clone()).collect();
+
+        // shuffled commitments: positional zipping would verify the wrong pairs
+        commitments.reverse();
+        assert!(batch_verify_subshares(
+            player_index,
+            &subshares,
+            &commitments,
+            &mut rng
+        ));
+
+        // a sub-share from a dealer the commitment set does not name
+        let orphan = vec![SubShare::new(9, player_index, Scalar::random(&mut rng)).unwrap()];
+        assert!(!batch_verify_subshares(
+            player_index,
+            &orphan,
+            &commitments[..1],
+            &mut rng
+        ));
+    }
+
     #[test]
     fn test_batch_verification() {
         let mut rng = OsRng;
@@ -1167,13 +1239,13 @@ mod tests {
 
         let dealers: Vec<Dealer<RistrettoPoint>> = old_shares
             .iter()
-            .map(|s| Dealer::new(s.index, s.scalar().clone(), 3, &mut rng))
+            .map(|s| Dealer::new(s.index, s.scalar().clone(), 3, &mut rng).expect("index is 1-indexed by construction"))
             .collect();
 
         let player_index = 1u32;
         let subshares: Vec<SubShare<Scalar>> = dealers
             .iter()
-            .map(|d| d.generate_subshare(player_index))
+            .map(|d| d.generate_subshare(player_index).expect("index is 1-indexed by construction"))
             .collect();
         let commitments: Vec<DealerCommitment<RistrettoPoint>> =
             dealers.iter().map(|d| d.commitment().clone()).collect();
@@ -1188,7 +1260,7 @@ mod tests {
 
         // Tamper with one sub-share
         let mut bad_subshares = subshares.clone();
-        bad_subshares[0] = SubShare::new(1, 1, Scalar::random(&mut rng));
+        bad_subshares[0] = SubShare::new(1, 1, Scalar::random(&mut rng)).expect("index is 1-indexed by construction");
 
         // Should fail
         assert!(!batch_verify_subshares(
@@ -1220,7 +1292,7 @@ mod tests {
         // Submit commitments
         for share in &old_shares {
             let dealer: Dealer<RistrettoPoint> =
-                Dealer::new(share.index, share.scalar().clone(), 3, &mut rng);
+                Dealer::new(share.index, share.scalar().clone(), 3, &mut rng).expect("index is 1-indexed by construction");
             state
                 .submit_commitment(dealer.commitment().clone())
                 .unwrap();
@@ -1237,7 +1309,7 @@ mod tests {
         for &i in &[5usize, 2, 4] {
             let share = &old_shares[i - 1];
             let dealer: Dealer<RistrettoPoint> =
-                Dealer::new(share.index, share.scalar().clone(), 3, &mut rng);
+                Dealer::new(share.index, share.scalar().clone(), 3, &mut rng).expect("index is 1-indexed by construction");
             partial.submit_commitment(dealer.commitment().clone()).unwrap();
         }
         assert_eq!(partial.dealer_set(), Some(vec![2, 4, 5]));
@@ -1247,7 +1319,7 @@ mod tests {
     #[test]
     fn test_commitment_serialization() {
         let mut rng = OsRng;
-        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 3, &mut rng);
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 3, &mut rng).expect("index is 1-indexed by construction");
 
         let original = dealer.commitment().clone();
         let bytes = original.to_bytes();
@@ -1267,12 +1339,12 @@ mod tests {
     #[test]
     fn test_horner_evaluation() {
         let mut rng = OsRng;
-        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 5, &mut rng);
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 5, &mut rng).expect("index is 1-indexed by construction");
 
         // Verify commitment evaluation matches sub-share
         for j in 1..=10u32 {
-            let subshare = dealer.generate_subshare(j);
-            let eval = dealer.commitment().evaluate_at(j);
+            let subshare = dealer.generate_subshare(j).expect("index is 1-indexed by construction");
+            let eval = dealer.commitment().evaluate_at(j).expect("index is 1-indexed by construction");
             let expected: RistrettoPoint = RistrettoPoint::generator().mul_scalar(subshare.value());
             assert_eq!(eval, expected);
         }

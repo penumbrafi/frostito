@@ -15,11 +15,21 @@
 //! # Protocol
 //!
 //! 1. Each participant i generates random polynomial f_i of degree t-1
-//! 2. Each publishes commitment C_i = [g^{f_i(0)}, g^{f_i(1)}, ...]
-//! 3. Each sends sub-share f_i(j) to participant j (encrypted)
+//! 2. Each broadcasts a [`Round1Package`]: the commitment
+//!    C_i = [g^{f_i(0)}, g^{f_i(1)}, ...] and a Schnorr proof of knowledge of
+//!    the constant term (Komlo–Goldberg SAC 2020 §5.1). Recipients verify the
+//!    proof before recording the commitment.
+//! 3. Each sends sub-share f_i(j) to participant j — **confidentially**; with
+//!    the `sealed` feature, [`crate::sealed`] does this, and without it the
+//!    caller must, because n-1 evaluations of a degree-(t-1) polynomial on the
+//!    wire reconstruct it outright
 //! 4. Participant j verifies each sub-share against commitments
-//! 5. Participant j's final share: s_j = sum_i(f_i(j))
-//! 6. Group public key: Y = sum_i(C_{i,0}) = g^{sum_i(f_i(0))}
+//! 5. A failure in step 2 or 4 is a complaint naming the dealer
+//!    ([`OsstError::InvalidProofOfKnowledge`], [`OsstError::InvalidSubShare`]);
+//!    every participant applies it with [`DkgState::disqualify`], or they
+//!    derive different keys
+//! 6. Participant j's final share: s_j = sum_i(f_i(j)) over the qualified set
+//! 7. Group public key: Y = sum_i(C_{i,0}) over the qualified set
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -28,6 +38,105 @@ use core::marker::PhantomData;
 use crate::curve::{OsstPoint, OsstScalar};
 use crate::error::OsstError;
 use crate::reshare::{DealerCommitment, SubShare};
+
+// ============================================================================
+// Proof of knowledge of the constant term (Komlo–Goldberg SAC 2020, §5.1)
+// ============================================================================
+
+/// Domain tag for the DKG proof of knowledge.
+pub const DKG_POK_DOMAIN: &[u8] = b"osst/dkg-pok/v1";
+
+/// Schnorr proof of knowledge of a dealer's constant term `a_0`.
+///
+/// Komlo–Goldberg (SAC 2020) KeyGen Round 1 step 2 requires every dealer to
+/// prove knowledge of the secret behind `C_0 = g^{a_0}`; ZF `frost-core` puts
+/// the same proof in its `round1::Package`. Without it a dealer can publish a
+/// constant-term commitment it did not choose — a rogue-key setup — and a
+/// recipient has nothing to check before the (much later) sub-share round.
+///
+/// `e = H(DKG_POK_DOMAIN ‖ dealer_index ‖ epoch ‖ C_0 ‖ R)`, `z = k + e·a_0`,
+/// verified as `z·G == R + e·C_0`. The epoch is in the challenge so a proof
+/// cannot be replayed from one ceremony into another.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProofOfKnowledge<P: OsstPoint> {
+    /// R = g^k
+    pub r: P,
+    /// z = k + e·a_0
+    pub z: P::Scalar,
+}
+
+impl<P: OsstPoint> ProofOfKnowledge<P> {
+    fn challenge(dealer_index: u32, epoch: u64, constant_commitment: &P, r: &P) -> P::Scalar {
+        use sha2::{Digest, Sha512};
+        let mut h = Sha512::new();
+        h.update(DKG_POK_DOMAIN);
+        h.update(dealer_index.to_le_bytes());
+        h.update(epoch.to_le_bytes());
+        h.update(constant_commitment.compress());
+        h.update(r.compress());
+        let hash: [u8; 64] = h.finalize().into();
+        P::Scalar::from_bytes_wide(&hash)
+    }
+
+    /// Prove knowledge of `a_0`.
+    pub fn prove<R: rand_core::RngCore + rand_core::CryptoRng>(
+        dealer_index: u32,
+        epoch: u64,
+        a_0: &P::Scalar,
+        rng: &mut R,
+    ) -> Self {
+        let k = P::Scalar::random(rng);
+        let r = P::generator().mul_scalar(&k);
+        let constant_commitment = P::generator().mul_scalar(a_0);
+        let e = Self::challenge(dealer_index, epoch, &constant_commitment, &r);
+        Self {
+            z: k.add(&e.mul(a_0)),
+            r,
+        }
+    }
+
+    /// Verify against a dealer's constant-term commitment.
+    pub fn verify(&self, dealer_index: u32, epoch: u64, constant_commitment: &P) -> bool {
+        let e = Self::challenge(dealer_index, epoch, constant_commitment, &self.r);
+        P::generator().mul_scalar(&self.z) == self.r.add(&constant_commitment.mul_scalar(&e))
+    }
+}
+
+/// What a dealer broadcasts in round 1: its Feldman commitment and its proof
+/// of knowledge of the constant term.
+///
+/// Recipients verify the proof before accepting the commitment
+/// ([`DkgState::submit_commitment`]); a failure is a complaint naming the
+/// dealer, not a silent drop.
+#[derive(Clone, Debug)]
+pub struct Round1Package<P: OsstPoint> {
+    pub commitment: DealerCommitment<P>,
+    pub proof_of_knowledge: ProofOfKnowledge<P>,
+}
+
+impl<P: OsstPoint> Round1Package<P> {
+    #[inline]
+    pub fn dealer_index(&self) -> u32 {
+        self.commitment.dealer_index
+    }
+
+    /// Verify the proof of knowledge against the package's own commitment.
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::InvalidProofOfKnowledge`] naming the dealer.
+    pub fn verify(&self, epoch: u64) -> Result<(), OsstError> {
+        let idx = self.commitment.dealer_index;
+        if self
+            .proof_of_knowledge
+            .verify(idx, epoch, self.commitment.share_commitment())
+        {
+            Ok(())
+        } else {
+            Err(OsstError::InvalidProofOfKnowledge(idx))
+        }
+    }
+}
 
 // ============================================================================
 // Dealer
@@ -56,22 +165,26 @@ impl<P: OsstPoint> Dealer<P> {
         index: u32,
         threshold: u32,
         rng: &mut R,
-    ) -> Self {
-        assert!(index > 0, "index must be 1-indexed");
-        assert!(threshold > 0, "threshold must be positive");
+    ) -> Result<Self, OsstError> {
+        if index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        if threshold == 0 {
+            return Err(OsstError::ThresholdMismatch { expected: 1, got: 0 });
+        }
 
         let mut polynomial = Vec::with_capacity(threshold as usize);
         for _ in 0..threshold {
             polynomial.push(P::Scalar::random(rng));
         }
 
-        let commitment = DealerCommitment::from_polynomial(index, &polynomial);
+        let commitment = DealerCommitment::from_polynomial(index, &polynomial)?;
 
-        Self {
+        Ok(Self {
             index,
             polynomial,
             commitment,
-        }
+        })
     }
 
     #[inline]
@@ -84,9 +197,32 @@ impl<P: OsstPoint> Dealer<P> {
         &self.commitment
     }
 
+    /// This dealer's round-1 broadcast: Feldman commitment plus a Schnorr
+    /// proof of knowledge of the constant term (Komlo–Goldberg §5.1).
+    ///
+    /// `epoch` binds the proof to one ceremony; pass the same value the
+    /// recipients' [`DkgState`] carries.
+    pub fn round1_package<R: rand_core::RngCore + rand_core::CryptoRng>(
+        &self,
+        epoch: u64,
+        rng: &mut R,
+    ) -> Round1Package<P> {
+        Round1Package {
+            commitment: self.commitment.clone(),
+            proof_of_knowledge: ProofOfKnowledge::prove::<R>(
+                self.index,
+                epoch,
+                &self.polynomial[0],
+                rng,
+            ),
+        }
+    }
+
     /// Generate sub-share for player j: f_i(j)
-    pub fn generate_subshare(&self, player_index: u32) -> SubShare<P::Scalar> {
-        assert!(player_index > 0, "player_index must be 1-indexed");
+    pub fn generate_subshare(&self, player_index: u32) -> Result<SubShare<P::Scalar>, OsstError> {
+        if player_index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
 
         let j = P::Scalar::from_u32(player_index);
 
@@ -101,10 +237,11 @@ impl<P: OsstPoint> Dealer<P> {
     }
 
     /// Generate sub-shares for all players 1..=n
-    pub fn generate_subshares(&self, num_players: u32) -> Vec<SubShare<P::Scalar>> {
-        (1..=num_players)
-            .map(|j| self.generate_subshare(j))
-            .collect()
+    pub fn generate_subshares(
+        &self,
+        num_players: u32,
+    ) -> Result<Vec<SubShare<P::Scalar>>, OsstError> {
+        (1..=num_players).map(|j| self.generate_subshare(j)).collect()
     }
 }
 
@@ -233,9 +370,10 @@ impl<P: OsstPoint> Aggregator<P> {
             return Ok(false);
         }
 
-        // verify sub-share against commitment
+        // verify sub-share against commitment. A failure is a complaint: it
+        // names the dealer, so the caller can broadcast it and disqualify.
         if !commitment.verify_subshare(self.player_index, subshare.value()) {
-            return Err(OsstError::InvalidResponse);
+            return Err(OsstError::InvalidSubShare(subshare.dealer_index));
         }
 
         self.subshares
@@ -306,6 +444,8 @@ pub struct DkgState<P: OsstPoint> {
     pub num_participants: u32,
     /// Collected commitments (indexed by dealer_index - 1)
     pub commitments: Vec<Option<DealerCommitment<P>>>,
+    /// Dealers disqualified by a complaint, sorted ascending.
+    disqualified: Vec<u32>,
 }
 
 impl<P: OsstPoint> DkgState<P> {
@@ -315,14 +455,29 @@ impl<P: OsstPoint> DkgState<P> {
             threshold,
             num_participants,
             commitments: vec![None; num_participants as usize],
+            disqualified: Vec::new(),
         }
     }
 
-    /// Submit a dealer's commitment. Returns true if new, false if duplicate.
-    pub fn submit_commitment(
-        &mut self,
-        commitment: DealerCommitment<P>,
-    ) -> Result<bool, OsstError> {
+    /// Submit a dealer's round-1 package. Returns true if new, false if
+    /// duplicate.
+    ///
+    /// The proof of knowledge is verified here, before the commitment is
+    /// recorded (K-1): a dealer that cannot prove knowledge of its constant
+    /// term never enters the ceremony.
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::InvalidProofOfKnowledge`] naming the dealer;
+    /// [`OsstError::InvalidIndex`] for an out-of-range index;
+    /// [`OsstError::InvalidCommitment`] on a threshold mismatch;
+    /// [`OsstError::UnexpectedDealer`] if the dealer is disqualified.
+    pub fn submit_commitment(&mut self, package: Round1Package<P>) -> Result<bool, OsstError> {
+        package.verify(self.epoch)?;
+        let commitment = package.commitment;
+        if self.disqualified.contains(&commitment.dealer_index) {
+            return Err(OsstError::UnexpectedDealer(commitment.dealer_index));
+        }
         let idx = commitment
             .dealer_index
             .checked_sub(1)
@@ -349,17 +504,83 @@ impl<P: OsstPoint> DkgState<P> {
         self.commitments.iter().filter(|c| c.is_some()).count()
     }
 
-    /// True when all participants have submitted commitments
+    /// True when every participant that has not been disqualified has
+    /// submitted a commitment.
     pub fn is_complete(&self) -> bool {
-        self.commitment_count() == self.num_participants as usize
+        self.commitment_count() + self.disqualified.len() == self.num_participants as usize
     }
 
-    /// Derive group public key from all commitments: Y = sum(C_{i,0})
+    /// Dealers disqualified by a complaint.
+    #[inline]
+    pub fn disqualified(&self) -> &[u32] {
+        &self.disqualified
+    }
+
+    /// Dealers still in the ceremony, in ascending order.
+    pub fn qualified_dealers(&self) -> Vec<u32> {
+        self.commitments
+            .iter()
+            .flatten()
+            .map(|c| c.dealer_index)
+            .collect()
+    }
+
+    /// Disqualify a dealer named by a complaint — an invalid proof of
+    /// knowledge ([`OsstError::InvalidProofOfKnowledge`]) or an invalid
+    /// sub-share ([`OsstError::InvalidSubShare`]), both of which carry the
+    /// index to pass here.
+    ///
+    /// The dealer's commitment is dropped, so it contributes nothing to the
+    /// group key or to any verification share, and further submissions from it
+    /// are refused. Every participant must apply the same complaints, or they
+    /// derive different keys.
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::InvalidIndex`] for an out-of-range index;
+    /// [`OsstError::DkgAborted`] when fewer than `threshold` dealers remain —
+    /// the ceremony cannot produce a usable key and must be restarted.
+    pub fn disqualify(&mut self, dealer_index: u32) -> Result<(), OsstError> {
+        let idx = dealer_index.checked_sub(1).ok_or(OsstError::InvalidIndex)? as usize;
+        if idx >= self.commitments.len() {
+            return Err(OsstError::InvalidIndex);
+        }
+        self.commitments[idx] = None;
+        if !self.disqualified.contains(&dealer_index) {
+            self.disqualified.push(dealer_index);
+            self.disqualified.sort_unstable();
+        }
+
+        let remaining = self.num_participants as usize - self.disqualified.len();
+        if remaining < self.threshold as usize {
+            return Err(OsstError::DkgAborted {
+                qualified: remaining,
+                need: self.threshold as usize,
+            });
+        }
+        Ok(())
+    }
+
+    /// Derive group public key from the qualified commitments: Y = sum(C_{i,0})
+    ///
+    /// # Warning
+    ///
+    /// This sums commitments; it does **not** witness the sub-share round. A
+    /// deployment that fixes the group key from on-chain commitments before
+    /// round 2 completes lets a dealer that never delivers valid sub-shares
+    /// still move `Y` — disqualify it and re-derive, or wait for
+    /// [`Aggregator::is_complete`].
+    ///
+    /// Note also the standard Pedersen-DKG caveat (GJKR99): commitments are
+    /// accepted in any order with no commit–reveal, so the last dealer to
+    /// publish sees every other `C_{i,0}` before choosing its own and an
+    /// abort-and-retry strategy can bias the distribution of `Y`. For Schnorr
+    /// signatures this is known and tolerated.
     pub fn derive_group_key(&self) -> Result<P, OsstError> {
         if !self.is_complete() {
             return Err(OsstError::InsufficientContributions {
                 got: self.commitment_count(),
-                need: self.num_participants as usize,
+                need: self.num_participants as usize - self.disqualified.len(),
             });
         }
 
@@ -373,7 +594,7 @@ impl<P: OsstPoint> DkgState<P> {
 
     /// Derive public verification share for player j.
     ///
-    /// Y_j = g^{s_j} = Σ_i C_i.evaluate_at(j)
+    /// Y_j = g^{s_j} = Σ_i C_i.evaluate_at(j).expect("index is 1-indexed by construction")
     ///
     /// These are needed for FROST share verification — detecting which
     /// signer produced a bad signature share without revealing secrets.
@@ -384,13 +605,13 @@ impl<P: OsstPoint> DkgState<P> {
         if !self.is_complete() {
             return Err(OsstError::InsufficientContributions {
                 got: self.commitment_count(),
-                need: self.num_participants as usize,
+                need: self.num_participants as usize - self.disqualified.len(),
             });
         }
 
         let mut vshare = P::identity();
         for commitment in self.commitments.iter().flatten() {
-            vshare = vshare.add(&commitment.evaluate_at(player_index));
+            vshare = vshare.add(&commitment.evaluate_at(player_index).expect("index is 1-indexed by construction"));
         }
 
         Ok(vshare)
@@ -434,7 +655,7 @@ mod tests {
 
         // phase 1: each participant creates a dealer
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         // phase 2: collect commitments
         let commitments: Vec<&DealerCommitment<RistrettoPoint>> =
@@ -445,7 +666,7 @@ mod tests {
         for j in 1..=n {
             let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
-                let subshare = dealer.generate_subshare(j);
+                let subshare = dealer.generate_subshare(j).expect("index is 1-indexed by construction");
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
@@ -464,7 +685,7 @@ mod tests {
         let secret_shares: Vec<SecretShare<Scalar>> = shares
             .iter()
             .enumerate()
-            .map(|(i, (s, _))| SecretShare::new((i + 1) as u32, *s))
+            .map(|(i, (s, _))| SecretShare::new((i + 1) as u32, *s).expect("index is 1-indexed by construction"))
             .collect();
 
         let payload = b"dkg test verification";
@@ -484,7 +705,7 @@ mod tests {
         let t = 3u32;
 
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let mut state: DkgState<RistrettoPoint> = DkgState::new(1, t, n);
 
@@ -492,7 +713,7 @@ mod tests {
 
         for dealer in &dealers {
             state
-                .submit_commitment(dealer.commitment().clone())
+                .submit_commitment(dealer.round1_package(1, &mut rng))
                 .unwrap();
         }
 
@@ -505,7 +726,7 @@ mod tests {
         // derive group key from aggregator
         let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(1, n).unwrap();
         for dealer in &dealers {
-            let subshare = dealer.generate_subshare(1);
+            let subshare = dealer.generate_subshare(1).expect("index is 1-indexed by construction");
             agg.add_subshare(subshare, dealer.commitment()).unwrap();
         }
         let agg_key = agg.derive_group_key().unwrap();
@@ -520,30 +741,30 @@ mod tests {
         let t = 2u32;
 
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(1, n).unwrap();
 
         // good sub-share
-        let subshare = dealers[0].generate_subshare(1);
+        let subshare = dealers[0].generate_subshare(1).expect("index is 1-indexed by construction");
         assert!(agg.add_subshare(subshare, dealers[0].commitment()).is_ok());
 
         // tampered sub-share (wrong value)
-        let bad = SubShare::new(2, 1, Scalar::random(&mut rng));
+        let bad = SubShare::new(2, 1, Scalar::random(&mut rng)).expect("index is 1-indexed by construction");
         let result = agg.add_subshare(bad, dealers[1].commitment());
-        assert!(matches!(result, Err(OsstError::InvalidResponse)));
+        assert!(matches!(result, Err(OsstError::InvalidSubShare(_))));
     }
 
     #[test]
     fn test_dkg_duplicate_rejected() {
         let mut rng = OsRng;
-        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, 2, &mut rng);
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
 
         let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(1, &[1]).unwrap();
-        let subshare = dealer.generate_subshare(1);
+        let subshare = dealer.generate_subshare(1).expect("index is 1-indexed by construction");
         assert!(agg.add_subshare(subshare, dealer.commitment()).unwrap());
 
-        let subshare2 = dealer.generate_subshare(1);
+        let subshare2 = dealer.generate_subshare(1).expect("index is 1-indexed by construction");
         assert!(!agg.add_subshare(subshare2, dealer.commitment()).unwrap());
     }
 
@@ -554,7 +775,7 @@ mod tests {
         let t = 4u32;
 
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let commitments: Vec<&DealerCommitment<RistrettoPoint>> =
             dealers.iter().map(|d| d.commitment()).collect();
@@ -565,14 +786,14 @@ mod tests {
         for j in 1..=n {
             let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
-                let subshare = dealer.generate_subshare(j);
+                let subshare = dealer.generate_subshare(j).expect("index is 1-indexed by construction");
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
             if group_key.is_none() {
                 group_key = Some(agg.derive_group_key().unwrap());
             }
-            secret_shares.push(SecretShare::new(j, agg.finalize().unwrap()));
+            secret_shares.push(SecretShare::new(j, agg.finalize().unwrap()).expect("index is 1-indexed by construction"));
         }
 
         let group_key = group_key.unwrap();
@@ -594,18 +815,18 @@ mod tests {
         let n = 5u32;
         let t = 3u32;
         let dealers: Vec<Dealer<RistrettoPoint>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let set = [1u32, 3, 4];
         let mut agg: Aggregator<RistrettoPoint> = Aggregator::new(2, &set).unwrap();
         // dealer 5 committed too, but is not in the agreed set
         assert_eq!(
-            agg.add_subshare(dealers[4].generate_subshare(2), dealers[4].commitment()),
+            agg.add_subshare(dealers[4].generate_subshare(2).expect("index is 1-indexed by construction"), dealers[4].commitment()),
             Err(OsstError::UnexpectedDealer(5))
         );
         for &i in &set {
             let d = &dealers[(i - 1) as usize];
-            agg.add_subshare(d.generate_subshare(2), d.commitment()).unwrap();
+            agg.add_subshare(d.generate_subshare(2).expect("index is 1-indexed by construction"), d.commitment()).unwrap();
         }
         assert!(agg.is_complete());
 
@@ -619,7 +840,7 @@ mod tests {
         // An incomplete aggregator refuses to finalize
         let mut partial: Aggregator<RistrettoPoint> = Aggregator::new(2, &set).unwrap();
         partial
-            .add_subshare(dealers[0].generate_subshare(2), dealers[0].commitment())
+            .add_subshare(dealers[0].generate_subshare(2).expect("index is 1-indexed by construction"), dealers[0].commitment())
             .unwrap();
         assert_eq!(partial.missing_dealers(), vec![3, 4]);
         assert!(matches!(
@@ -628,6 +849,127 @@ mod tests {
         ));
     }
 
+    // ========================================================================
+    // K-1: proof of knowledge of the constant term
+    // ========================================================================
+
+    #[test]
+    fn pok_verifies_for_an_honest_dealer() {
+        let mut rng = OsRng;
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(2, 3, &mut rng).expect("index is 1-indexed by construction");
+        let pkg = dealer.round1_package(7, &mut rng);
+        assert!(pkg.verify(7).is_ok());
+    }
+
+    #[test]
+    fn pok_is_bound_to_the_dealer_index_the_epoch_and_the_commitment() {
+        let mut rng = OsRng;
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(2, 3, &mut rng).expect("index is 1-indexed by construction");
+        let pkg = dealer.round1_package(7, &mut rng);
+
+        // another epoch
+        assert_eq!(pkg.verify(8), Err(OsstError::InvalidProofOfKnowledge(2)));
+
+        // another dealer index: replaying dealer 2's proof as dealer 3
+        let mut stolen = pkg.clone();
+        stolen.commitment.dealer_index = 3;
+        assert_eq!(stolen.verify(7), Err(OsstError::InvalidProofOfKnowledge(3)));
+
+        // another constant term: the rogue-key shape. The attacker publishes a
+        // C_0 it did not choose and cannot prove knowledge of.
+        let other: Dealer<RistrettoPoint> = Dealer::new(2, 3, &mut rng).expect("index is 1-indexed by construction");
+        let mut rogue = pkg.clone();
+        rogue.commitment = other.commitment().clone();
+        assert_eq!(rogue.verify(7), Err(OsstError::InvalidProofOfKnowledge(2)));
+    }
+
+    #[test]
+    fn dkg_state_rejects_a_dealer_that_cannot_prove_knowledge() {
+        let mut rng = OsRng;
+        let honest: Dealer<RistrettoPoint> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
+        let other: Dealer<RistrettoPoint> = Dealer::new(2, 2, &mut rng).expect("index is 1-indexed by construction");
+
+        let mut state: DkgState<RistrettoPoint> = DkgState::new(1, 2, 3);
+
+        // dealer 2 publishes dealer-1-style proof over someone else's C_0
+        let mut forged = other.round1_package(1, &mut rng);
+        forged.commitment = honest.commitment().clone();
+        forged.commitment.dealer_index = 2;
+        assert_eq!(
+            state.submit_commitment(forged),
+            Err(OsstError::InvalidProofOfKnowledge(2))
+        );
+        assert_eq!(state.commitment_count(), 0, "nothing was recorded");
+
+        // and the honest package is accepted
+        assert!(state
+            .submit_commitment(honest.round1_package(1, &mut rng))
+            .unwrap());
+    }
+
+    #[test]
+    fn a_complaint_disqualifies_a_dealer_and_moves_the_group_key() {
+        let mut rng = OsRng;
+        let n = 3u32;
+        let t = 2u32;
+        let dealers: Vec<Dealer<RistrettoPoint>> =
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
+
+        let mut state: DkgState<RistrettoPoint> = DkgState::new(9, t, n);
+        for d in &dealers {
+            state.submit_commitment(d.round1_package(9, &mut rng)).unwrap();
+        }
+        let key_all = state.derive_group_key().unwrap();
+
+        // Player 1 finds dealer 3's sub-share invalid. The error names the
+        // dealer: that is the complaint.
+        let mut agg: Aggregator<RistrettoPoint> = Aggregator::all_dealers(1, n).unwrap();
+        let bad = SubShare::new(3, 1, Scalar::random(&mut rng)).expect("index is 1-indexed by construction");
+        assert_eq!(
+            agg.add_subshare(bad, dealers[2].commitment()),
+            Err(OsstError::InvalidSubShare(3))
+        );
+
+        // Everyone applies it.
+        state.disqualify(3).unwrap();
+        assert_eq!(state.disqualified(), &[3]);
+        assert_eq!(state.qualified_dealers(), vec![1, 2]);
+        assert!(state.is_complete(), "complete over the surviving dealers");
+
+        let key_qualified = state.derive_group_key().unwrap();
+        assert_ne!(key_all, key_qualified);
+        assert_eq!(
+            key_qualified,
+            dealers[0]
+                .commitment()
+                .share_commitment()
+                .add(dealers[1].commitment().share_commitment())
+        );
+
+        // A disqualified dealer cannot re-enter.
+        assert_eq!(
+            state.submit_commitment(dealers[2].round1_package(9, &mut rng)),
+            Err(OsstError::UnexpectedDealer(3))
+        );
+    }
+
+    #[test]
+    fn disqualifying_below_threshold_aborts_the_ceremony() {
+        let mut rng = OsRng;
+        let dealers: Vec<Dealer<RistrettoPoint>> =
+            (1..=3).map(|i| Dealer::new(i, 3, &mut rng).expect("index is 1-indexed by construction")).collect();
+        let mut state: DkgState<RistrettoPoint> = DkgState::new(1, 3, 3);
+        for d in &dealers {
+            state.submit_commitment(d.round1_package(1, &mut rng)).unwrap();
+        }
+        assert_eq!(
+            state.disqualify(2),
+            Err(OsstError::DkgAborted {
+                qualified: 2,
+                need: 3
+            })
+        );
+    }
 }
 
 #[cfg(all(test, feature = "pallas"))]
@@ -644,7 +986,7 @@ mod pallas_tests {
         let t = 3u32;
 
         let dealers: Vec<Dealer<Point>> =
-            (1..=n).map(|i| Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let commitments: Vec<&DealerCommitment<Point>> =
             dealers.iter().map(|d| d.commitment()).collect();
@@ -654,14 +996,14 @@ mod pallas_tests {
         for j in 1..=n {
             let mut agg: Aggregator<Point> = Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
-                let subshare = dealer.generate_subshare(j);
+                let subshare = dealer.generate_subshare(j).expect("index is 1-indexed by construction");
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
             if group_key.is_none() {
                 group_key = Some(agg.derive_group_key().unwrap());
             }
-            shares.push(SecretShare::new(j, agg.finalize().unwrap()));
+            shares.push(SecretShare::new(j, agg.finalize().unwrap()).expect("index is 1-indexed by construction"));
         }
 
         let group_key = group_key.unwrap();

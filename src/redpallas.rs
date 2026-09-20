@@ -164,8 +164,8 @@ pub mod zcash {
         let mut buf = Vec::with_capacity(commitments.len() * 68);
         for (_, c) in commitments {
             buf.extend_from_slice(&c.index.to_le_bytes());
-            buf.extend_from_slice(&c.hiding.compress());
-            buf.extend_from_slice(&c.binding.compress());
+            buf.extend_from_slice(c.hiding.compress().as_ref());
+            buf.extend_from_slice(c.binding.compress().as_ref());
         }
         buf
     }
@@ -174,7 +174,7 @@ pub mod zcash {
     pub fn commit<R: rand_core::RngCore + rand_core::CryptoRng>(
         index: u32,
         rng: &mut R,
-    ) -> (Nonces<Scalar>, SigningCommitments<Point>) {
+    ) -> Result<(Nonces<Scalar>, SigningCommitments<Point>), OsstError> {
         frost::commit::<Point, R>(index, rng)
     }
 
@@ -347,8 +347,8 @@ pub mod zcash {
         let nested_position = 3u32;
 
         // phase 1: players generate outer polynomials
-        let player_a_dealer: dkg::Dealer<Point> = dkg::Dealer::new(1, outer_t, rng);
-        let player_b_dealer: dkg::Dealer<Point> = dkg::Dealer::new(2, outer_t, rng);
+        let player_a_dealer: dkg::Dealer<Point> = dkg::Dealer::new(1, outer_t, rng).expect("index is 1-indexed by construction");
+        let player_b_dealer: dkg::Dealer<Point> = dkg::Dealer::new(2, outer_t, rng).expect("index is 1-indexed by construction");
 
         // phase 2: interleaved DKG for jury (position 3)
         // produces Shamir shares of each coefficient of f₃(x)
@@ -374,12 +374,12 @@ pub mod zcash {
         }
 
         // phase 3b: players Shamir-split their evaluations with feldman commitments
-        let f1_at_3 = player_a_dealer.generate_subshare(nested_position);
+        let f1_at_3 = player_a_dealer.generate_subshare(nested_position).expect("index is 1-indexed by construction");
         let (f1_pieces, f1_commitment) = nested::split_evaluation_for_inner::<Point, _>(
             f1_at_3.value(), jury_n, jury_threshold, rng,
         );
 
-        let f2_at_3 = player_b_dealer.generate_subshare(nested_position);
+        let f2_at_3 = player_b_dealer.generate_subshare(nested_position).expect("index is 1-indexed by construction");
         let (f2_pieces, f2_commitment) = nested::split_evaluation_for_inner::<Point, _>(
             f2_at_3.value(), jury_n, jury_threshold, rng,
         );
@@ -401,19 +401,19 @@ pub mod zcash {
                 nested_position,
                 &[(1, f1_pieces[k].1), (2, f2_pieces[k].1)],
             );
-            jury_shares.push(SecretShare::new((k + 1) as u32, sigma));
+            jury_shares.push(SecretShare::new((k + 1) as u32, sigma).expect("index is 1-indexed by construction"));
         }
 
         // derive keys
-        let s1 = player_a_dealer.generate_subshare(1).value()
-            .add(&player_b_dealer.generate_subshare(1).value())
+        let s1 = player_a_dealer.generate_subshare(1).expect("index is 1-indexed by construction").value()
+            .add(&player_b_dealer.generate_subshare(1).expect("index is 1-indexed by construction").value())
             .add(&f3_at_1);
-        let s2 = player_a_dealer.generate_subshare(2).value()
-            .add(&player_b_dealer.generate_subshare(2).value())
+        let s2 = player_a_dealer.generate_subshare(2).expect("index is 1-indexed by construction").value()
+            .add(&player_b_dealer.generate_subshare(2).expect("index is 1-indexed by construction").value())
             .add(&f3_at_2);
 
-        let player_a = SecretShare::new(1, s1);
-        let player_b = SecretShare::new(2, s2);
+        let player_a = SecretShare::new(1, s1).expect("index is 1-indexed by construction");
+        let player_b = SecretShare::new(2, s2).expect("index is 1-indexed by construction");
 
         // group public key: Y = g^{f₁(0)} + g^{f₂(0)} + g^{f₃(0)}
         let group_pubkey = player_a_dealer.commitment().share_commitment()
@@ -423,8 +423,8 @@ pub mod zcash {
         // jury's verification share: Y₃ = g^{s₃}
         // computed from commitments without knowing s₃
         let p_scalar = Scalar::from_u32(nested_position);
-        let mut jury_vshare = player_a_dealer.commitment().evaluate_at(nested_position)
-            .add(&player_b_dealer.commitment().evaluate_at(nested_position));
+        let mut jury_vshare = player_a_dealer.commitment().evaluate_at(nested_position).expect("index is 1-indexed by construction")
+            .add(&player_b_dealer.commitment().evaluate_at(nested_position).expect("index is 1-indexed by construction"));
         let mut p_pow = Scalar::one();
         for cc in &coeff_commitments {
             jury_vshare = jury_vshare.add(&cc.mul_scalar(&p_pow));
@@ -432,6 +432,13 @@ pub mod zcash {
         }
 
         // derive FVK seed from private DKG material
+        //
+        // DEMO ONLY (SECURITY-REVIEW-2026-09.md §5.1). This computes a
+        // BLAKE2b over BOTH players' secret shares, so it needs both secrets
+        // in one address space, makes the spending key recoverable from any
+        // two shares, and changes the FVK on a key-preserving reshare. It is
+        // here to make the walkthrough runnable; a deployment must derive the
+        // FVK by a route that never gathers the shares.
         //
         // the seed MUST include secret material that only DKG participants know.
         // using only the group pubkey (public) would let anyone derive the
@@ -593,6 +600,9 @@ pub mod zcash {
     // ========================================================================
 
     /// Inner binding factor using BLAKE2b for Zcash protocol consistency.
+    ///
+    /// # ⚠️ v1 — INSECURE. See the `legacy-v1` feature.
+    #[cfg(feature = "legacy-v1")]
     fn redpallas_inner_binding_factor(
         holder_index: u32,
         outer_message: &[u8],
@@ -616,11 +626,22 @@ pub mod zcash {
 
     /// Complete nested RedPallas signing for escrow disputes.
     ///
+    /// # ⚠️ v1 — INSECURE, and single-process. Behind `legacy-v1`.
+    ///
+    /// This is the v1 construction: it hands the outer protocol a single
+    /// pre-bound point with an identity binding commitment, so the outer
+    /// binding factor multiplies the identity and vanishes
+    /// (SECURITY-nested-frost.md §2.1, finding R-1). It also takes the whole
+    /// `JuryNetwork` — every jury share in one address space — so it is a
+    /// single-process helper, not a distributed protocol. Do not distribute
+    /// the jury onto it.
+    ///
     /// Combines OSST authorization + nested FROST signing with RedPallas
     /// (BLAKE2b) hashes throughout. Produces a standard Zcash Orchard
     /// SpendAuth signature.
     ///
     /// s₃ is NEVER reconstructed. Returns None if OSST fails or signing fails.
+    #[cfg(feature = "legacy-v1")]
     pub fn nested_redpallas_sign(
         jury: &JuryNetwork,
         player_share: &SecretShare<Scalar>,
@@ -646,10 +667,21 @@ pub mod zcash {
         if !osst_ok { return None; }
 
         // phase 2: inner commitment with RedPallas binding
+        // v1 single-process helper: the "session" is this call, so the id is
+        // derived from the message. (Removed in 0.4.0 — see the `legacy-v1`
+        // feature.)
+        let mut session_id = [0u8; 32];
+        {
+            let h = blake2b_simd::Params::new()
+                .hash_length(32)
+                .personal(b"frostito_v1_sess")
+                .hash(message);
+            session_id.copy_from_slice(h.as_bytes());
+        }
         let mut inner_nonces = Vec::new();
         let mut inner_commits = Vec::new();
         for &k in &active_jury {
-            let (n, c) = nested::inner_commit::<Point, _>(k, &mut rng);
+            let (n, c) = nested::inner_commit::<Point, _>(k, session_id, &mut rng);
             inner_nonces.push(n);
             inner_commits.push(c);
         }
@@ -663,7 +695,7 @@ pub mod zcash {
         }
 
         // phase 3: outer RedPallas package
-        let (player_nonces, player_commits) = commit(player_share.index, &mut rng);
+        let (player_nonces, player_commits) = commit(player_share.index, &mut rng).expect("index is 1-indexed by construction");
         let jury_commits = SigningCommitments {
             index: jury_index,
             hiding: r_nested,
@@ -833,7 +865,7 @@ pub mod zcash {
             evidence: DisputeEvidence,
             rng: &mut R,
         ) -> (Self, DisputeOpen) {
-            let (nonces, commitment) = commit(player_share.index, rng);
+            let (nonces, commitment) = commit(player_share.index, rng).expect("index is 1-indexed by construction");
 
             let msg = DisputeOpen {
                 player_commitment: commitment.clone(),
@@ -941,7 +973,7 @@ pub mod zcash {
             }
 
             // generate jury's FROST nonces
-            let (nonces, commitment) = commit(jury_index, rng);
+            let (nonces, commitment) = commit(jury_index, rng).expect("index is 1-indexed by construction");
 
             let accepted = JuryAccepted {
                 jury_commitment: commitment.clone(),
@@ -1060,7 +1092,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &shares[0..t as usize] {
-            let (nonces, commitments) = commit(s.index, &mut rng);
+            let (nonces, commitments) = commit(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(nonces);
             commitments_vec.push(commitments);
         }
@@ -1093,7 +1125,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut comms = Vec::new();
         for s in &shares[0..2] {
-            let (n, c) = commit(s.index, &mut rng);
+            let (n, c) = commit(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             comms.push(c);
         }
@@ -1120,8 +1152,8 @@ mod tests {
         // happy path: player A + player B sign the settlement
         let message = b"settlement: A=600, B=400";
 
-        let (nonces_a, comm_a) = commit(player_a.index, &mut rng);
-        let (nonces_b, comm_b) = commit(player_b.index, &mut rng);
+        let (nonces_a, comm_a) = commit(player_a.index, &mut rng).expect("index is 1-indexed by construction");
+        let (nonces_b, comm_b) = commit(player_b.index, &mut rng).expect("index is 1-indexed by construction");
 
         let package = RedPallasPackage::new(message.to_vec(), vec![comm_a, comm_b]).unwrap();
 
@@ -1147,8 +1179,8 @@ mod tests {
         // dispute: player A + jury sign (player B refuses)
         let message = b"jury verdict: A=800, B=200";
 
-        let (nonces_a, comm_a) = commit(player_a.index, &mut rng);
-        let (nonces_jury, comm_jury) = commit(3, &mut rng); // jury is index 3
+        let (nonces_a, comm_a) = commit(player_a.index, &mut rng).expect("index is 1-indexed by construction");
+        let (nonces_jury, comm_jury) = commit(3, &mut rng).expect("index is 1-indexed by construction"); // jury is index 3
 
         let package = RedPallasPackage::new(
             message.to_vec(),
@@ -1207,8 +1239,8 @@ mod tests {
         // ── 2. Happy path: A + B sign with FROST ────────────────────
         let settlement_msg = b"PCZT:settlement:A=600,B=400";
 
-        let (nonces_a, comm_a) = commit(player_a.index, &mut rng);
-        let (nonces_b, comm_b) = commit(player_b.index, &mut rng);
+        let (nonces_a, comm_a) = commit(player_a.index, &mut rng).expect("index is 1-indexed by construction");
+        let (nonces_b, comm_b) = commit(player_b.index, &mut rng).expect("index is 1-indexed by construction");
         let package = RedPallasPackage::new(
             settlement_msg.to_vec(),
             vec![comm_a, comm_b],
@@ -1229,8 +1261,8 @@ mod tests {
         let verdict_msg = b"PCZT:verdict:A=800,B=200:jury_fee=10";
         let verdict_payload = b"jury-verdict:hand#42:A=800,B=200";
 
-        let (nonces_a2, comm_a2) = commit(player_a.index, &mut rng);
-        let (nonces_jury, comm_jury) = commit(3, &mut rng); // jury = index 3
+        let (nonces_a2, comm_a2) = commit(player_a.index, &mut rng).expect("index is 1-indexed by construction");
+        let (nonces_jury, comm_jury) = commit(3, &mut rng).expect("index is 1-indexed by construction"); // jury = index 3
         let dispute_package = RedPallasPackage::new(
             verdict_msg.to_vec(),
             vec![comm_a2, comm_jury],
@@ -1301,8 +1333,8 @@ mod tests {
         let msg = b"PCZT:verdict:A=200,B=800";
         let verdict_payload = b"jury-verdict:B-wins";
 
-        let (nonces_b, comm_b) = commit(player_b.index, &mut rng);
-        let (nonces_jury, comm_jury) = commit(3, &mut rng);
+        let (nonces_b, comm_b) = commit(player_b.index, &mut rng).expect("index is 1-indexed by construction");
+        let (nonces_jury, comm_jury) = commit(3, &mut rng).expect("index is 1-indexed by construction");
         let package = RedPallasPackage::new(msg.to_vec(), vec![comm_b, comm_jury]).unwrap();
 
         let share_b = sign(&package, nonces_b, &player_b, &group_pubkey).unwrap();
@@ -1326,7 +1358,7 @@ mod tests {
         let msg = b"steal all funds";
 
         // A alone tries to sign
-        let (nonces_a, comm_a) = commit(player_a.index, &mut rng);
+        let (nonces_a, comm_a) = commit(player_a.index, &mut rng).expect("index is 1-indexed by construction");
         let package = RedPallasPackage::new(msg.to_vec(), vec![comm_a]).unwrap();
         let share_a = sign(&package, nonces_a, &player_a, &group_pubkey).unwrap();
         let sig = aggregate(&package, &[share_a], &group_pubkey, None).unwrap();
@@ -1502,12 +1534,13 @@ mod tests {
                     y = y.add(&coeff.mul(&x_pow));
                     x_pow = x_pow.mul(&x);
                 }
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
 
     #[test]
+    #[cfg(feature = "legacy-v1")]
     fn test_nested_redpallas_sign() {
         let mut rng = rand::rngs::OsRng;
         let jury_n = 5u32;

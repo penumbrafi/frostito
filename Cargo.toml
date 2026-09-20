@@ -1,6 +1,6 @@
 [package]
 name = "osst"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "frostito: nested FROST with OSST identification, DKG, and proactive resharing"
@@ -16,6 +16,22 @@ std = [
     "sha2/std",
     "rand_core/std",
 ]
+# Confidential, authenticated DKG round-2 delivery (`osst::sealed`).
+#
+# Needs std (snow does), so the no_std core stays clean and the plaintext
+# SubShare/Dealer API is unchanged beneath it.
+sealed = ["std", "dep:snow", "dep:x25519-dalek", "dep:hkdf"]
+
+# Nested FROST v1 — INSECURE, off by default.
+#
+# v1 pre-binds the inner nonces and hands the outer protocol a single point
+# with an identity binding commitment, which severs the outer binding coupling
+# and admits a ROS-style forgery (SECURITY-nested-frost.md §2, finding R-1 of
+# SECURITY-REVIEW-2026-09.md). It is retained ONLY so an existing deployment
+# can compile while it migrates to v2, and a caller has to say so in its own
+# Cargo.toml to reach it. Do not enable for new code.
+legacy-v1 = []
+
 # Curve backends
 ristretto255 = ["dep:curve25519-dalek"]
 pallas = ["dep:pasta_curves", "dep:blake2b_simd"]
@@ -51,6 +67,12 @@ blake2b_simd = { version = "1.0", default-features = false, optional = true }
 
 # for zeroize implementations on external scalar types
 generic-array = { version = "0.14", default-features = false, optional = true }
+
+# sealed DKG round 2: Noise_K_25519_ChaChaPoly_BLAKE2s, the same pattern ZF's
+# frost-client and zcli's frost-spend use.
+snow = { version = "0.9", default-features = false, features = ["default-resolver"], optional = true }
+x25519-dalek = { version = "2", features = ["static_secrets"], optional = true }
+hkdf = { version = "0.12", optional = true }
 
 # decaf377 - for Penumbra compatibility
 decaf377 = { version = "0.10", default-features = false, optional = true }

@@ -18,9 +18,39 @@ repo. `github.com/rotkonetworks/frostito` is kept as a mirror of `main` so
 existing pins (`rev = "14e38da"`) keep resolving; new work goes to
 penumbrafi.
 
-## security warning
+## security
 
-this crate has not been audited. use at your own risk.
+this crate has not had a third-party audit. an internal adversarial review was
+completed on 2026-09-20 — scope, findings and PoCs in
+[`SECURITY-REVIEW-2026-09.md`](SECURITY-REVIEW-2026-09.md) — and everything it
+raised against this crate is fixed in **0.4.0**, with each PoC kept as a
+regression test in `tests/audit_*.rs`. Review is not proof: no formal
+reductions were attempted, and absence of a finding there is not evidence of
+soundness.
+
+what 0.4.0 changed, and what it means for you:
+
+| finding | severity | effect |
+|---------|----------|--------|
+| N-1/N-2 | high | nested v2 inner signers now hold the message and the full commitment set; a coordinator cannot get a share for an unapproved payload |
+| C-1 | high (secp only) | secp256k1 point compression is SEC1 with parity. **wire- and signature-incompatible with 0.3.x on that backend** |
+| R-1 | medium | nested v1 is behind the off-by-default `legacy-v1` feature, RedPallas path included |
+| K-1 | medium | DKG dealers prove knowledge of their constant term; complaints name the dealer and `DkgState::disqualify` acts on them |
+| L-1/H-1 | medium/low | liveness signatures bind the public key; OSST and liveness challenges are domain-separated. **both hashes change** |
+| D-1/D-2 | critical/high | `osst::sealed` seals round-2 sub-shares per recipient over Noise_K, binding sender, recipient, ceremony and commitment |
+| F-1, Z-1, P-1, B-1 | low | `sign` checks its own commitment; real zeroization on every backend; wire-parsed indices error instead of aborting the process; batch verification pairs by dealer index |
+
+if you ran a DKG with a version before 0.4.0 over a network that did not
+itself provide confidentiality and sender authentication for round 2, treat
+the resulting key as compromised and regenerate it. that is D-1: it is not
+theoretical, and it needs no wire access where sub-shares were broadcast.
+
+nested FROST v1 is insecure (`SECURITY-nested-frost.md`). do not enable
+`legacy-v1` for new code.
+
+### OSST verification is not accountable
+
+see below — it is a deliberate privacy/accountability trade, not a defect.
 
 ## accountability and privacy tradeoff
 
@@ -125,7 +155,7 @@ if you need identifiable aborts:
 use osst::{SecretShare, Contribution, verify};
 
 // after DKG, each custodian has a share
-let share = SecretShare::new(index, scalar);
+let share = SecretShare::new(index, scalar)?;   // errors on index 0
 
 // generate contribution (schnorr proof)
 let contribution = share.contribute(&mut rng, &payload);
@@ -142,9 +172,9 @@ rotate custodian sets while preserving the group public key:
 use osst::reshare::{Dealer, Aggregator};
 
 // old custodians become dealers
-let dealer = Dealer::new(index, current_share, new_threshold, &mut rng);
+let dealer = Dealer::new(index, current_share, new_threshold, &mut rng)?;
 let commitment = dealer.commitment();
-let subshare = dealer.generate_subshare(player_index);
+let subshare = dealer.generate_subshare(player_index)?;
 
 // every new custodian must agree on the dealer set S *before* aggregating
 // (e.g. via a signed epoch manifest). players that aggregate over different
@@ -171,6 +201,8 @@ lowest committed dealer indices) for coordinators to put in the manifest.
 - `osst::dkg` - distributed key generation over an agreed dealer set
 - `osst::nested` - nested FROST (see `SECURITY-nested-frost.md`)
 - `osst::redpallas` - zcash orchard spend-auth signing helpers
+- `osst::sealed` - confidential, authenticated DKG round 2 (feature `sealed`)
+- `osst::context` - epoch-bound signing contexts
 
 ## license
 

@@ -25,7 +25,7 @@
 //! use osst::{SecretShare, verify};
 //!
 //! // After DKG, each custodian has a share
-//! let share = SecretShare::new(index, scalar);
+//! let share = SecretShare::new(index, scalar).expect("index is 1-indexed by construction");
 //!
 //! // Generate contribution (Schnorr proof)
 //! let contribution = share.contribute(&mut rng, &payload);
@@ -52,6 +52,8 @@ pub mod liveness;
 pub mod nested;
 pub mod redpallas;
 pub mod reshare;
+#[cfg(feature = "sealed")]
+pub mod sealed;
 #[cfg(all(test, feature = "pallas"))]
 pub(crate) mod test_rng;
 mod types;
@@ -98,13 +100,26 @@ pub fn random_scalar<S: OsstScalar, R: rand_core::RngCore + rand_core::CryptoRng
     S::random(rng)
 }
 
+/// Domain tag for the OSST contribution challenge.
+pub const OSST_CONTRIBUTION_DOMAIN: &[u8] = b"osst/contribution/v1";
+
 /// Hash a point and payload to a scalar challenge
-/// H(u_i || payload) -> c_i
+///
+/// `c_i = H(OSST_CONTRIBUTION_DOMAIN || u_i || payload)`
+///
+/// # Domain separation
+///
+/// Until 0.4.0 this was `SHA512(compress(u) || payload)`, byte-identical to
+/// `liveness::challenge_hash` (H-1): a liveness signature `(R, s)` over a
+/// 64-byte message *was* an OSST contribution over that payload, and vice
+/// versa, so a dealer holding one key for both handed over contributions for
+/// free. The two are now separated by tag.
 pub fn hash_to_challenge<S: OsstScalar, P: OsstPoint<Scalar = S>>(
     commitment: &P,
     payload: &[u8],
 ) -> S {
     let mut hasher = Sha512::new();
+    hasher.update(OSST_CONTRIBUTION_DOMAIN);
     hasher.update(commitment.compress());
     hasher.update(payload);
     let hash: [u8; 64] = hasher.finalize().into();
@@ -142,9 +157,19 @@ impl<S: OsstScalar> Drop for SecretShare<S> {
 }
 
 impl<S: OsstScalar> SecretShare<S> {
-    pub fn new(index: u32, scalar: S) -> Self {
-        assert!(index > 0, "index must be 1-indexed");
-        Self { index, scalar }
+    /// Construct a share.
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::InvalidIndex`] if `index` is 0 — Shamir indices are
+    /// 1-indexed, and index 0 is the secret itself. This returns rather than
+    /// panicking (P-1): a node parsing an index off the wire must not be
+    /// abortable by a peer.
+    pub fn new(index: u32, scalar: S) -> Result<Self, OsstError> {
+        if index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        Ok(Self { index, scalar })
     }
 
     /// Access the secret scalar (use sparingly, avoid logging/debugging)
@@ -209,65 +234,37 @@ impl<P: OsstPoint> Contribution<P> {
         }
     }
 
-    /// Serialize for transmission (fixed 68-byte format for 32-byte curves)
-    ///
-    /// For curves with non-32-byte points (e.g. secp256k1), use `to_bytes_vec`.
-    pub fn to_bytes(&self) -> [u8; 68] {
-        let mut buf = [0u8; 68];
-        buf[0..4].copy_from_slice(&self.index.to_le_bytes());
-        buf[4..36].copy_from_slice(&self.commitment.compress());
-        buf[36..68].copy_from_slice(&self.response.to_bytes());
-        buf
+    /// Byte length of the serialized form.
+    #[inline]
+    pub fn byte_size() -> usize {
+        4 + P::COMPRESSED_SIZE + 32
     }
 
-    /// Deserialize from fixed 68-byte format
-    pub fn from_bytes(bytes: &[u8; 68]) -> Result<Self, OsstError> {
-        let index = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-
-        let point_bytes: [u8; 32] = bytes[4..36].try_into().unwrap();
-        let commitment = P::decompress(&point_bytes).ok_or(OsstError::InvalidCommitment)?;
-
-        let response_bytes: [u8; 32] = bytes[36..68].try_into().unwrap();
-        let response =
-            P::Scalar::from_canonical_bytes(&response_bytes).ok_or(OsstError::InvalidResponse)?;
-
-        Ok(Self {
-            index,
-            commitment,
-            response,
-        })
-    }
-
-    /// Serialize to variable-length bytes (handles all curve types)
-    ///
-    /// Format: [index: 4][commitment: COMPRESSED_SIZE][response: 32]
-    pub fn to_bytes_vec(&self) -> Vec<u8> {
-        let compressed = self.commitment.compress_vec();
-        let mut buf = Vec::with_capacity(4 + compressed.len() + 32);
+    /// Serialize for transmission: `index:4 || u_i || s_i`, the point in this
+    /// curve's canonical compressed encoding.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::byte_size());
         buf.extend_from_slice(&self.index.to_le_bytes());
-        buf.extend_from_slice(&compressed);
+        buf.extend_from_slice(self.commitment.compress().as_ref());
         buf.extend_from_slice(&self.response.to_bytes());
         buf
     }
 
-    /// Deserialize from variable-length bytes
-    ///
-    /// Requires knowing the point compression size for the curve.
-    pub fn from_bytes_vec(bytes: &[u8]) -> Result<Self, OsstError> {
-        let expected_len = 4 + P::COMPRESSED_SIZE + 32;
-        if bytes.len() != expected_len {
+    /// Deserialize.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, OsstError> {
+        if bytes.len() != Self::byte_size() {
             return Err(OsstError::InvalidCommitment);
         }
 
         let index = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
 
-        let point_bytes = &bytes[4..4 + P::COMPRESSED_SIZE];
-        let commitment = P::decompress_slice(point_bytes).ok_or(OsstError::InvalidCommitment)?;
+        let n = P::COMPRESSED_SIZE;
+        let commitment = P::decompress(&bytes[4..4 + n]).ok_or(OsstError::InvalidCommitment)?;
 
-        let response_offset = 4 + P::COMPRESSED_SIZE;
-        let response_bytes: [u8; 32] = bytes[response_offset..response_offset + 32]
-            .try_into()
-            .unwrap();
+        let response_bytes: [u8; 32] = bytes[4 + n..4 + n + 32].try_into().unwrap();
         let response =
             P::Scalar::from_canonical_bytes(&response_bytes).ok_or(OsstError::InvalidResponse)?;
 
@@ -506,7 +503,7 @@ mod pallas_tests {
                     x_pow *= x;
                 }
 
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
@@ -616,7 +613,7 @@ mod tests {
                     x_pow *= x;
                 }
 
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
@@ -861,7 +858,7 @@ mod secp256k1_tests {
                     y = y.add(&coeff.mul(&x_pow));
                     x_pow = x_pow.mul(&x);
                 }
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
@@ -896,22 +893,24 @@ mod secp256k1_tests {
         let scalar = <Scalar as OsstScalar>::random(&mut rng);
         let point: ProjectivePoint = ProjectivePoint::GENERATOR.mul_scalar(&scalar);
 
-        // test 32-byte compression (x-coord only)
+        // SEC1 compressed, parity byte included: a real round trip (C-1).
         let compressed = point.compress();
-        let decompressed = ProjectivePoint::decompress(&compressed);
-        // note: may not match exactly due to y-ambiguity
-        assert!(decompressed.is_some(), "should decompress 32-byte form");
+        assert_eq!(compressed.len(), 33, "secp256k1 should be 33 bytes");
+        let decompressed = ProjectivePoint::decompress(&compressed).expect("decompresses");
+        assert_eq!(point, decompressed, "roundtrip should match");
 
-        // test full 33-byte compression
-        let full_compressed = point.compress_vec();
-        assert_eq!(full_compressed.len(), 33, "secp256k1 should be 33 bytes");
-
-        let full_decompressed = ProjectivePoint::decompress_slice(&full_compressed);
+        // the bare x-coordinate is no longer accepted
         assert!(
-            full_decompressed.is_some(),
-            "should decompress 33-byte form"
+            ProjectivePoint::decompress(&compressed[1..]).is_none(),
+            "a 32-byte x-only encoding must be rejected"
         );
-        assert_eq!(point, full_decompressed.unwrap(), "roundtrip should match");
+
+        // and the identity survives the round trip
+        let id = <ProjectivePoint as OsstPoint>::identity();
+        assert_eq!(
+            ProjectivePoint::decompress(id.compress().as_ref()).unwrap(),
+            id
+        );
     }
 
     #[test]
@@ -949,10 +948,10 @@ mod secp256k1_tests {
         let original: Contribution<ProjectivePoint> = shares[0].contribute(&mut rng, payload);
 
         // test variable-length serialization (correct for secp256k1)
-        let bytes = original.to_bytes_vec();
+        let bytes = original.to_bytes();
         assert_eq!(bytes.len(), 4 + 33 + 32, "secp256k1 contribution should be 69 bytes");
 
-        let recovered = Contribution::<ProjectivePoint>::from_bytes_vec(&bytes).unwrap();
+        let recovered = Contribution::<ProjectivePoint>::from_bytes(&bytes).unwrap();
         assert_eq!(original.index, recovered.index);
         assert_eq!(original.commitment, recovered.commitment);
         assert_eq!(original.response, recovered.response);
@@ -982,7 +981,7 @@ mod decaf377_tests {
                     y = y.add(&coeff.mul(&x_pow));
                     x_pow = x_pow.mul(&x);
                 }
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }

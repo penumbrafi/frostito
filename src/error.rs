@@ -34,6 +34,40 @@ pub enum OsstError {
 
     /// Dealers committed to different new thresholds
     ThresholdMismatch { expected: u32, got: u32 },
+
+    /// The signing package's message is not the message the signer approved
+    MessageMismatch,
+
+    /// A commitment in the package is not the one produced in the local round
+    UnexpectedCommitment,
+
+    /// A coordinator-supplied outer context does not match the locally
+    /// recomputed one (binding factor, challenge or Lagrange coefficient)
+    ChallengeMismatch,
+
+    /// Two rounds of the same protocol were mixed (session id mismatch)
+    SessionMismatch,
+
+    /// A dealer's proof of knowledge of its constant term did not verify.
+    /// Carries the failing dealer's index: this is a complaint, and it names
+    /// who to disqualify.
+    InvalidProofOfKnowledge(u32),
+
+    /// A dealer's sub-share did not verify against its commitment. Carries the
+    /// failing dealer's index.
+    InvalidSubShare(u32),
+
+    /// The ceremony cannot continue: too few dealers remain after
+    /// disqualification.
+    DkgAborted { qualified: usize, need: usize },
+
+    /// A sealed package did not open. Carries the dealer it claimed to come
+    /// from. Which of wrong-sender, wrong-recipient, wrong-ceremony or
+    /// tampering caused it is deliberately not reported.
+    SealedOpenFailed(u32),
+
+    /// A participant is not on the sealed roster.
+    UnknownParticipant(u32),
 }
 
 impl fmt::Display for OsstError {
@@ -55,6 +89,33 @@ impl fmt::Display for OsstError {
             Self::ThresholdMismatch { expected, got } => {
                 write!(f, "dealer committed to threshold {}, expected {}", got, expected)
             }
+            Self::MessageMismatch => {
+                write!(f, "signing package message is not the approved message")
+            }
+            Self::UnexpectedCommitment => {
+                write!(f, "commitment is not the one produced in this round")
+            }
+            Self::ChallengeMismatch => {
+                write!(f, "coordinator-supplied outer context does not match")
+            }
+            Self::SessionMismatch => write!(f, "session id mismatch"),
+            Self::InvalidProofOfKnowledge(idx) => {
+                write!(f, "dealer {} published an invalid proof of knowledge", idx)
+            }
+            Self::InvalidSubShare(idx) => {
+                write!(f, "dealer {} sent an invalid sub-share", idx)
+            }
+            Self::SealedOpenFailed(idx) => {
+                write!(f, "sealed package from dealer {} did not open", idx)
+            }
+            Self::UnknownParticipant(idx) => {
+                write!(f, "participant {} is not on the roster", idx)
+            }
+            Self::DkgAborted { qualified, need } => write!(
+                f,
+                "dkg aborted: {} qualified dealers remain, need {}",
+                qualified, need
+            ),
         }
     }
 }

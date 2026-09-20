@@ -46,7 +46,7 @@ fn main() {
     let outer_t = 2u32;
 
     let outer_dealers: Vec<dkg::Dealer<Point>> = (1..=outer_n)
-        .map(|i| dkg::Dealer::new(i, outer_t, &mut rng))
+        .map(|i| dkg::Dealer::new(i, outer_t, &mut rng).unwrap())
         .collect();
 
     let outer_commitments: Vec<&DealerCommitment<Point>> =
@@ -59,7 +59,7 @@ fn main() {
     for j in 1..=outer_n {
         let mut agg: dkg::Aggregator<Point> = dkg::Aggregator::all_dealers(j, outer_n).unwrap();
         for dealer in &outer_dealers {
-            let subshare = dealer.generate_subshare(j);
+            let subshare = dealer.generate_subshare(j).unwrap();
             agg.add_subshare(subshare, outer_commitments[(dealer.index() - 1) as usize])
                 .unwrap();
         }
@@ -67,7 +67,7 @@ fn main() {
         if j == 1 {
             outer_group_key = agg.derive_group_key().unwrap();
         }
-        let ss = SecretShare::new(j, share_scalar);
+        let ss = SecretShare::new(j, share_scalar).unwrap();
         outer_vshares.insert(j, Point::generator().mul_scalar(ss.scalar()));
         outer_shares.push(ss);
     }
@@ -179,7 +179,7 @@ fn main() {
     let mut inner_commitments = Vec::new();
     for &i in &active_holders {
         let (nonces, commitments) =
-            frost::commit::<Point, _>(inner_shares[i].index, &mut rng);
+            frost::commit::<Point, _>(inner_shares[i].index, &mut rng).unwrap();
         inner_nonces.push(nonces);
         inner_commitments.push(commitments);
     }
@@ -234,7 +234,7 @@ fn main() {
     let mut outer_commitments = Vec::new();
     for &i in &outer_active {
         let (nonces, commitments) =
-            frost::commit::<Point, _>(outer_shares[i].index, &mut rng);
+            frost::commit::<Point, _>(outer_shares[i].index, &mut rng).unwrap();
         outer_nonces.push(nonces);
         outer_commitments.push(commitments);
     }
@@ -308,7 +308,7 @@ fn shamir_split(secret: &Scalar, n: u32, t: u32) -> Vec<SecretShare<Scalar>> {
                 y += coeff * x_pow;
                 x_pow *= x;
             }
-            SecretShare::new(i, y)
+            SecretShare::new(i, y).unwrap()
         })
         .collect()
 }

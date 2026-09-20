@@ -235,7 +235,7 @@ mod frost_tests {
         let mut nonces = Vec::new();
         let mut commitments = Vec::new();
         for &i in &active {
-            let (n, c) = frost::commit::<RistrettoPoint, _>(i, &mut rng);
+            let (n, c) = frost::commit::<RistrettoPoint, _>(i, &mut rng).expect("index is 1-indexed by construction");
             nonces.push((i, n));
             commitments.push(c);
         }
@@ -247,7 +247,7 @@ mod frost_tests {
 
         let mut sig_shares = Vec::new();
         for (i, n) in nonces {
-            let share = SecretShare::new(i, eval(i));
+            let share = SecretShare::new(i, eval(i)).expect("index is 1-indexed by construction");
             sig_shares
                 .push(frost::sign::<RistrettoPoint>(&package, n, &share, &group_pubkey).unwrap());
         }

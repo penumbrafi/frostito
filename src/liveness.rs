@@ -66,6 +66,9 @@ impl CheckpointAnchor {
     }
 }
 
+/// Domain tag for the liveness contribution signature.
+pub const LIVENESS_SIG_DOMAIN: &[u8] = b"osst/liveness-sig/v1";
+
 // ============================================================================
 // Liveness Proof
 // ============================================================================
@@ -155,42 +158,57 @@ pub struct DealerContribution<P: OsstPoint> {
     /// Proof of infrastructure participation
     pub liveness: LivenessProof,
     /// Schnorr signature binding commitment + liveness
-    pub signature: ContributionSignature<P::Scalar>,
+    pub signature: ContributionSignature<P>,
 }
 
 /// Schnorr signature over contribution
+///
+/// `r` is held as a point, not as bytes: the curve's canonical compressed
+/// encoding is not 32 bytes on every backend (secp256k1 is 33), and carrying
+/// bytes meant re-deriving a point from a possibly non-canonical encoding on
+/// every verification.
 #[derive(Clone)]
-pub struct ContributionSignature<S: OsstScalar> {
+pub struct ContributionSignature<P: OsstPoint> {
     /// R = g^k
-    pub r: [u8; 32],
+    pub r: P,
     /// s = k + e * x
-    pub s: S,
+    pub s: P::Scalar,
 }
 
-impl<S: OsstScalar> ContributionSignature<S> {
-    pub fn new(r: [u8; 32], s: S) -> Self {
+impl<P: OsstPoint> ContributionSignature<P> {
+    pub fn new(r: P, s: P::Scalar) -> Self {
         Self { r, s }
     }
 
-    pub fn to_bytes(&self) -> [u8; 64] {
-        let mut buf = [0u8; 64];
-        buf[0..32].copy_from_slice(&self.r);
-        buf[32..64].copy_from_slice(&self.s.to_bytes());
+    /// Byte length of the serialized form.
+    #[inline]
+    pub fn byte_size() -> usize {
+        P::COMPRESSED_SIZE + 32
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::byte_size());
+        buf.extend_from_slice(self.r.compress().as_ref());
+        buf.extend_from_slice(&self.s.to_bytes());
         buf
     }
 
-    pub fn from_bytes(bytes: &[u8; 64]) -> Result<Self, OsstError> {
-        let r: [u8; 32] = bytes[0..32].try_into().unwrap();
-        let s = S::from_canonical_bytes(&bytes[32..64].try_into().unwrap())
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, OsstError> {
+        if bytes.len() != Self::byte_size() {
+            return Err(OsstError::InvalidCommitment);
+        }
+        let n = P::COMPRESSED_SIZE;
+        let r = P::decompress(&bytes[0..n]).ok_or(OsstError::InvalidCommitment)?;
+        let s = P::Scalar::from_canonical_bytes(&bytes[n..n + 32].try_into().unwrap())
             .ok_or(OsstError::InvalidResponse)?;
         Ok(Self { r, s })
     }
 }
 
-impl<S: OsstScalar> core::fmt::Debug for ContributionSignature<S> {
+impl<P: OsstPoint> core::fmt::Debug for ContributionSignature<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ContributionSignature")
-            .field("r", &hex_short(&self.r))
+            .field("r", &hex_short(self.r.compress().as_ref()))
             .field("s", &"[SCALAR]")
             .finish()
     }
@@ -220,7 +238,7 @@ impl<P: OsstPoint> DealerContribution<P> {
     pub fn new(
         commitment: DealerCommitment<P>,
         liveness: LivenessProof,
-        signature: ContributionSignature<P::Scalar>,
+        signature: ContributionSignature<P>,
     ) -> Self {
         Self {
             commitment,
@@ -266,15 +284,15 @@ impl<P: OsstPoint> DealerContribution<P> {
         // Schnorr signature
         let k = P::Scalar::random(rng);
         let r_point = P::generator().mul_scalar(&k);
-        let r = r_point.compress();
+        let public_key = P::generator().mul_scalar(secret_key);
 
-        // e = H(R || message)
-        let e = Self::challenge_hash(&r, &message);
+        // e = H(dom || R || Y || message)
+        let e = Self::challenge_hash(&r_point, &public_key, &message);
 
         // s = k + e * x
         let s = k.add(&e.mul(secret_key));
 
-        let signature = ContributionSignature::new(r, s);
+        let signature = ContributionSignature::new(r_point, s);
 
         Self {
             commitment,
@@ -287,27 +305,40 @@ impl<P: OsstPoint> DealerContribution<P> {
     pub fn verify_signature(&self, public_key: &P, context: &[u8]) -> bool {
         let message = Self::signing_message(&self.commitment, &self.liveness, context);
 
-        // Decompress R
-        let r_point = match P::decompress(&self.signature.r) {
-            Some(p) => p,
-            None => return false,
-        };
-
-        // e = H(R || message)
-        let e = Self::challenge_hash(&self.signature.r, &message);
+        // e = H(dom || R || Y || message)
+        let e = Self::challenge_hash(&self.signature.r, public_key, &message);
 
         // Verify: g^s == R + Y^e
         let lhs = P::generator().mul_scalar(&self.signature.s);
-        let rhs = r_point.add(&public_key.mul_scalar(&e));
+        let rhs = self.signature.r.add(&public_key.mul_scalar(&e));
 
         lhs == rhs
     }
 
-    fn challenge_hash(r: &[u8; 32], message: &[u8; 64]) -> P::Scalar {
+    /// Challenge for the contribution signature.
+    ///
+    /// `e = H(LIVENESS_SIG_DOMAIN || R || Y || message)`
+    ///
+    /// # Why the key is in the hash (L-1)
+    ///
+    /// Until 0.4.0 this was `SHA512(R || message)`. Verification is
+    /// `g^s == R + e·Y` with `e` independent of `Y`, so a valid `(R, s)` under
+    /// `Y` became a valid `(R, s + e·delta)` under `Y + delta·G` for any
+    /// `delta` — equivalently, an adversary could pick `R` and `s` freely and
+    /// back-solve a key for which they verify. Whether that was exploitable
+    /// depended on whether the registry established dealer keys with a proof
+    /// of possession, which osst does not do either way. RFC 8032 and BIP340
+    /// both bind the key into the challenge for exactly this reason.
+    ///
+    /// The domain tag additionally separates this hash from the OSST
+    /// contribution challenge, which it used to equal byte-for-byte (H-1).
+    pub fn challenge_hash(r: &P, public_key: &P, message: &[u8; 64]) -> P::Scalar {
         use sha2::{Digest, Sha512};
 
         let mut hasher = Sha512::new();
-        hasher.update(r);
+        hasher.update(LIVENESS_SIG_DOMAIN);
+        hasher.update(r.compress());
+        hasher.update(public_key.compress());
         hasher.update(message);
 
         let hash: [u8; 64] = hasher.finalize().into();
@@ -388,17 +419,41 @@ impl<'a, P: OsstPoint, V: LivenessVerifier> ContributionVerifier<'a, P, V> {
         Ok(())
     }
 
-    /// Verify multiple contributions, returning valid ones
+    /// Verify one contribution against a roster keyed by dealer index.
+    ///
+    /// # Errors
+    ///
+    /// [`ContributionError::IndexMismatch`] when the roster has no key for
+    /// this contribution's dealer, plus the errors of [`Self::verify`].
+    pub fn verify_keyed(
+        &self,
+        contribution: &DealerContribution<P>,
+        public_keys: &[(u32, P)],
+    ) -> Result<(), ContributionError> {
+        let pk = public_keys
+            .iter()
+            .find(|(i, _)| *i == contribution.dealer_index())
+            .map(|(_, k)| k)
+            .ok_or(ContributionError::IndexMismatch)?;
+        self.verify(contribution, pk)
+    }
+
+    /// Verify multiple contributions, returning the positions of the valid
+    /// ones.
+    ///
+    /// Public keys are looked up by `dealer_index`, not by position: the
+    /// previous signature zipped the two lists, so a caller that passed them
+    /// in different orders verified every contribution against the wrong key
+    /// and the `IndexMismatch` variant was never constructed.
     pub fn verify_batch(
         &self,
         contributions: &[DealerContribution<P>],
-        public_keys: &[P],
+        public_keys: &[(u32, P)],
     ) -> Vec<usize> {
         contributions
             .iter()
-            .zip(public_keys.iter())
             .enumerate()
-            .filter_map(|(i, (contrib, pk))| self.verify(contrib, pk).ok().map(|_| i))
+            .filter_map(|(i, contrib)| self.verify_keyed(contrib, public_keys).ok().map(|_| i))
             .collect()
     }
 }
@@ -462,7 +517,7 @@ mod tests {
         let public: RistrettoPoint = RistrettoPoint::generator().mul_scalar(&secret);
 
         // Create dealer and commitment
-        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 3, &mut rng);
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 3, &mut rng).expect("index is 1-indexed by construction");
         let commitment = dealer.commitment().clone();
 
         // Create liveness proof
@@ -498,7 +553,7 @@ mod tests {
         let secret = Scalar::random(&mut rng);
         let public: RistrettoPoint = RistrettoPoint::generator().mul_scalar(&secret);
 
-        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 3, &mut rng);
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(1, Scalar::random(&mut rng), 3, &mut rng).expect("index is 1-indexed by construction");
         let commitment = dealer.commitment().clone();
 
         // Recent checkpoint - should pass

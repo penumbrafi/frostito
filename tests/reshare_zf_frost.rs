@@ -39,7 +39,7 @@ fn scalar_to_zf(s: &S) -> keys::SigningShare {
 }
 
 fn point_to_zf_share(p: &P) -> keys::VerifyingShare {
-    keys::VerifyingShare::deserialize(&p.compress()).unwrap()
+    keys::VerifyingShare::deserialize(p.compress().as_ref()).unwrap()
 }
 
 /// Rebuild ZF key material for new member `j` from the frostito outputs.
@@ -125,11 +125,11 @@ fn zf_dkg_then_frostito_reshare_then_zf_sign() {
         .iter()
         .map(|&i| {
             let s = zf_share_to_scalar(&old_shares[&id(i)]);
-            (i, Dealer::new(i, s, new_t, &mut rng))
+            (i, Dealer::new(i, s, new_t, &mut rng).unwrap())
         })
         .collect();
 
-    let group_key_point = P::decompress(&group_key.serialize().unwrap().try_into().unwrap()).unwrap();
+    let group_key_point = P::decompress(&group_key.serialize().unwrap()).unwrap();
 
     let mut new_key_packages = BTreeMap::new();
     let mut polys = Vec::new();
@@ -137,7 +137,7 @@ fn zf_dkg_then_frostito_reshare_then_zf_sign() {
         let mut agg: Aggregator<P> = Aggregator::new(j, &dealer_set).unwrap();
         for (&i, dealer) in &dealers {
             assert!(agg
-                .add_subshare(dealer.generate_subshare(j), dealer.commitment().clone())
+                .add_subshare(dealer.generate_subshare(j).unwrap(), dealer.commitment().clone())
                 .unwrap());
             let _ = i;
         }

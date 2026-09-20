@@ -128,25 +128,35 @@ pub struct SigningCommitments<P: OsstPoint> {
 }
 
 impl<P: OsstPoint> SigningCommitments<P> {
-    /// Serialize to bytes: [index:4][D:32][E:32] = 68 bytes
-    pub fn to_bytes(&self) -> [u8; 68] {
-        let mut buf = [0u8; 68];
-        buf[0..4].copy_from_slice(&self.index.to_le_bytes());
-        buf[4..36].copy_from_slice(&self.hiding.compress());
-        buf[36..68].copy_from_slice(&self.binding.compress());
+    /// Byte length of the serialized form.
+    #[inline]
+    pub fn byte_size() -> usize {
+        4 + 2 * P::COMPRESSED_SIZE
+    }
+
+    /// Serialize: `index:4 || D || E`, the points in this curve's canonical
+    /// compressed encoding (32 bytes each, 33 on secp256k1).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::byte_size());
+        buf.extend_from_slice(&self.index.to_le_bytes());
+        buf.extend_from_slice(self.hiding.compress().as_ref());
+        buf.extend_from_slice(self.binding.compress().as_ref());
         buf
     }
 
     /// Deserialize from bytes.
-    pub fn from_bytes(bytes: &[u8; 68]) -> Result<Self, OsstError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, OsstError> {
+        if bytes.len() != Self::byte_size() {
+            return Err(OsstError::InvalidCommitment);
+        }
         let index = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
         if index == 0 {
             return Err(OsstError::InvalidIndex);
         }
-        let hiding_bytes: [u8; 32] = bytes[4..36].try_into().unwrap();
-        let binding_bytes: [u8; 32] = bytes[36..68].try_into().unwrap();
-        let hiding = P::decompress(&hiding_bytes).ok_or(OsstError::InvalidCommitment)?;
-        let binding = P::decompress(&binding_bytes).ok_or(OsstError::InvalidCommitment)?;
+        let n = P::COMPRESSED_SIZE;
+        let hiding = P::decompress(&bytes[4..4 + n]).ok_or(OsstError::InvalidCommitment)?;
+        let binding =
+            P::decompress(&bytes[4 + n..4 + 2 * n]).ok_or(OsstError::InvalidCommitment)?;
         Ok(Self {
             index,
             hiding,
@@ -315,19 +325,28 @@ pub struct Signature<P: OsstPoint> {
 }
 
 impl<P: OsstPoint> Signature<P> {
-    /// Serialize: [R:32][z:32] = 64 bytes
-    pub fn to_bytes(&self) -> [u8; 64] {
-        let mut buf = [0u8; 64];
-        buf[0..32].copy_from_slice(&self.r.compress());
-        buf[32..64].copy_from_slice(&self.z.to_bytes());
+    /// Byte length of the serialized form.
+    #[inline]
+    pub fn byte_size() -> usize {
+        P::COMPRESSED_SIZE + 32
+    }
+
+    /// Serialize: `R || z`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::byte_size());
+        buf.extend_from_slice(self.r.compress().as_ref());
+        buf.extend_from_slice(&self.z.to_bytes());
         buf
     }
 
     /// Deserialize.
-    pub fn from_bytes(bytes: &[u8; 64]) -> Result<Self, OsstError> {
-        let r_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
-        let z_bytes: [u8; 32] = bytes[32..64].try_into().unwrap();
-        let r = P::decompress(&r_bytes).ok_or(OsstError::InvalidCommitment)?;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, OsstError> {
+        if bytes.len() != Self::byte_size() {
+            return Err(OsstError::InvalidCommitment);
+        }
+        let n = P::COMPRESSED_SIZE;
+        let r = P::decompress(&bytes[0..n]).ok_or(OsstError::InvalidCommitment)?;
+        let z_bytes: [u8; 32] = bytes[n..n + 32].try_into().unwrap();
         let z = P::Scalar::from_canonical_bytes(&z_bytes)
             .ok_or(OsstError::InvalidResponse)?;
         Ok(Self { r, z })
@@ -344,11 +363,11 @@ impl<P: OsstPoint> Signature<P> {
 fn encode_commitments<P: OsstPoint>(
     commitments: &BTreeMap<u32, SigningCommitments<P>>,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(commitments.len() * 68);
+    let mut buf = Vec::with_capacity(commitments.len() * (4 + 2 * P::COMPRESSED_SIZE));
     for (_, c) in commitments {
         buf.extend_from_slice(&c.index.to_le_bytes());
-        buf.extend_from_slice(&c.hiding.compress());
-        buf.extend_from_slice(&c.binding.compress());
+        buf.extend_from_slice(c.hiding.compress().as_ref());
+        buf.extend_from_slice(c.binding.compress().as_ref());
     }
     buf
 }
@@ -402,8 +421,10 @@ fn compute_challenge<P: OsstPoint>(
 pub fn commit<P: OsstPoint, R: rand_core::RngCore + rand_core::CryptoRng>(
     index: u32,
     rng: &mut R,
-) -> (Nonces<P::Scalar>, SigningCommitments<P>) {
-    assert!(index > 0, "signer index must be 1-indexed");
+) -> Result<(Nonces<P::Scalar>, SigningCommitments<P>), OsstError> {
+    if index == 0 {
+        return Err(OsstError::InvalidIndex);
+    }
 
     let hiding = P::Scalar::random(rng);
     let binding = P::Scalar::random(rng);
@@ -414,7 +435,7 @@ pub fn commit<P: OsstPoint, R: rand_core::RngCore + rand_core::CryptoRng>(
         binding: P::generator().mul_scalar(&binding),
     };
 
-    (Nonces { hiding, binding }, commitments)
+    Ok((Nonces { hiding, binding }, commitments))
 }
 
 /// Round 2: produce a signature share.
@@ -431,15 +452,53 @@ pub fn commit<P: OsstPoint, R: rand_core::RngCore + rand_core::CryptoRng>(
 /// # Errors
 ///
 /// Returns `InvalidIndex` if this signer's index is not in the package.
+/// [`sign`] with the message given as an epoch-bound
+/// [`SigningContext`](crate::SigningContext).
+///
+/// The package must have been built over `ctx.encode()`; otherwise this
+/// returns [`OsstError::MessageMismatch`] rather than signing whatever the
+/// coordinator put in the package. This is the only-way-in form: a caller that
+/// uses it cannot forget to bind the epoch and manifest.
+///
+/// Note the verifier-side rule (see [`crate::context`]): epoch binding is a
+/// property of the verifier. A verifier MUST rebuild the context bytes from an
+/// epoch and manifest hash it obtains from an authoritative source, and never
+/// from data carried alongside the signature.
+pub fn sign_with_context<P: OsstPoint>(
+    ctx: &crate::SigningContext<'_>,
+    package: &SigningPackage<P>,
+    nonces: Nonces<P::Scalar>,
+    share: &SecretShare<P::Scalar>,
+    group_pubkey: &P,
+) -> Result<SignatureShare<P::Scalar>, OsstError> {
+    if package.message() != ctx.encode().as_slice() {
+        return Err(OsstError::MessageMismatch);
+    }
+    sign(package, nonces, share, group_pubkey)
+}
+
 pub fn sign<P: OsstPoint>(
     package: &SigningPackage<P>,
     nonces: Nonces<P::Scalar>,
     share: &SecretShare<P::Scalar>,
     group_pubkey: &P,
 ) -> Result<SignatureShare<P::Scalar>, OsstError> {
-    // verify our index is in the signing set
-    if package.get_commitments(share.index).is_none() {
-        return Err(OsstError::InvalidIndex);
+    // verify our index is in the signing set, and that the commitment the
+    // package carries under it is the one these nonces produced (F-1).
+    //
+    // Without this the coordinator chooses the binding factor an honest signer
+    // applies to its own binding nonce while holding the hiding nonce fixed.
+    // One session is one equation in three unknowns, so it is not by itself an
+    // extraction — but it becomes one for any signer whose nonce state
+    // survives a process restart, and it is a cheap, standard invariant that
+    // ZF `frost-core` enforces as `Error::IncorrectCommitment`.
+    let mine = package
+        .get_commitments(share.index)
+        .ok_or(OsstError::InvalidIndex)?;
+    if mine.hiding != P::generator().mul_scalar(&nonces.hiding)
+        || mine.binding != P::generator().mul_scalar(&nonces.binding)
+    {
+        return Err(OsstError::UnexpectedCommitment);
     }
 
     // binding factor for this signer
@@ -593,7 +652,7 @@ mod tests {
                     y += coeff * x_pow;
                     x_pow *= x;
                 }
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
@@ -619,7 +678,7 @@ mod tests {
         let mut all_nonces = Vec::new();
         let mut all_commitments = Vec::new();
         for share in &shares[0..t as usize] {
-            let (nonces, commitments) = commit::<RistrettoPoint, _>(share.index, &mut rng);
+            let (nonces, commitments) = commit::<RistrettoPoint, _>(share.index, &mut rng).expect("index is 1-indexed by construction");
             all_nonces.push(nonces);
             all_commitments.push(commitments);
         }
@@ -683,7 +742,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &active {
-            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng);
+            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
@@ -726,7 +785,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &shares[0..3] {
-            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng);
+            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
@@ -767,7 +826,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &shares[0..3] {
-            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng);
+            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
@@ -806,7 +865,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &shares[0..2] {
-            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng);
+            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
@@ -853,7 +912,7 @@ mod tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &shares[0..3] {
-            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng);
+            let (n, c) = commit::<RistrettoPoint, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
@@ -890,8 +949,8 @@ mod tests {
     #[test]
     fn test_frost_duplicate_commitments_rejected() {
         let mut rng = OsRng;
-        let (_, c1) = commit::<RistrettoPoint, _>(1, &mut rng);
-        let (_, c2) = commit::<RistrettoPoint, _>(1, &mut rng); // same index
+        let (_, c1) = commit::<RistrettoPoint, _>(1, &mut rng).expect("index is 1-indexed by construction");
+        let (_, c2) = commit::<RistrettoPoint, _>(1, &mut rng).expect("index is 1-indexed by construction"); // same index
         let result =
             SigningPackage::<RistrettoPoint>::new(b"test".to_vec(), vec![c1, c2]);
         assert!(matches!(result, Err(OsstError::DuplicateIndex(1))));
@@ -922,7 +981,7 @@ mod pallas_tests {
                     y += coeff * x_pow;
                     x_pow *= x;
                 }
-                SecretShare::new(i, y)
+                SecretShare::new(i, y).expect("index is 1-indexed by construction")
             })
             .collect()
     }
@@ -943,7 +1002,7 @@ mod pallas_tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in &shares[0..t as usize] {
-            let (nonces, commitments) = commit::<Point, _>(s.index, &mut rng);
+            let (nonces, commitments) = commit::<Point, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(nonces);
             commitments_vec.push(commitments);
         }
@@ -979,7 +1038,7 @@ mod pallas_tests {
 
         // DKG
         let dealers: Vec<dkg::Dealer<Point>> =
-            (1..=n).map(|i| dkg::Dealer::new(i, t, &mut rng)).collect();
+            (1..=n).map(|i| dkg::Dealer::new(i, t, &mut rng).expect("index is 1-indexed by construction")).collect();
 
         let commitments: Vec<&crate::reshare::DealerCommitment<Point>> =
             dealers.iter().map(|d| d.commitment()).collect();
@@ -991,7 +1050,7 @@ mod pallas_tests {
         for j in 1..=n {
             let mut agg: dkg::Aggregator<Point> = dkg::Aggregator::all_dealers(j, n).unwrap();
             for dealer in &dealers {
-                let subshare = dealer.generate_subshare(j);
+                let subshare = dealer.generate_subshare(j).expect("index is 1-indexed by construction");
                 agg.add_subshare(subshare, commitments[(dealer.index() - 1) as usize])
                     .unwrap();
             }
@@ -999,7 +1058,7 @@ mod pallas_tests {
             if group_key.is_none() {
                 group_key = Some(agg.derive_group_key().unwrap());
             }
-            let ss = SecretShare::new(j, share_scalar);
+            let ss = SecretShare::new(j, share_scalar).expect("index is 1-indexed by construction");
             vshares.insert(j, Point::generator().mul_scalar(ss.scalar()));
             secret_shares.push(ss);
         }
@@ -1013,7 +1072,7 @@ mod pallas_tests {
         let mut nonces_vec = Vec::new();
         let mut commitments_vec = Vec::new();
         for s in active {
-            let (n, c) = commit::<Point, _>(s.index, &mut rng);
+            let (n, c) = commit::<Point, _>(s.index, &mut rng).expect("index is 1-indexed by construction");
             nonces_vec.push(n);
             commitments_vec.push(c);
         }
