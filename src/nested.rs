@@ -660,6 +660,7 @@ mod tests {
             session_id: SESSION,
             inner_commitments: &inner_commitments,
             active_indices: &quorum,
+            inner_threshold: 3,
         };
 
         // ── inner holders sign; every share is verified before aggregation ──
@@ -778,6 +779,7 @@ mod tests {
             session_id: SESSION,
             inner_commitments: &inner_commitments,
             active_indices: &quorum,
+            inner_threshold: 3,
         };
 
         let public_shares: Vec<(u32, Point)> = inner_shares
@@ -1415,8 +1417,18 @@ pub struct NestedSigningRequest<'a, P: OsstPoint> {
     pub inner_commitments: &'a [InnerCommitments<P>],
     /// The inner quorum actually signing.
     ///
-    /// Caller-anchored: see the type documentation.
+    /// Caller-anchored: see the type documentation. Validated against
+    /// `inner_commitments` and `inner_threshold` by [`inner_sign_v2`] (M-14).
     pub active_indices: &'a [u32],
+    /// The inner group's own threshold `t_in`, from the holder's inner key
+    /// material.
+    ///
+    /// Caller-anchored, and the reason it is here rather than derived: a
+    /// [`SecretShare`](crate::SecretShare) carries an index and a scalar and
+    /// nothing else, so `inner_sign_v2` has no way to learn `t_in` from its
+    /// arguments. Supply the value the inner DKG or reshare fixed; a holder
+    /// that passes a coordinator's number has anchored nothing.
+    pub inner_threshold: u32,
 }
 
 /// Outer context for v2 signing.
@@ -1593,6 +1605,38 @@ pub fn inner_sign_v2<P: OsstPoint>(
     if request.package.message() != approved_message {
         return Err(OsstError::MessageMismatch);
     }
+
+    // (M-14) the quorum the μ_k are computed over must be a real quorum of the
+    // commitment set the nested aggregate was formed from. `active_indices` is
+    // coordinator-supplied, and through 0.4.x the only check was that this
+    // holder appeared somewhere in it: a set with duplicates, with members that
+    // published no round-1 commitment, or smaller than t_in produced Lagrange
+    // coefficients over a quorum that does not match the ΣD the package
+    // committed to. The share then simply failed to aggregate — N-3 fixed
+    // exactly this on the aggregation side and left the signing side open.
+    // These are errors, never panics: the values come off the wire.
+    if (request.active_indices.len() as u64) < request.inner_threshold as u64 {
+        return Err(OsstError::InsufficientContributions {
+            got: request.active_indices.len(),
+            need: request.inner_threshold as usize,
+        });
+    }
+    for (i, &k) in request.active_indices.iter().enumerate() {
+        if k == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        if request.active_indices[..i].contains(&k) {
+            return Err(OsstError::DuplicateIndex(k));
+        }
+        if !request
+            .inner_commitments
+            .iter()
+            .any(|c| c.holder_index == k)
+        {
+            return Err(OsstError::UnknownQuorumMember(k));
+        }
+    }
+
 
     // (N-2) this round is the round the nonces were committed to ...
     if nonces.session_id != request.session_id {

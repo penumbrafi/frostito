@@ -68,6 +68,27 @@ pub enum OsstError {
 
     /// A participant is not on the sealed roster.
     UnknownParticipant(u32),
+
+    /// An index in a coordinator-supplied `active_indices` has no round-1
+    /// commitment in the set the nested aggregate was formed over (M-14).
+    UnknownQuorumMember(u32),
+
+    /// Two participants published different views of the same round-1
+    /// commitment set: a dealer equivocated, or the broadcast is not
+    /// reliable. Refuse to enter round 2 (M-5).
+    EchoMismatch,
+
+    /// A revealed inner commitment has no matching round-0 precommitment, or
+    /// does not match the one it claims (M-20).
+    PrecommitMismatch(u32),
+
+    /// `(session_id, holder_index)` has already produced a share. Signing
+    /// again would be nonce reuse (M-13).
+    SessionSpent,
+
+    /// A complaint's signature did not verify under the accuser's identity
+    /// key, or it names a ceremony other than this one (M-6).
+    InvalidComplaint,
 }
 
 impl fmt::Display for OsstError {
@@ -111,6 +132,15 @@ impl fmt::Display for OsstError {
             Self::UnknownParticipant(idx) => {
                 write!(f, "participant {} is not on the roster", idx)
             }
+            Self::UnknownQuorumMember(idx) => {
+                write!(f, "quorum member {} has no round-1 commitment", idx)
+            }
+            Self::EchoMismatch => write!(f, "round-1 commitment sets disagree"),
+            Self::PrecommitMismatch(idx) => {
+                write!(f, "holder {} revealed a commitment it did not precommit to", idx)
+            }
+            Self::SessionSpent => write!(f, "this session has already produced a share"),
+            Self::InvalidComplaint => write!(f, "complaint did not verify"),
             Self::DkgAborted { qualified, need } => write!(
                 f,
                 "dkg aborted: {} qualified dealers remain, need {}",

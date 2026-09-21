@@ -129,6 +129,7 @@ fn coordinator_cannot_swap_the_message_under_the_inner_group() {
         session_id: SESSION,
         inner_commitments: &commitments,
         active_indices: &w.quorum,
+        inner_threshold: 3,
     };
 
     // The jury approved APPROVED. Every holder refuses, at the API.
@@ -177,6 +178,7 @@ fn the_approved_message_still_signs() {
         session_id: SESSION,
         inner_commitments: &commitments,
         active_indices: &w.quorum,
+        inner_threshold: 3,
     };
 
     let mut sigs = Vec::new();
@@ -246,6 +248,7 @@ fn substituted_nested_commitment_is_rejected_by_the_holder() {
         session_id: SESSION,
         inner_commitments: &commitments,
         active_indices: &w.quorum,
+        inner_threshold: 3,
     };
 
     for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
@@ -303,6 +306,7 @@ fn nonces_from_another_session_are_rejected() {
         session_id: OTHER,
         inner_commitments: &commits_b,
         active_indices: &w.quorum,
+        inner_threshold: 3,
     };
 
     // Holder 1 still holds round A's nonces; it must not answer round B.
@@ -362,6 +366,7 @@ fn incomplete_quorum_is_rejected() {
         session_id: SESSION,
         inner_commitments: &commitments,
         active_indices: &w.quorum,
+        inner_threshold: 3,
     };
     let params = InnerSigningParamsV2::from_outer::<Point>(&package, &w.group_pubkey, 2).unwrap();
 
@@ -454,6 +459,7 @@ fn v2_response_equals_the_flat_frost_response() {
         session_id: SESSION,
         inner_commitments: &commitments,
         active_indices: &quorum,
+        inner_threshold: 3,
     };
 
     let mut sigs = Vec::new();
@@ -540,4 +546,76 @@ fn a_substituted_group_key_passes_from_coordinator_checked() {
     // the request type cannot carry a group key at all any more: `Y` is a
     // parameter of `inner_sign_v2`, taken from the holder's own key package.
     // (Enforced at compile time — `NestedSigningRequest` has no such field.)
+}
+
+/// M-14 — `active_indices` is coordinator-supplied and was unvalidated on the
+/// signing side.
+///
+/// `inner_sign_v2` checked only that this holder appeared somewhere in the
+/// list. A set with duplicates, with members that published no round-1
+/// commitment, or smaller than `t_in` produced μ_k over a quorum that does not
+/// match the ΣD the package committed to, and the share simply failed to
+/// aggregate with no indication why. N-3 fixed this on the aggregation side
+/// (`aggregate_inner_shares_verified`) and left the signing side open.
+///
+/// Each rejection is an error, never a panic: these values come off the wire.
+#[test]
+fn a_malformed_quorum_is_rejected_by_the_signer() {
+    let mut rng = OsRng;
+    let w = world(&mut rng);
+
+    let cases: [(&[u32], u32, osst::OsstError); 4] = [
+        // duplicate holder: the Lagrange set is degenerate
+        (&[1, 2, 2], 3, osst::OsstError::DuplicateIndex(2)),
+        // a member that published no round-1 commitment
+        (&[1, 2, 9], 3, osst::OsstError::UnknownQuorumMember(9)),
+        // index 0 is not a Shamir index
+        (&[1, 2, 0], 3, osst::OsstError::InvalidIndex),
+        // below the inner threshold the holder's own key material fixes
+        (
+            &[1, 2],
+            3,
+            osst::OsstError::InsufficientContributions { got: 2, need: 3 },
+        ),
+    ];
+
+    for (active, t, expected) in cases {
+        // a full honest round, so nothing but the quorum is wrong
+        let mut nonces = Vec::new();
+        let mut commitments = Vec::new();
+        for &k in &w.quorum {
+            let (n, c) = inner_commit::<Point, _>(k, SESSION, &mut rng);
+            nonces.push(n);
+            commitments.push(c);
+        }
+        let (d_nested, e_nested) =
+            aggregate_inner_commitment_pair::<Point>(&SESSION, &commitments).unwrap();
+        let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
+        let commits_2 = SigningCommitments {
+            index: 2,
+            hiding: d_nested,
+            binding: e_nested,
+        };
+        let package =
+            frost::SigningPackage::<Point>::new(b"m".to_vec(), vec![commits_1, commits_2]).unwrap();
+
+        let request = NestedSigningRequest {
+            package: &package,
+            nested_index: 2,
+            session_id: SESSION,
+            inner_commitments: &commitments,
+            active_indices: active,
+            inner_threshold: t,
+        };
+
+        let err = inner_sign_v2::<Point>(
+            nonces.remove(0),
+            &w.inner_shares[0],
+            &w.group_pubkey,
+            b"m",
+            &request,
+        )
+        .unwrap_err();
+        assert_eq!(err, expected, "quorum {:?} must be rejected", active);
+    }
 }
