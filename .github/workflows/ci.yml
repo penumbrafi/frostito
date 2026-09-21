@@ -21,6 +21,8 @@ jobs:
       - run: cargo build --all-features
       - run: cargo test --all-features
       - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   backends:
     name: backend ${{ matrix.backend }}
@@ -48,7 +50,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        feature: [sealed, legacy-v1]
+        feature: [sealed, legacy-v1, unsafe_plaintext]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

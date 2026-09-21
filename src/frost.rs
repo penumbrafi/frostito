@@ -232,14 +232,26 @@ impl<P: OsstPoint> SigningPackage<P> {
 
     /// Compute the binding factor for signer i.
     ///
-    /// ρ_i = H("frost-binding-v1" || index || message || encoded_commitments)
+    /// `ρ_i = H("frost-binding-v2" ‖ Y ‖ len(m) ‖ m ‖ len(B) ‖ B ‖ index)` —
+    /// see the `compute_binding_factor` source for why the group public key is in
+    /// there (M-24) and why it is a parameter rather than a field of this
+    /// type.
+    ///
     /// Public so a nested (hierarchical) position can obtain the SAME outer
     /// binding factor the flat protocol would apply to it — see
     /// `nested::inner_sign_v2`. Exposing it is what lets the inner group bind
     /// its nonces to the full outer commitment set.
-    pub fn binding_factor(&self, index: u32) -> P::Scalar {
-        compute_binding_factor::<P::Scalar>(
+    ///
+    /// # `group_pubkey` is caller-anchored
+    ///
+    /// It is deliberately NOT stored in the package. A `SigningPackage` is
+    /// coordinator-shaped data — a signer typically receives one — and a group
+    /// key read out of it would be the coordinator's assertion, which is
+    /// precisely finding M-4. Pass `Y` from your own key material.
+    pub fn binding_factor(&self, index: u32, group_pubkey: &P) -> P::Scalar {
+        compute_binding_factor::<P>(
             index,
+            group_pubkey,
             &self.message,
             &self.encoded_commitments,
         )
@@ -249,10 +261,13 @@ impl<P: OsstPoint> SigningPackage<P> {
     /// Public so a nested position's inner holders can INDEPENDENTLY recompute
     /// the outer context (R_outer) from public data instead of trusting the
     /// coordinator's word for it.
-    pub fn group_commitment(&self) -> P {
+    ///
+    /// `group_pubkey` must come from the caller's own key material — see
+    /// [`binding_factor`](Self::binding_factor).
+    pub fn group_commitment(&self, group_pubkey: &P) -> P {
         let mut r = P::identity();
         for (_, c) in &self.commitments {
-            let rho = self.binding_factor(c.index);
+            let rho = self.binding_factor(c.index, group_pubkey);
             // D_i + ρ_i · E_i
             let bound = c.binding.mul_scalar(&rho);
             r = r.add(&c.hiding);
@@ -281,7 +296,7 @@ pub struct SignatureShare<S: OsstScalar> {
 }
 
 impl<S: OsstScalar> SignatureShare<S> {
-    /// Serialize: [index:4][z:32] = 36 bytes
+    /// Serialize: `index:4 || z:32` = 36 bytes
     pub fn to_bytes(&self) -> [u8; 36] {
         let mut buf = [0u8; 36];
         buf[0..4].copy_from_slice(&self.index.to_le_bytes());
@@ -372,23 +387,57 @@ fn encode_commitments<P: OsstPoint>(
     buf
 }
 
-/// Binding factor: ρ_i = H("frost-binding-v1" || i || msg || commitments)
+/// Binding factor
 ///
-/// Mixes the signer's index with the full commitment list to prevent
-/// adaptive commitment selection attacks.
-fn compute_binding_factor<S: OsstScalar>(
+/// ```text
+/// ρ_i = H("frost-binding-v2" ‖ Y ‖ len(m) ‖ m ‖ len(B) ‖ B ‖ i)
+/// ```
+///
+/// Mixes the signer's index with the full commitment list to prevent adaptive
+/// commitment selection attacks, and with the group public key.
+///
+/// # Why `Y` is in here (M-24 / A-2)
+///
+/// Through 0.4.x the binding factor was `H(dom ‖ i ‖ len(m) ‖ m ‖ B)` — no
+/// group public key. RFC 9591 §4.4 puts it first in the binding-factor input:
+///
+/// ```text
+/// rho_input = G.SerializeElement(group_public_key) ‖ H4(msg)
+///             ‖ H5(encode_group_commitment_list(commitment_list))
+///             ‖ EncodeScalar(identifier)
+/// ```
+///
+/// The consequence of omitting it is that one commitment set and one message
+/// produce the same ρ under every group key, so a transcript is not pinned to
+/// the key it was collected for — which is exactly the freedom M-4 hands a
+/// coordinator that also gets to assert `Y`. Including it makes the whole
+/// signing transcript, binding factor and challenge alike, a function of the
+/// group key, so substituting `Y'` moves ρ as well as `c` and the two can no
+/// longer be made to agree with a package the honest signers already accepted.
+///
+/// The ordering follows RFC 9591 (key, message, commitments, identifier); the
+/// length prefixes on the two variable fields keep the encoding injective
+/// without the RFC's intermediate H4/H5 hashes. `Y` needs none: a compressed
+/// point is fixed-width for a given curve.
+///
+/// This changes every signature this crate produces, which is why it rides the
+/// 0.5.0 wire break.
+fn compute_binding_factor<P: OsstPoint>(
     index: u32,
+    group_pubkey: &P,
     message: &[u8],
     encoded_commitments: &[u8],
-) -> S {
+) -> P::Scalar {
     let mut h = Sha512::new();
-    h.update(b"frost-binding-v1");
-    h.update(index.to_le_bytes());
+    h.update(b"frost-binding-v2");
+    h.update(group_pubkey.compress());
     h.update((message.len() as u64).to_le_bytes());
     h.update(message);
+    h.update((encoded_commitments.len() as u64).to_le_bytes());
     h.update(encoded_commitments);
+    h.update(index.to_le_bytes());
     let hash: [u8; 64] = h.finalize().into();
-    S::from_bytes_wide(&hash)
+    <P::Scalar as OsstScalar>::from_bytes_wide(&hash)
 }
 
 /// Schnorr challenge: c = H("frost-challenge-v1" || R || Y || m)
@@ -502,10 +551,10 @@ pub fn sign<P: OsstPoint>(
     }
 
     // binding factor for this signer
-    let rho = package.binding_factor(share.index);
+    let rho = package.binding_factor(share.index, group_pubkey);
 
     // group commitment R
-    let group_commitment = package.group_commitment();
+    let group_commitment = package.group_commitment(group_pubkey);
 
     // challenge c = H(R, Y, m)
     let challenge = package.challenge(&group_commitment, group_pubkey);
@@ -558,7 +607,7 @@ pub fn aggregate<P: OsstPoint>(
         });
     }
 
-    let group_commitment = package.group_commitment();
+    let group_commitment = package.group_commitment(group_pubkey);
     let challenge = package.challenge(&group_commitment, group_pubkey);
 
     // optionally verify each share
@@ -576,7 +625,7 @@ pub fn aggregate<P: OsstPoint>(
                 .get(&share.index)
                 .ok_or(OsstError::InvalidIndex)?;
 
-            let rho = package.binding_factor(share.index);
+            let rho = package.binding_factor(share.index, group_pubkey);
             let comm = package
                 .get_commitments(share.index)
                 .ok_or(OsstError::InvalidIndex)?;

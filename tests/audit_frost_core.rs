@@ -225,3 +225,38 @@ fn wire_parsed_indices_error_rather_than_aborting_the_process() {
         OsstError::InvalidIndex
     );
 }
+
+/// M-24 (A-2, FIXED) — the binding factor now includes the group public key,
+/// as RFC 9591 §4.4 does.
+///
+/// Through 0.4.x one commitment set and one message gave the same ρ under
+/// every group key, so a signing transcript was not pinned to the key it was
+/// collected for. That is exactly the freedom M-4 hands a coordinator which
+/// also gets to assert `Y`: with ρ independent of `Y`, only the challenge
+/// moved when the key was substituted. Now both move.
+#[test]
+fn the_binding_factor_depends_on_the_group_public_key() {
+    let mut rng = OsRng;
+    let g = <Point as OsstPoint>::generator();
+    let (_, commitments) = frost::commit::<Point, _>(1, &mut rng).unwrap();
+    let package = frost::SigningPackage::<Point>::new(b"m".to_vec(), vec![commitments]).unwrap();
+
+    let y1 = g.mul_scalar(&Scalar::random(&mut rng));
+    let y2 = g.mul_scalar(&Scalar::random(&mut rng));
+
+    assert_ne!(
+        package.binding_factor(1, &y1),
+        package.binding_factor(1, &y2),
+        "substituting the group key must move the binding factor, not only the challenge"
+    );
+    assert_ne!(
+        package.group_commitment(&y1),
+        package.group_commitment(&y2),
+        "and therefore the group commitment too"
+    );
+    assert_eq!(
+        package.binding_factor(1, &y1),
+        package.binding_factor(1, &y1),
+        "and it is still deterministic in its inputs"
+    );
+}

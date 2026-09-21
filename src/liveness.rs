@@ -69,6 +69,14 @@ impl CheckpointAnchor {
 /// Domain tag for the liveness contribution signature.
 pub const LIVENESS_SIG_DOMAIN: &[u8] = b"osst/liveness-sig/v1";
 
+/// Domain tag for the message a [`DealerContribution`] signature covers.
+///
+/// `v2` because 0.5.0 length-prefixed the encoding (M-12); the `v1` tag was
+/// the last `SCREAMING-CASE-V1` string in the crate and its digest differs
+/// from this one for every input, so a 0.4.x signature does not verify here
+/// and vice versa.
+pub const CONTRIBUTION_SIG_MSG_DOMAIN: &[u8] = b"osst/contribution-sig/v2";
+
 // ============================================================================
 // Liveness Proof
 // ============================================================================
@@ -252,9 +260,40 @@ impl<P: OsstPoint> DealerContribution<P> {
         self.commitment.dealer_index
     }
 
-    /// Compute the message to be signed
+    /// The message a contribution signature covers.
     ///
-    /// H(commitment || liveness || context)
+    /// ```text
+    /// SHA-512(
+    ///     len(domain):u64 LE ‖ CONTRIBUTION_SIG_MSG_DOMAIN ‖
+    ///     len(commitment):u64 LE ‖ commitment.to_bytes() ‖
+    ///     len(liveness):u64 LE ‖ liveness.to_bytes() ‖
+    ///     len(context):u64 LE ‖ context
+    /// )
+    /// ```
+    ///
+    /// # Injectivity (M-12)
+    ///
+    /// Until 0.5.0 the four fields were concatenated bare. `DealerCommitment`
+    /// serializes as `dealer_index:4 ‖ t compressed points` — variable length,
+    /// no prefix, and `from_bytes` needs the threshold out of band.
+    /// `LivenessProof` is self-delimiting only once its *start offset* is
+    /// known, and that offset is exactly what the missing prefix left
+    /// undetermined; `context` is caller-supplied and trailing. So reading
+    /// `t+1` coefficients instead of `t` shifted the commitment/liveness
+    /// boundary by one point and, where the shifted bytes parsed, produced a
+    /// second `(commitment, liveness, context)` triple with the same digest.
+    ///
+    /// Every variable-length field now carries a `u64` length prefix, so the
+    /// encoding is injective and no field can absorb bytes from its
+    /// neighbour — the discipline
+    /// [`SigningContext::encode`](crate::SigningContext::encode) already
+    /// applies and documents.
+    ///
+    /// The prior severity assessment still stands on the old code: a dealer
+    /// only ever signs a commitment it built itself, and a verifier parses
+    /// with a threshold pinned out of band, so this was an encoding defect
+    /// rather than a live forgery primitive. It rides 0.5.0 because it is
+    /// signature-incompatible and 0.5.0 already breaks the wire.
     pub fn signing_message(
         commitment: &DealerCommitment<P>,
         liveness: &LivenessProof,
@@ -262,11 +301,17 @@ impl<P: OsstPoint> DealerContribution<P> {
     ) -> [u8; 64] {
         use sha2::{Digest, Sha512};
 
+        fn field(hasher: &mut sha2::Sha512, bytes: &[u8]) {
+            use sha2::Digest;
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+
         let mut hasher = Sha512::new();
-        hasher.update(b"OSST-CONTRIBUTION-V1");
-        hasher.update(commitment.to_bytes());
-        hasher.update(liveness.to_bytes());
-        hasher.update(context);
+        field(&mut hasher, CONTRIBUTION_SIG_MSG_DOMAIN);
+        field(&mut hasher, &commitment.to_bytes());
+        field(&mut hasher, &liveness.to_bytes());
+        field(&mut hasher, context);
 
         hasher.finalize().into()
     }
@@ -506,6 +551,117 @@ mod tests {
         fn max_checkpoint_age(&self) -> u64 {
             self.max_age
         }
+    }
+
+    /// M-12: the pre-0.5.0 contribution message concatenated the domain tag,
+    /// the commitment, the liveness proof and the context with no length
+    /// prefixes, and `DealerCommitment::to_bytes` is variable-length with the
+    /// threshold supplied out of band. So the commitment/liveness boundary was
+    /// undetermined and the encoding was not injective.
+    ///
+    /// This builds an explicit collision against the old rule — two distinct
+    /// `(commitment, liveness)` pairs whose bare concatenations are equal
+    /// byte-for-byte, the second commitment carrying one extra coefficient
+    /// that the first pair spends on the head of its liveness proof — and
+    /// asserts that the length-prefixed v2 message separates them.
+    #[test]
+    fn contribution_message_is_injective_across_the_commitment_boundary() {
+        let mut rng = OsRng;
+        let g = <RistrettoPoint as OsstPoint>::generator();
+        let p1 = g.mul_scalar(&Scalar::random(&mut rng));
+        let p2 = g.mul_scalar(&Scalar::random(&mut rng));
+        // the extra coefficient, which pair A instead reads as the first 32
+        // bytes of its anchor
+        let x = g.mul_scalar(&Scalar::random(&mut rng));
+        let x_bytes = OsstPoint::compress(&x);
+
+        // --- pair A: two coefficients, the extra point absorbed by the anchor
+        let commitment_a = DealerCommitment::<RistrettoPoint> {
+            dealer_index: 7,
+            coefficients: vec![p1, p2],
+        };
+        let height_a = u64::from_le_bytes(x_bytes[0..8].try_into().unwrap());
+        let mut block_hash_a = [0u8; 32];
+        block_hash_a[0..24].copy_from_slice(&x_bytes[8..32]);
+        block_hash_a[24..32].copy_from_slice(&[0xA1; 8]);
+        let timestamp_a = 0x0102_0304_0506_0708u64;
+        // 32 proof bytes whose last four are zero: those four are pair B's
+        // proof length, and it must read as empty
+        let mut proof_a = [0x5Au8; 32];
+        proof_a[28..32].copy_from_slice(&0u32.to_le_bytes());
+        let state_root = [0xC3u8; 32];
+        let liveness_a = LivenessProof::new(
+            CheckpointAnchor::new(height_a, block_hash_a, timestamp_a),
+            proof_a.to_vec(),
+            state_root,
+        );
+
+        // --- pair B: three coefficients, its liveness proof made of the
+        //     bytes pair A spent on the tail of its anchor and its proof
+        let commitment_b = DealerCommitment::<RistrettoPoint> {
+            dealer_index: 7,
+            coefficients: vec![p1, p2, x],
+        };
+        let tail = &liveness_a.to_bytes()[32..];
+        let liveness_b = LivenessProof::from_bytes(tail).expect("tail parses as a liveness proof");
+
+        let context = b"osst-epoch-42";
+
+        // the old rule: domain ‖ commitment ‖ liveness ‖ context, bare
+        let old = |c: &DealerCommitment<RistrettoPoint>, l: &LivenessProof| {
+            use sha2::{Digest, Sha512};
+            let mut h = Sha512::new();
+            h.update(b"OSST-CONTRIBUTION-V1");
+            h.update(c.to_bytes());
+            h.update(l.to_bytes());
+            h.update(context);
+            let out: [u8; 64] = h.finalize().into();
+            out
+        };
+
+        assert_ne!(
+            commitment_a.to_bytes(),
+            commitment_b.to_bytes(),
+            "the two commitments must genuinely differ"
+        );
+        assert_eq!(
+            old(&commitment_a, &liveness_a),
+            old(&commitment_b, &liveness_b),
+            "the pre-0.5.0 encoding really did collide here"
+        );
+
+        assert_ne!(
+            DealerContribution::<RistrettoPoint>::signing_message(
+                &commitment_a,
+                &liveness_a,
+                context
+            ),
+            DealerContribution::<RistrettoPoint>::signing_message(
+                &commitment_b,
+                &liveness_b,
+                context
+            ),
+            "length prefixes must separate the two triples"
+        );
+    }
+
+    /// The context field is trailing; a length prefix must stop it absorbing
+    /// bytes from, or donating bytes to, its neighbour.
+    #[test]
+    fn contribution_message_separates_the_context_field() {
+        let mut rng = OsRng;
+        let dealer: Dealer<RistrettoPoint> =
+            Dealer::new(1, Scalar::random(&mut rng), 3, &mut rng).expect("index is 1-indexed by construction");
+        let commitment = dealer.commitment().clone();
+        let liveness = LivenessProof::new(
+            CheckpointAnchor::new(100, [1u8; 32], 1234567890),
+            vec![1, 2, 3, 4],
+            [2u8; 32],
+        );
+        assert_ne!(
+            DealerContribution::<RistrettoPoint>::signing_message(&commitment, &liveness, b"ab"),
+            DealerContribution::<RistrettoPoint>::signing_message(&commitment, &liveness, b"abc"),
+        );
     }
 
     #[test]

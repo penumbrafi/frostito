@@ -78,7 +78,7 @@ pub struct InnerShare<S: OsstScalar> {
     /// inner holder's index (1-indexed)
     pub holder_index: u32,
     /// shamir shares of each outer polynomial coefficient
-    /// alpha[j] = holder's share of coefficient j
+    /// `alpha[j]` = holder's share of coefficient `j`
     pub coefficient_shares: Vec<S>,
 }
 
@@ -485,8 +485,8 @@ mod tests {
             frost::SigningPackage::new(msg.to_vec(), vec![commits_1, commits_2]).unwrap();
 
         // hand-rolled, as jury.rs / escrow.rs do it today
-        let rho_2 = package.binding_factor(2);
-        let r_outer = package.group_commitment();
+        let rho_2 = package.binding_factor(2, &group_pubkey);
+        let r_outer = package.group_commitment(&group_pubkey);
         let challenge = package.challenge(&r_outer, &group_pubkey);
         let indices = package.signer_indices();
         let outer_lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
@@ -608,7 +608,14 @@ mod tests {
             .iter()
             .fold(<Scalar as OsstScalar>::zero(), |acc, n| acc.add(&n.binding));
 
-        let (d_nested, e_nested) = aggregate_inner_commitment_pair::<Point>(&SESSION, &inner_commitments).unwrap();
+        // round 0: the commit-reveal precommitments the aggregate now verifies
+        let inner_precommits: Vec<(u32, [u8; 32])> = inner_commitments
+            .iter()
+            .map(|c| (c.holder_index, inner_precommit::<Point>(c)))
+            .collect();
+        let (d_nested, e_nested) =
+            aggregate_inner_commitment_pair::<Point>(&SESSION, &inner_precommits, &inner_commitments)
+                .unwrap();
         assert_eq!(d_nested, <Point as OsstPoint>::generator().mul_scalar(&d_sum));
         assert_eq!(e_nested, <Point as OsstPoint>::generator().mul_scalar(&e_sum));
 
@@ -624,14 +631,16 @@ mod tests {
             frost::SigningPackage::new(msg.to_vec(), vec![commits_1, commits_2.clone()]).unwrap();
 
         // outer context — recomputable by any inner holder from public data
-        let rho_2 = package.binding_factor(2);
-        let r_outer = package.group_commitment();
+        let rho_2 = package.binding_factor(2, &group_pubkey);
+        let r_outer = package.group_commitment(&group_pubkey);
         let challenge = package.challenge(&r_outer, &group_pubkey);
         let indices = package.signer_indices();
         let outer_lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
         let pos_2 = indices.iter().position(|&i| i == 2).unwrap();
         // A coordinator-supplied context is only accepted when it is the one
-        // the holder recomputes for itself.
+        // the holder recomputes for itself. Deprecated since 0.5.0 (M-21) —
+        // still exercised here because the legacy wire path still ships.
+        #[allow(deprecated)]
         let params = InnerSigningParamsV2::from_coordinator_checked::<Point>(
             &rho_2,
             &challenge,
@@ -641,25 +650,25 @@ mod tests {
             2,
         )
         .unwrap();
-        assert!(matches!(
-            InnerSigningParamsV2::from_coordinator_checked::<Point>(
+        #[allow(deprecated)]
+        let mismatched = InnerSigningParamsV2::from_coordinator_checked::<Point>(
                 &rho_2,
                 &Scalar::random(&mut rng),
                 &outer_lagrange[pos_2],
                 &package,
                 &group_pubkey,
                 2,
-            ),
-            Err(OsstError::ChallengeMismatch)
-        ));
+            );
+        assert!(matches!(mismatched, Err(OsstError::ChallengeMismatch)));
 
         let request = NestedSigningRequest {
             package: &package,
-            group_pubkey: &group_pubkey,
             nested_index: 2,
             session_id: SESSION,
+            inner_precommits: &inner_precommits,
             inner_commitments: &inner_commitments,
             active_indices: &quorum,
+            inner_threshold: 3,
         };
 
         // ── inner holders sign; every share is verified before aggregation ──
@@ -676,7 +685,7 @@ mod tests {
 
         let mut inner_sigs = Vec::new();
         for (n, share) in inner_nonces.into_iter().zip(inner_shares.iter()) {
-            let sig = inner_sign_v2::<Point>(n, share, msg, &request).unwrap();
+            let sig = inner_sign_v2::<Point>(n, share, &group_pubkey, msg, &request).unwrap();
             let pos = quorum.iter().position(|&i| i == share.index).unwrap();
             let commitment = inner_commitments
                 .iter()
@@ -755,7 +764,14 @@ mod tests {
             inner_nonces.push(n);
             inner_commitments.push(c);
         }
-        let (d_nested, e_nested) = aggregate_inner_commitment_pair::<Point>(&SESSION, &inner_commitments).unwrap();
+        // round 0: the commit-reveal precommitments the aggregate now verifies
+        let inner_precommits: Vec<(u32, [u8; 32])> = inner_commitments
+            .iter()
+            .map(|c| (c.holder_index, inner_precommit::<Point>(c)))
+            .collect();
+        let (d_nested, e_nested) =
+            aggregate_inner_commitment_pair::<Point>(&SESSION, &inner_precommits, &inner_commitments)
+                .unwrap();
         let group_pubkey = <Point as OsstPoint>::generator().mul_scalar(&sigma_2);
 
         let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).expect("index is 1-indexed by construction");
@@ -766,7 +782,7 @@ mod tests {
         };
         let package =
             frost::SigningPackage::new(msg.to_vec(), vec![commits_1, commits_2]).unwrap();
-        let r_outer = package.group_commitment();
+        let r_outer = package.group_commitment(&group_pubkey);
         let indices = package.signer_indices();
         let outer_lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
         let pos_2 = indices.iter().position(|&i| i == 2).unwrap();
@@ -774,11 +790,12 @@ mod tests {
         let params = InnerSigningParamsV2::from_outer::<Point>(&package, &group_pubkey, 2).unwrap();
         let request = NestedSigningRequest {
             package: &package,
-            group_pubkey: &group_pubkey,
             nested_index: 2,
             session_id: SESSION,
+            inner_precommits: &inner_precommits,
             inner_commitments: &inner_commitments,
             active_indices: &quorum,
+            inner_threshold: 3,
         };
 
         let public_shares: Vec<(u32, Point)> = inner_shares
@@ -793,7 +810,7 @@ mod tests {
 
         let mut sigs = Vec::new();
         for (n, share) in inner_nonces.into_iter().zip(inner_shares.iter()) {
-            sigs.push(inner_sign_v2::<Point>(n, share, msg, &request).unwrap());
+            sigs.push(inner_sign_v2::<Point>(n, share, &group_pubkey, msg, &request).unwrap());
         }
         // holder 2 goes rogue
         sigs[1].response = sigs[1].response.add(&<Scalar as OsstScalar>::one());
@@ -1002,7 +1019,7 @@ mod tests {
             let mut r = Point::identity();
             for &idx in &outer_indices {
                 let c = outer_package.get_commitments(idx).unwrap();
-                let rho = compute_outer_binding_factor::<Point>(idx, message, &outer_package);
+                let rho = compute_outer_binding_factor::<Point>(idx, &group_key, message, &outer_package);
                 r = r.add(&c.hiding).add(&c.binding.mul_scalar(&rho));
             }
             r
@@ -1148,7 +1165,7 @@ mod tests {
                 let mut r = Point::identity();
                 for &idx in &outer_indices {
                     let c = package.get_commitments(idx).unwrap();
-                    let rho = compute_outer_binding_factor::<Point>(idx, message, &package);
+                    let rho = compute_outer_binding_factor::<Point>(idx, &group_key, message, &package);
                     r = r.add(&c.hiding).add(&c.binding.mul_scalar(&rho));
                 }
                 r
@@ -1205,6 +1222,7 @@ mod tests {
     #[cfg(feature = "legacy-v1")]
     fn compute_outer_binding_factor<P: OsstPoint>(
         index: u32,
+        group_pubkey: &P,
         message: &[u8],
         package: &frost::SigningPackage<P>,
     ) -> P::Scalar {
@@ -1216,11 +1234,13 @@ mod tests {
             encoded.extend_from_slice(c.binding.compress().as_ref());
         }
         let mut h = Sha512::new();
-        h.update(b"frost-binding-v1");
-        h.update(index.to_le_bytes());
+        h.update(b"frost-binding-v2");
+        h.update(group_pubkey.compress());
         h.update((message.len() as u64).to_le_bytes());
         h.update(message);
+        h.update((encoded.len() as u64).to_le_bytes());
         h.update(&encoded);
+        h.update(index.to_le_bytes());
         P::Scalar::from_bytes_wide(&h.finalize().into())
     }
 }
@@ -1298,16 +1318,38 @@ pub fn verify_inner_precommit<P: OsstPoint>(
 /// as `hiding` and `binding` respectively — the nested position then looks
 /// exactly like any other signer and receives a real outer binding factor.
 ///
-/// Callers MUST have verified every precommitment (see
-/// [`verify_inner_precommit`]) before calling this.
+/// # The commit–reveal round is enforced here (M-20)
+///
+/// Through 0.4.x the requirement was a doc comment — "callers MUST have
+/// verified every precommitment" — and nothing called
+/// [`verify_inner_precommit`], including `inner_sign_v2`. "Not load-bearing"
+/// and "unenforced" together mean nobody notices when a caller skips it, and
+/// the callers this crate has do skip it.
+///
+/// So the precommitments are now an argument, and every revealed commitment
+/// must have one that matches. `precommits` is a list of
+/// `(holder_index, precommit)` as produced by [`inner_precommit`]; extra
+/// entries for holders that did not reveal are fine — a holder can precommit
+/// and then fail to appear — but a reveal with no matching precommit, or one
+/// that does not match, is a rejection naming the holder.
+///
+/// On why the round exists at all: the prior audit's A-1 is right that it is
+/// belt-and-braces rather than load-bearing, because the outer ρ covers the
+/// full outer commitment list including the nested aggregate, so a holder
+/// revealing last cannot hold an honest effective nonce fixed. The reason to
+/// enforce it anyway is that the argument depends on the outer protocol
+/// behaving, and this check does not.
 ///
 /// # Errors
 ///
 /// - [`OsstError::EmptyContributions`] if the list is empty.
 /// - [`OsstError::DuplicateIndex`] if a holder appears twice.
 /// - [`OsstError::SessionMismatch`] if any commitment belongs to another round.
+/// - [`OsstError::PrecommitMismatch`] naming a holder whose reveal has no
+///   matching round-0 precommitment.
 pub fn aggregate_inner_commitment_pair<P: OsstPoint>(
     session_id: &[u8; 32],
+    precommits: &[(u32, [u8; 32])],
     inner_commitments: &[InnerCommitments<P>],
 ) -> Result<(P, P), OsstError> {
     if inner_commitments.is_empty() {
@@ -1327,6 +1369,17 @@ pub fn aggregate_inner_commitment_pair<P: OsstPoint>(
             return Err(OsstError::DuplicateIndex(c.holder_index));
         }
         seen.push(c.holder_index);
+
+        // (M-20) the reveal must be the one this holder committed to in round 0
+        let pre = precommits
+            .iter()
+            .find(|(k, _)| *k == c.holder_index)
+            .map(|(_, p)| p)
+            .ok_or(OsstError::PrecommitMismatch(c.holder_index))?;
+        if !verify_inner_precommit::<P>(pre, c) {
+            return Err(OsstError::PrecommitMismatch(c.holder_index));
+        }
+
         d = d.add(&c.hiding);
         e = e.add(&c.binding);
     }
@@ -1350,37 +1403,88 @@ pub fn verify_nested_commitment<P: OsstPoint>(
     package: &crate::frost::SigningPackage<P>,
     nested_index: u32,
     session_id: &[u8; 32],
+    precommits: &[(u32, [u8; 32])],
     inner_commitments: &[InnerCommitments<P>],
 ) -> Result<(), OsstError> {
     let entry = package
         .get_commitments(nested_index)
         .ok_or(OsstError::InvalidIndex)?;
-    let (d, e) = aggregate_inner_commitment_pair::<P>(session_id, inner_commitments)?;
+    let (d, e) = aggregate_inner_commitment_pair::<P>(session_id, precommits, inner_commitments)?;
     if entry.hiding != d || entry.binding != e {
         return Err(OsstError::UnexpectedCommitment);
     }
     Ok(())
 }
 
-/// Everything an inner holder needs about the OUTER round, other than the
-/// message it is approving and its own nonces.
+/// Everything an inner holder needs about the OUTER round that legitimately
+/// comes from the coordinator.
 ///
 /// Passed by reference to [`inner_sign_v2`]. Every field is public data; the
 /// holder derives the outer binding factor, challenge and Lagrange coefficient
 /// from it locally, so no coordinator ever gets to assert them.
+///
+/// # Public is not the same as locally anchored (M-4)
+///
+/// The 0.4.0 doc comment said "every field is public data", which is true and
+/// beside the point: *public* means an adversary learns nothing by seeing it,
+/// not that a holder may take it from whoever sent the request. Two fields
+/// here still have to be anchored against the holder's own state before the
+/// request is trusted, and one has been removed from the struct outright:
+///
+/// - **`group_pubkey` — removed.** It used to live here, and a coordinator
+///   that substituted `Y'` got a package that passed every self-consistency
+///   check, including
+///   [`from_coordinator_checked`](InnerSigningParamsV2::from_coordinator_checked),
+///   because everything was recomputed *using the supplied `Y`*. The holder
+///   then signed the approved message under an attacker-chosen challenge.
+///   That is not a forgery — the result verifies under nothing — but it is
+///   free choice of `c` over a fixed `m`, which is the degree of freedom the
+///   ROS literature is about, and there is no reason to concede it. `Y` is now
+///   a separate argument to [`inner_sign_v2`], which the holder must supply
+///   from its own key package, so a request simply cannot carry one.
+/// - **`nested_index`** must be the holder's own group's position in the outer
+///   set, as fixed when the outer key was generated — not a position a
+///   coordinator assigns per request.
+/// - **`active_indices`** must be the inner quorum the holder's own group
+///   agreed, not a set the coordinator picks. [`inner_sign_v2`] validates it
+///   against `inner_commitments` (M-14), which bounds the damage but does not
+///   make a coordinator-chosen quorum the holder's own choice.
+///
+/// `package`, `session_id` and `inner_commitments` are checked against local
+/// state inside [`inner_sign_v2`]: the message against the holder's approved
+/// bytes, the session against its nonces, and the commitment set against its
+/// own round-1 commitment and the package's nested entry.
 pub struct NestedSigningRequest<'a, P: OsstPoint> {
     /// The outer signing package (carries the message and the FULL commitment list).
     pub package: &'a crate::frost::SigningPackage<P>,
-    /// The outer group public key.
-    pub group_pubkey: &'a P,
     /// The nested position's index in the OUTER signing set.
+    ///
+    /// Caller-anchored: see the type documentation.
     pub nested_index: u32,
     /// The inner round's id, as agreed before round 1.
     pub session_id: [u8; 32],
-    /// The revealed inner commitment set from round 1, precommitments checked.
+    /// The round-0 precommitments, as `(holder_index, precommit)`.
+    ///
+    /// Verified against `inner_commitments` by [`inner_sign_v2`] (M-20) — the
+    /// commit–reveal round is no longer a caller convention. These come from
+    /// the inner group's own round 0, not from the coordinator.
+    pub inner_precommits: &'a [(u32, [u8; 32])],
+    /// The revealed inner commitment set from round 1.
     pub inner_commitments: &'a [InnerCommitments<P>],
     /// The inner quorum actually signing.
+    ///
+    /// Caller-anchored: see the type documentation. Validated against
+    /// `inner_commitments` and `inner_threshold` by [`inner_sign_v2`] (M-14).
     pub active_indices: &'a [u32],
+    /// The inner group's own threshold `t_in`, from the holder's inner key
+    /// material.
+    ///
+    /// Caller-anchored, and the reason it is here rather than derived: a
+    /// [`SecretShare`] carries an index and a scalar and
+    /// nothing else, so `inner_sign_v2` has no way to learn `t_in` from its
+    /// arguments. Supply the value the inner DKG or reshare fixed; a holder
+    /// that passes a coordinator's number has anchored nothing.
+    pub inner_threshold: u32,
 }
 
 /// Outer context for v2 signing.
@@ -1444,10 +1548,10 @@ impl<S: OsstScalar> InnerSigningParamsV2<S> {
             .position(|&i| i == nested_index)
             .ok_or(OsstError::InvalidIndex)?;
         let lagrange = compute_lagrange_coefficients::<S>(&indices)?;
-        let group_commitment = package.group_commitment();
+        let group_commitment = package.group_commitment(group_pubkey);
 
         Ok(Self {
-            outer_binding: package.binding_factor(nested_index),
+            outer_binding: package.binding_factor(nested_index, group_pubkey),
             outer_challenge: package.challenge(&group_commitment, group_pubkey),
             outer_lambda: lagrange[pos].clone(),
         })
@@ -1456,10 +1560,33 @@ impl<S: OsstScalar> InnerSigningParamsV2<S> {
     /// Accept a coordinator-supplied outer context ONLY if it is the one the
     /// holder recomputes from the package itself.
     ///
+    /// # Deprecated (M-21): this validates self-consistency, not provenance
+    ///
+    /// It does what it says, and it is correctly documented as the
+    /// legacy-wire-format escape hatch — but it *reads* like the blessed way
+    /// to accept coordinator input, and a caller who stops reading at the name
+    /// is protected against nothing. Everything here is recomputed against the
+    /// **supplied** `package` and `group_pubkey`, so a coordinator that
+    /// substitutes either gets a self-consistent triple that passes. narsild
+    /// made exactly this mistake (M-4): it called this function correctly and
+    /// still signed under an attacker-supplied `Y`.
+    ///
+    /// Prefer [`from_outer`](Self::from_outer), and take `group_pubkey` from
+    /// your own key package rather than from the request. Where a legacy wire
+    /// format distributes the three scalars anyway, this still recomputes and
+    /// still rejects a mismatch — just do not read it as an authenticity
+    /// check.
+    ///
     /// # Errors
     ///
     /// [`OsstError::ChallengeMismatch`] if any of the three scalars differs
     /// from the locally derived value.
+    #[deprecated(
+        since = "0.5.0",
+        note = "validates self-consistency, not the provenance of `package` or `group_pubkey`: \
+                a substituted group key passes. Prefer `from_outer`, with `group_pubkey` taken \
+                from the signer's own key package."
+    )]
     pub fn from_coordinator_checked<P: OsstPoint<Scalar = S>>(
         supplied_binding: &S,
         supplied_challenge: &S,
@@ -1499,17 +1626,45 @@ impl<S: OsstScalar> InnerSigningParamsV2<S> {
 ///
 /// Note `nonces` is taken BY VALUE: the nonce pair is consumed and zeroized on
 /// drop, so a holder cannot produce two shares from one commitment round
-/// without deliberately cloning. Callers that persist state across restarts
-/// MUST additionally record `(session_id, holder_index)` as spent — the type
-/// system cannot see a process boundary.
+/// without deliberately cloning.
+///
+/// # This function is not a replay guard (M-13)
+///
+/// `session_id` is a mixing guard: it stops two concurrent rounds being
+/// spliced together, and it enters neither the binding factor nor the
+/// challenge. Within one process, consuming the nonces by value plus the
+/// commitment check above is sound. Across a process boundary it is nothing —
+/// a snapshot-restore replays the nonces under a fresh challenge and two
+/// responses under one nonce give up the share by elementary algebra.
+///
+/// Any caller whose state can survive or roll back a restart — which is every
+/// daemon — MUST record `(session_id, holder_index)` as spent, durably, before
+/// the share leaves the process. [`inner_sign_v2_spending`] does that ordering
+/// for you against a [`SpentSessions`] store; the full contract is on that
+/// trait.
+///
+/// # `local_group_pubkey` (M-4)
+///
+/// The outer group public key is a parameter of this function and NOT a field
+/// of [`NestedSigningRequest`], because it must come from the holder's own key
+/// material — the key package written when the outer key was generated — and
+/// never from the coordinator's request. It enters both the binding factor
+/// (M-24) and the challenge `c = H(R ‖ Y ‖ m)`. A coordinator that gets to
+/// choose it gets free choice of `c` over a fixed `m` and a package that
+/// passes every self-consistency check, which is the trap narsild fell into.
+///
+/// Nothing here can verify that the value you pass is the real group key —
+/// only that you, not the coordinator, chose it. Read it from local storage.
 ///
 /// # Errors
 ///
 /// [`OsstError::MessageMismatch`], [`OsstError::UnexpectedCommitment`],
-/// [`OsstError::SessionMismatch`], [`OsstError::InvalidIndex`].
+/// [`OsstError::SessionMismatch`], [`OsstError::InvalidIndex`],
+/// [`OsstError::DuplicateIndex`].
 pub fn inner_sign_v2<P: OsstPoint>(
     nonces: InnerNonces<P::Scalar>,
     share: &SecretShare<P::Scalar>,
+    local_group_pubkey: &P,
     approved_message: &[u8],
     request: &NestedSigningRequest<'_, P>,
 ) -> Result<InnerSignatureShare<P::Scalar>, OsstError> {
@@ -1517,6 +1672,38 @@ pub fn inner_sign_v2<P: OsstPoint>(
     if request.package.message() != approved_message {
         return Err(OsstError::MessageMismatch);
     }
+
+    // (M-14) the quorum the μ_k are computed over must be a real quorum of the
+    // commitment set the nested aggregate was formed from. `active_indices` is
+    // coordinator-supplied, and through 0.4.x the only check was that this
+    // holder appeared somewhere in it: a set with duplicates, with members that
+    // published no round-1 commitment, or smaller than t_in produced Lagrange
+    // coefficients over a quorum that does not match the ΣD the package
+    // committed to. The share then simply failed to aggregate — N-3 fixed
+    // exactly this on the aggregation side and left the signing side open.
+    // These are errors, never panics: the values come off the wire.
+    if (request.active_indices.len() as u64) < request.inner_threshold as u64 {
+        return Err(OsstError::InsufficientContributions {
+            got: request.active_indices.len(),
+            need: request.inner_threshold as usize,
+        });
+    }
+    for (i, &k) in request.active_indices.iter().enumerate() {
+        if k == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        if request.active_indices[..i].contains(&k) {
+            return Err(OsstError::DuplicateIndex(k));
+        }
+        if !request
+            .inner_commitments
+            .iter()
+            .any(|c| c.holder_index == k)
+        {
+            return Err(OsstError::UnknownQuorumMember(k));
+        }
+    }
+
 
     // (N-2) this round is the round the nonces were committed to ...
     if nonces.session_id != request.session_id {
@@ -1541,13 +1728,14 @@ pub fn inner_sign_v2<P: OsstPoint>(
         request.package,
         request.nested_index,
         &request.session_id,
+        request.inner_precommits,
         request.inner_commitments,
     )?;
 
     // Outer context, recomputed locally from the package.
     let params = InnerSigningParamsV2::from_outer::<P>(
         request.package,
-        request.group_pubkey,
+        local_group_pubkey,
         request.nested_index,
     )?;
 
@@ -1569,6 +1757,160 @@ pub fn inner_sign_v2<P: OsstPoint>(
     })
 }
 
+
+// ============================================================================
+// The session-id contract, and spent-session tracking (M-13)
+// ============================================================================
+
+/// A record of which `(session_id, holder_index)` pairs have already produced
+/// a signature share.
+///
+/// # What `session_id` is, precisely
+///
+/// This is worth stating exactly, because the 0.4.0 CHANGELOG's N-2 entry can
+/// be read as more than it is.
+///
+/// `session_id` is a **mixing guard, not a replay guard.** It threads through
+/// [`InnerNonces`], [`InnerCommitments`] and [`inner_precommit`], and it is
+/// checked for equality in [`inner_sign_v2`],
+/// [`aggregate_inner_commitment_pair`] and [`verify_nested_commitment`]. What
+/// it buys is that two concurrent inner rounds cannot be spliced into each
+/// other: a commitment from round A cannot be presented as part of round B,
+/// and nonces from A cannot sign in B.
+///
+/// It enters **neither** hash that matters. `compute_binding_factor` and
+/// `compute_challenge` never see it, so two sessions over the same message and
+/// the same outer commitment list produce the same ρ and the same `c`. It is
+/// not in the signature, it is not in the transcript a verifier checks, and
+/// nothing about it is enforced across a process boundary.
+///
+/// # What actually prevents nonce reuse, and where it stops
+///
+/// Two things, both in-process:
+///
+/// 1. [`inner_sign_v2`] takes `nonces` **by value**, so the pair is consumed
+///    and zeroized on drop; producing two shares from one commitment round
+///    requires deliberately cloning.
+/// 2. It checks that the published commitment matches the nonces being
+///    consumed, so a second share would have to be for a round that published
+///    the same commitment.
+///
+/// Within one process that is sound. Across a restart it is nothing: a VM
+/// snapshot-restore, a container restarted from an image, or any rollback of
+/// the node's state brings the nonces back and lets them sign a second time
+/// under a fresh challenge. Two responses under one nonce give
+/// `σ = (z₁ − z₂)/(w₁ − w₂)` — the share falls out by elementary algebra. For
+/// a daemon holding long-lived escrow authority this is the failure mode most
+/// likely to actually happen, because snapshots are operational routine rather
+/// than an attack.
+///
+/// The type system cannot see a process boundary. This trait is where a caller
+/// puts the thing that can.
+///
+/// # Implementing this
+///
+/// The implementation must be **durable and write-ahead**: the record has to
+/// be on stable storage, `fsync`'d, *before* the share leaves the process.
+/// [`inner_sign_v2_spending`] calls [`spend`](Self::spend) before it computes
+/// anything, so an implementation that writes synchronously gets the ordering
+/// for free. An implementation that buffers, or that records after the fact,
+/// provides nothing: the crash window is exactly the window that matters.
+///
+/// [`MemorySpentSessions`] is for tests. It is not durable, and its
+/// documentation says so; a deployment that uses it has not implemented this.
+pub trait SpentSessions {
+    /// Mark `(session_id, holder_index)` spent, or refuse if it already is.
+    ///
+    /// Must be atomic with respect to crashes: either the pair is durably
+    /// recorded when this returns `Ok`, or it returns `Err`.
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::SessionSpent`] if the pair has already produced a share.
+    /// An implementation backed by storage may return any other
+    /// [`OsstError`] for a write failure — a failure to record MUST be
+    /// reported, never swallowed, since the caller will otherwise sign.
+    fn spend(&mut self, session_id: &[u8; 32], holder_index: u32) -> Result<(), OsstError>;
+
+    /// Whether the pair has already been spent. Advisory: a caller must still
+    /// go through [`spend`](Self::spend), which is the atomic operation.
+    fn is_spent(&self, session_id: &[u8; 32], holder_index: u32) -> bool;
+}
+
+/// An in-memory [`SpentSessions`], for tests.
+///
+/// **Not durable.** It is exactly the thing M-13 is about — state that does
+/// not survive the process — and it exists so the tests and examples can
+/// exercise the spending path. Do not deploy it.
+#[derive(Clone, Debug, Default)]
+pub struct MemorySpentSessions {
+    spent: alloc::collections::BTreeSet<([u8; 32], u32)>,
+}
+
+impl MemorySpentSessions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many pairs have been recorded.
+    pub fn len(&self) -> usize {
+        self.spent.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spent.is_empty()
+    }
+}
+
+impl SpentSessions for MemorySpentSessions {
+    fn spend(&mut self, session_id: &[u8; 32], holder_index: u32) -> Result<(), OsstError> {
+        if !self.spent.insert((*session_id, holder_index)) {
+            return Err(OsstError::SessionSpent);
+        }
+        Ok(())
+    }
+
+    fn is_spent(&self, session_id: &[u8; 32], holder_index: u32) -> bool {
+        self.spent.contains(&(*session_id, holder_index))
+    }
+}
+
+/// [`inner_sign_v2`], with `(session_id, holder_index)` recorded as spent
+/// before the share is computed (M-13).
+///
+/// This is the form a daemon should use. The write happens first, so a crash
+/// between the record and the share leaves the session burnt rather than
+/// replayable — the safe direction. A caller that records afterwards has
+/// implemented nothing: the crash window is the whole point.
+///
+/// The `session_id` a holder spends is the one in its own nonces, not the one
+/// in the request, so a coordinator cannot get a share recorded against a
+/// session the holder is not in.
+///
+/// # Errors
+///
+/// [`OsstError::SessionSpent`] if this holder has already signed this session,
+/// whatever the store says happened before the process started; anything
+/// [`SpentSessions::spend`] returns for a write failure; and every error of
+/// [`inner_sign_v2`].
+pub fn inner_sign_v2_spending<P: OsstPoint, S: SpentSessions + ?Sized>(
+    store: &mut S,
+    nonces: InnerNonces<P::Scalar>,
+    share: &SecretShare<P::Scalar>,
+    local_group_pubkey: &P,
+    approved_message: &[u8],
+    request: &NestedSigningRequest<'_, P>,
+) -> Result<InnerSignatureShare<P::Scalar>, OsstError> {
+    store.spend(&nonces.session_id, nonces.holder_index)?;
+    inner_sign_v2::<P>(
+        nonces,
+        share,
+        local_group_pubkey,
+        approved_message,
+        request,
+    )
+}
+
 /// [`inner_sign_v2`] with the approved message given as an epoch-bound
 /// [`SigningContext`](crate::SigningContext) rather than raw bytes.
 ///
@@ -1579,10 +1921,11 @@ pub fn inner_sign_v2<P: OsstPoint>(
 pub fn inner_sign_v2_with_context<P: OsstPoint>(
     nonces: InnerNonces<P::Scalar>,
     share: &SecretShare<P::Scalar>,
+    local_group_pubkey: &P,
     ctx: &crate::SigningContext<'_>,
     request: &NestedSigningRequest<'_, P>,
 ) -> Result<InnerSignatureShare<P::Scalar>, OsstError> {
-    inner_sign_v2::<P>(nonces, share, &ctx.encode(), request)
+    inner_sign_v2::<P>(nonces, share, local_group_pubkey, &ctx.encode(), request)
 }
 
 /// Verify one inner holder's share before it is aggregated:

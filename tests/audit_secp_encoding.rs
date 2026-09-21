@@ -147,12 +147,55 @@ mod binding_factor_separates_negated_commitments {
             binding: g.mul_scalar(&e),
         };
 
+        let y = g.mul_scalar(&<Scalar as OsstScalar>::random(&mut rng));
         let a = SigningPackage::<Point>::new(b"m".to_vec(), vec![honest]).unwrap();
         let b = SigningPackage::<Point>::new(b"m".to_vec(), vec![flipped]).unwrap();
         assert_ne!(
-            a.binding_factor(1),
-            b.binding_factor(1),
+            a.binding_factor(1, &y),
+            b.binding_factor(1, &y),
             "a sign flip in the commitment set must move the binding factor"
         );
+    }
+}
+
+/// M-22: `compress()` no longer reaches the all-zero output by falling off the
+/// end of a length check. Both named branches are exercised here — the
+/// identity, which SEC1 encodes as one `0x00` byte and which this crate widens
+/// to 33 zero bytes, and an ordinary point, which is 33 bytes already.
+#[cfg(feature = "secp256k1")]
+mod compress_has_no_silent_failure_path {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use k256::ProjectivePoint as Point;
+    use osst::curve::{OsstPoint, OsstScalar};
+
+    #[test]
+    fn identity_compresses_to_the_zero_encoding() {
+        let id = <Point as OsstPoint>::identity();
+        assert_eq!(
+            OsstPoint::compress(&id),
+            [0u8; 33],
+            "the identity must keep the fixed-width all-zero form"
+        );
+        assert_eq!(
+            <Point as OsstPoint>::decompress(&[0u8; 33]).expect("decompresses"),
+            id,
+            "and it must decompress back to the identity"
+        );
+    }
+
+    /// The premise of the infallibility argument, asserted rather than assumed:
+    /// k256's own encoder emits exactly 1 byte for the identity and exactly 33
+    /// for every other point, so the `match` in `compress` is exhaustive.
+    #[test]
+    fn k256_emits_only_the_two_lengths_compress_handles() {
+        let id = <Point as OsstPoint>::identity();
+        assert_eq!(id.to_affine().to_encoded_point(true).as_bytes().len(), 1);
+
+        let mut rng = rand::rngs::OsRng;
+        for _ in 0..64 {
+            let s = <k256::Scalar as OsstScalar>::random(&mut rng);
+            let p = <Point as OsstPoint>::generator().mul_scalar(&s);
+            assert_eq!(p.to_affine().to_encoded_point(true).as_bytes().len(), 33);
+        }
     }
 }

@@ -71,10 +71,25 @@ pub mod zcash {
 
     /// Binding factor for RedPallas FROST
     ///
+    /// ```text
+    /// ρ_i = BLAKE2b-512[FROST_RedPallas_](vk ‖ len(m) ‖ m ‖ len(B) ‖ B ‖ i)
+    /// ```
+    ///
     /// Uses BLAKE2b-512 with "FROST_RedPallas_" personalization for
     /// Zcash protocol compliance.
+    ///
+    /// The randomized verification key `vk` is in the input for the same
+    /// reason as in the generic backend (M-24): RFC 9591 §4.4 puts the group
+    /// public key first in the binding-factor input, and without it one
+    /// commitment set and one message give the same ρ under every key. This
+    /// module's hashes are osst's own construction — it is not byte-compatible
+    /// with ZF `frost-core`/`reddsa`, and never was — so the change is
+    /// uniform with `frost::compute_binding_factor` rather than pinned to an
+    /// external transcript. `tests/reshare_zf_frost.rs`, which does interop
+    /// with ZF, signs with ZF's own `SigningPackage` and is unaffected.
     fn redpallas_binding_factor(
         index: u32,
+        group_pubkey: &Point,
         message: &[u8],
         encoded_commitments: &[u8],
     ) -> Scalar {
@@ -82,10 +97,12 @@ pub mod zcash {
             .hash_length(64)
             .personal(b"FROST_RedPallas_")
             .to_state()
-            .update(&index.to_le_bytes())
+            .update(&group_pubkey.compress())
             .update(&(message.len() as u64).to_le_bytes())
             .update(message)
+            .update(&(encoded_commitments.len() as u64).to_le_bytes())
             .update(encoded_commitments)
+            .update(&index.to_le_bytes())
             .finalize();
         let hash: [u8; 64] = *h.as_array();
         Scalar::from_bytes_wide(&hash)
@@ -138,14 +155,19 @@ pub mod zcash {
             self.commitments.len()
         }
 
-        fn binding_factor(&self, index: u32) -> Scalar {
-            redpallas_binding_factor(index, &self.message, &self.encoded_commitments)
+        fn binding_factor(&self, index: u32, group_pubkey: &Point) -> Scalar {
+            redpallas_binding_factor(
+                index,
+                group_pubkey,
+                &self.message,
+                &self.encoded_commitments,
+            )
         }
 
-        fn group_commitment(&self) -> Point {
+        fn group_commitment(&self, group_pubkey: &Point) -> Point {
             let mut r = Point::identity();
             for (_, c) in &self.commitments {
-                let rho = self.binding_factor(c.index);
+                let rho = self.binding_factor(c.index, group_pubkey);
                 let bound = c.binding.mul_scalar(&rho);
                 r = r.add(&c.hiding);
                 r = r.add(&bound);
@@ -191,8 +213,8 @@ pub mod zcash {
             return Err(OsstError::InvalidIndex);
         }
 
-        let rho = package.binding_factor(share.index);
-        let group_commitment = package.group_commitment();
+        let rho = package.binding_factor(share.index, group_pubkey);
+        let group_commitment = package.group_commitment(group_pubkey);
         let challenge = package.challenge(&group_commitment, group_pubkey);
 
         let indices = package.signer_indices();
@@ -227,7 +249,7 @@ pub mod zcash {
             });
         }
 
-        let group_commitment = package.group_commitment();
+        let group_commitment = package.group_commitment(group_pubkey);
         let challenge = package.challenge(&group_commitment, group_pubkey);
 
         // optional share verification
@@ -245,7 +267,7 @@ pub mod zcash {
                     .get(&share.index)
                     .ok_or(OsstError::InvalidIndex)?;
 
-                let rho = package.binding_factor(share.index);
+                let rho = package.binding_factor(share.index, group_pubkey);
                 let comm = package
                     .commitments
                     .get(&share.index)
@@ -495,8 +517,8 @@ pub mod zcash {
         outer_index: u32, // jury's index in outer protocol (3)
     ) -> Result<SignatureShare<Scalar>, OsstError> {
         // compute outer protocol values
-        let rho = outer_package.binding_factor(outer_index);
-        let group_commitment = outer_package.group_commitment();
+        let rho = outer_package.binding_factor(outer_index, &jury.outer_group_pubkey);
+        let group_commitment = outer_package.group_commitment(&jury.outer_group_pubkey);
         let challenge = outer_package.challenge(&group_commitment, &jury.outer_group_pubkey);
 
         let outer_indices = outer_package.signer_indices();
@@ -715,7 +737,7 @@ pub mod zcash {
         let outer_lambda = compute_lagrange_coefficients::<Scalar>(&outer_indices).ok()?;
         let nested_pos = outer_indices.iter().position(|&i| i == jury_index)?;
 
-        let outer_gc = outer_package.group_commitment();
+        let outer_gc = outer_package.group_commitment(&jury.outer_group_pubkey);
         let outer_challenge = outer_package.challenge(&outer_gc, &jury.outer_group_pubkey);
 
         // phase 4: inner holders sign

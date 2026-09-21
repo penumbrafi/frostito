@@ -203,7 +203,18 @@ impl<S: OsstScalar> SubShare<S> {
         &self.value
     }
 
-    pub fn to_bytes(&self) -> [u8; 40] {
+    /// `dealer_index:4 ‖ player_index:4 ‖ value:32` — the secret scalar in
+    /// the clear.
+    ///
+    /// Crate-internal: [`sealed::seal_subshare`](crate::sealed::seal_subshare)
+    /// is the only caller, and it hands the result straight to Noise. See
+    /// [`to_bytes`](Self::to_bytes) for why there is no unguarded public
+    /// serializer.
+    #[cfg_attr(
+        not(any(feature = "sealed", feature = "unsafe_plaintext")),
+        allow(dead_code)
+    )]
+    pub(crate) fn encode_plaintext(&self) -> [u8; 40] {
         let mut buf = [0u8; 40];
         buf[0..4].copy_from_slice(&self.dealer_index.to_le_bytes());
         buf[4..8].copy_from_slice(&self.player_index.to_le_bytes());
@@ -211,7 +222,13 @@ impl<S: OsstScalar> SubShare<S> {
         buf
     }
 
-    pub fn from_bytes(bytes: &[u8; 40]) -> Result<Self, OsstError> {
+    /// Inverse of [`encode_plaintext`](Self::encode_plaintext); crate-internal
+    /// for the same reason.
+    #[cfg_attr(
+        not(any(feature = "sealed", feature = "unsafe_plaintext")),
+        allow(dead_code)
+    )]
+    pub(crate) fn decode_plaintext(bytes: &[u8; 40]) -> Result<Self, OsstError> {
         let dealer_index = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
         let player_index = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
 
@@ -227,6 +244,54 @@ impl<S: OsstScalar> SubShare<S> {
             player_index,
             value,
         })
+    }
+
+    /// Serialize the sub-share **with the secret scalar in the clear**.
+    ///
+    /// # This is the D-1 footgun
+    ///
+    /// Round 2 of a DKG or a reshare puts one evaluation of every dealer's
+    /// polynomial on the wire per recipient. Anyone who collects `t` of them
+    /// interpolates the group signing key. That is a total, silent compromise,
+    /// it needs no wire tampering where sub-shares are broadcast, and it was
+    /// rated Critical in `SECURITY-REVIEW-2026-09.md` — the whole reason
+    /// [`osst::sealed`](crate::sealed) exists.
+    ///
+    /// Until 0.5.0 this was a plain `pub fn` with no deprecation and no
+    /// warning, one method call away from the sealed API and offering a caller
+    /// no steer at all between the two. A caller took it (M-25, and M-1 of the
+    /// 2026-09-21 maintainer review, where a daemon served the resulting bytes
+    /// over an unauthenticated HTTP GET).
+    ///
+    /// It is now behind the off-by-default `unsafe_plaintext` feature, which a
+    /// caller has to name in its own `Cargo.toml`, and deprecated there. The
+    /// **only** sound use is feeding
+    /// [`sealed::seal_subshare`](crate::sealed::seal_subshare) — which does it
+    /// for you, internally, without ever handing the bytes out. If these bytes
+    /// reach a socket, a log, a status endpoint or a disk that is not the
+    /// holder's own sealed store, the key is gone.
+    #[cfg(feature = "unsafe_plaintext")]
+    #[deprecated(
+        since = "0.5.0",
+        note = "plaintext sub-share: these 40 bytes are secret key material and t of them \
+                reconstruct the group key. Use osst::sealed::seal_subshare, which seals to \
+                one recipient over Noise_K and never exposes the plaintext."
+    )]
+    pub fn to_bytes(&self) -> [u8; 40] {
+        self.encode_plaintext()
+    }
+
+    /// Parse a plaintext sub-share. See [`to_bytes`](Self::to_bytes) — the
+    /// same warning applies, and a caller that needs this is holding secret
+    /// material that should have arrived sealed.
+    #[cfg(feature = "unsafe_plaintext")]
+    #[deprecated(
+        since = "0.5.0",
+        note = "plaintext sub-share: use osst::sealed::open_subshare, which authenticates \
+                the dealer, binds the ceremony and runs the Feldman check for you."
+    )]
+    pub fn from_bytes(bytes: &[u8; 40]) -> Result<Self, OsstError> {
+        Self::decode_plaintext(bytes)
     }
 }
 
