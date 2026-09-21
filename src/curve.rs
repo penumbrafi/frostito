@@ -580,17 +580,48 @@ pub mod secp256k1 {
         /// round trip nor injective: `P` and `-P` had the same 32 bytes, so
         /// binding factors and challenges could not separate a commitment set
         /// from its sign-flipped variants (C-1).
+        ///
+        /// # Infallibility (M-22)
+        ///
+        /// `compress` returns `[u8; 33]` and cannot report an error, so the
+        /// only honest options are a total function or a panic. It is total,
+        /// and the case analysis is exhaustive rather than a fallthrough:
+        /// SEC1 compressed encoding of a curve point over a 256-bit field is
+        /// `0x02`/`0x03` followed by 32 x-coordinate bytes — 33 bytes — and
+        /// the sole other output `k256`'s encoder can produce is the identity,
+        /// which SEC1 gives the single byte `0x00`. Both are named branches
+        /// below, so a silently all-zero result is no longer reachable by
+        /// falling off the end of an `if`.
+        ///
+        /// Until 0.5.0 an unexpected length left `out` all-zero, which
+        /// `decompress` maps to the identity: a wrong hash input rather than a
+        /// loud failure, in the function whose lossiness was C-1.
+        ///
+        /// The remaining `unreachable!` is over `k256`'s own encoder, not over
+        /// wire input, so P-1 ("never abort on parsed bytes") does not apply —
+        /// nothing an attacker sends reaches this branch, and if a future
+        /// `k256` reached it the all-zero alternative would be a silently
+        /// wrong binding factor. `identity_compresses_to_the_zero_encoding`
+        /// in `tests/audit_secp_encoding.rs` pins both named branches.
         fn compress(&self) -> Self::Compressed {
-            let mut out = [0u8; 33];
             let affine = self.to_affine();
             let encoded = affine.to_encoded_point(true);
             let bytes = encoded.as_bytes();
-            if bytes.len() == 33 {
-                out.copy_from_slice(bytes);
+            match bytes.len() {
+                33 => {
+                    let mut out = [0u8; 33];
+                    out.copy_from_slice(bytes);
+                    out
+                }
+                // identity: SEC1 emits a single 0x00 byte; keep the all-zero
+                // fixed-width form, which `decompress` maps back to the
+                // identity.
+                1 if bytes[0] == 0 => [0u8; 33],
+                other => unreachable!(
+                    "k256 emitted a {}-byte compressed point; SEC1 admits only 33 (a point) or 1 (the identity)",
+                    other
+                ),
             }
-            // identity: SEC1 emits a single 0x00 byte; keep the all-zero
-            // fixed-width form, which `decompress` maps back to the identity.
-            out
         }
 
         fn decompress(bytes: &[u8]) -> Option<Self> {
