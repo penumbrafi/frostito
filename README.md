@@ -42,7 +42,7 @@ what 0.5.0 changed, and what it means for you:
 | M-12 | low | the liveness contribution message is length-prefixed and injective; tag `osst/contribution-sig/v2`. **that signature changes too** |
 | M-5 | high | dealer equivocation: `EchoDigest`/`AgreedRound1` ship the echo round over the round-1 set, and `sealed::open_subshare_agreed` resolves commitments from the agreed set |
 | M-4/M-21 | high/low | `NestedSigningRequest` no longer carries the group key — `inner_sign_v2` takes it from your own key package; `from_coordinator_checked` is deprecated |
-| M-6 | high | `Complaint` is signed, ceremony-bound and justified, with a verdict a third party can reach |
+| M-6 | high | `Complaint` is signed, ceremony-bound and justified, with a verdict a third party can reach. 0.5.1 closes the residual: `sealed::open_subshare_agreed_with_evidence` keeps the rejected plaintext so a round-2 complaint can actually be raised, and `ComplaintTally` gates disqualification on `t` distinct accusers |
 | M-14 | medium | `active_indices` is validated against the commitment set and the inner threshold |
 | M-13 | medium | the session id is documented as a mixing guard, not a replay guard; `SpentSessions` + `inner_sign_v2_spending` are where you put the durable half |
 | M-20 | low | the commit–reveal round is enforced, not documented |
@@ -83,7 +83,12 @@ as caller obligations and a caller got each one wrong:
 - **complaint agreement.** `Complaint` is verifiable and ceremony-bound.
   nothing in this crate re-broadcasts one, adjudicates across nodes, or makes
   `DkgState::disqualify` apply the same set everywhere. that is the caller's,
-  and getting it wrong splits the group.
+  and getting it wrong splits the group. a `BadSubShare` verdict says only
+  *"this scalar is not a valid sub-share for that commitment"* — noise_K is
+  not transferable, so a fabricated scalar is `Upheld` too — which is why
+  `ComplaintTally` requires `t` distinct accusers before a dealer is
+  disqualified, and why a dealer that cheats at most `t-1` recipients is
+  excluded rather than blamed.
 - **durable nonce state.** `SpentSessions` is a trait, not an implementation.
   the in-memory one is for tests. a daemon that snapshots and restores without
   a write-ahead, `fsync`'d spent-session log will eventually sign twice under

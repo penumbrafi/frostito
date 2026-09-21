@@ -1,5 +1,84 @@
 # changelog
 
+## [0.5.1] - 2026-09-21
+
+Closes the last item on the 2026-09-21 maintainer review's block list (ii):
+the **M-6 residual**, round-2 complaint transferability.
+
+0.5.0 gave a complaint a signature, a `(epoch, session_id, round)` binding and
+a verdict, but a `BadSubShare` complaint was still something a caller could not
+actually *raise*: `sealed::open_subshare_agreed` discards the decrypted scalar
+the moment the Feldman check fails, so a cheated recipient could abort and log
+and nothing else. `narsild` did exactly that, and the result was the
+split-group outcome M-6 names — one node stops, the rest finalize.
+
+Nominally a patch release, and **not** source-compatible: the only downstream
+is `narsild`, updated in lockstep (`penumbrafi/penumbra` PR #31).
+
+### added
+
+- `sealed::open_subshare_agreed_with_evidence` — `open_subshare_agreed`, but a
+  Feldman failure returns `Err(OpenFailure::BadSubShare { evidence })` instead
+  of discarding the plaintext. Everything that is *not* accusable — a package
+  that does not open, an envelope that disagrees with its contents, a dealer
+  outside the agreed set — is `OpenFailure::Local`, because an accusation built
+  from unauthenticated bytes is one anyone could manufacture against anyone.
+  `open_subshare_agreed` is now this function with the evidence dropped.
+- `dkg::BadSubShareEvidence` — the sub-share scalar, the digest of the dealer's
+  commitment **in the agreed round-1 set**, dealer and recipient indices,
+  session id, round, and the sealed ciphertext digest. Zeroizes on drop and
+  redacts the scalar from `Debug`.
+- `dkg::ComplaintTally` — counts **distinct** accusers with `Upheld` verdicts
+  per accused dealer and gates disqualification on `t` of them. Refuses
+  self-accusation and zero indices; a re-broadcast complaint seen twice counts
+  once.
+- `sealed::OpenFailure`, `sealed::sealed_ciphertext_digest`,
+  `sealed::SEALED_DIGEST_DOMAIN`.
+- `dkg::commitment_digest` and `dkg::COMMITMENT_DIGEST_DOMAIN`, moved from
+  `sealed` (which re-exports them) so a complaint verifier compiled without the
+  `sealed` feature can recompute the digest.
+
+### breaking
+
+| what changed | why |
+|---|---|
+| `ComplaintEvidence::BadSubShare` carries one `BadSubShareEvidence` instead of `{ commitment, revealed, sealed_digest }` | the accuser no longer supplies the commitment its own evidence is checked against |
+| `Complaint::verify` takes `agreed: Option<&AgreedRound1<P>>` | the Feldman check runs against the **verifier's** agreed commitment |
+| `Complaint::adjudicate` takes the same argument and returns `Result` | there must be no zero-argument path that adjudicates a `BadSubShare` |
+
+### the honest version of what this buys
+
+`Upheld` on a `BadSubShare` complaint means **"this scalar is not a valid
+sub-share for that commitment"**. It does not mean "the dealer sent it".
+Noise_K authenticates the sender to the recipient and nothing further, so a
+malicious recipient can fabricate a plaintext its own key would have produced —
+and that fabricated scalar fails the Feldman check exactly as a genuinely bad
+one does. `Upheld` and `Unfounded` therefore cannot distinguish an honest
+recipient from a lying one; `Unfounded` only ever appears when an accuser
+complains about a sub-share that is in fact valid.
+
+So the gate is quorum, not adjudication, and `ComplaintTally` is it: `t`
+distinct accusers against the same dealer, so no tolerated coalition can frame
+an honest one. `tests` carry the demonstration — a fabricated complaint against
+a wholly honest dealer is `Upheld`, and a lone `Upheld` leaves
+`disqualifiable()` empty.
+
+Two residuals, both documented rather than fixed:
+
+- **Exclusion.** A dealer that cheats at most `t-1` recipients is never
+  disqualified. Those recipients hold no usable share from it and must decline
+  to finalize; that is exclusion, not a split key, and it is detectable but not
+  attributable. Closing it needs the GJKR dealer-defence round — the accused
+  publishes `f_i(j)` for each complainant and everyone checks — which needs a
+  reliable broadcast and a timeout, so it belongs to the protocol layer.
+- **Revealing the scalar.** Publishing one evaluation of one dealer's
+  polynomial is a real disclosure. It is acceptable because an `Upheld` verdict
+  is itself the proof that the published value is *not* a point on the agreed
+  polynomial: it discloses nothing about the agreed commitments, the group key,
+  or the recipient's real share. The `Unfounded` case does publish a genuine
+  point — and there the accuser has spent one of its own, named itself, and is
+  still `t-1` short of anything.
+
 ## [0.5.0] - 2026-09-21
 
 Follow-on security release addressing `REVIEW-2026-09-21-maintainer.md`, the
