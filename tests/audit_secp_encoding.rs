@@ -147,11 +147,12 @@ mod binding_factor_separates_negated_commitments {
             binding: g.mul_scalar(&e),
         };
 
+        let y = g.mul_scalar(&<Scalar as OsstScalar>::random(&mut rng));
         let a = SigningPackage::<Point>::new(b"m".to_vec(), vec![honest]).unwrap();
         let b = SigningPackage::<Point>::new(b"m".to_vec(), vec![flipped]).unwrap();
         assert_ne!(
-            a.binding_factor(1),
-            b.binding_factor(1),
+            a.binding_factor(1, &y),
+            b.binding_factor(1, &y),
             "a sign flip in the commitment set must move the binding factor"
         );
     }

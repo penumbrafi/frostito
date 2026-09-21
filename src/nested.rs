@@ -485,8 +485,8 @@ mod tests {
             frost::SigningPackage::new(msg.to_vec(), vec![commits_1, commits_2]).unwrap();
 
         // hand-rolled, as jury.rs / escrow.rs do it today
-        let rho_2 = package.binding_factor(2);
-        let r_outer = package.group_commitment();
+        let rho_2 = package.binding_factor(2, &group_pubkey);
+        let r_outer = package.group_commitment(&group_pubkey);
         let challenge = package.challenge(&r_outer, &group_pubkey);
         let indices = package.signer_indices();
         let outer_lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
@@ -624,8 +624,8 @@ mod tests {
             frost::SigningPackage::new(msg.to_vec(), vec![commits_1, commits_2.clone()]).unwrap();
 
         // outer context — recomputable by any inner holder from public data
-        let rho_2 = package.binding_factor(2);
-        let r_outer = package.group_commitment();
+        let rho_2 = package.binding_factor(2, &group_pubkey);
+        let r_outer = package.group_commitment(&group_pubkey);
         let challenge = package.challenge(&r_outer, &group_pubkey);
         let indices = package.signer_indices();
         let outer_lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
@@ -766,7 +766,7 @@ mod tests {
         };
         let package =
             frost::SigningPackage::new(msg.to_vec(), vec![commits_1, commits_2]).unwrap();
-        let r_outer = package.group_commitment();
+        let r_outer = package.group_commitment(&group_pubkey);
         let indices = package.signer_indices();
         let outer_lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
         let pos_2 = indices.iter().position(|&i| i == 2).unwrap();
@@ -1002,7 +1002,7 @@ mod tests {
             let mut r = Point::identity();
             for &idx in &outer_indices {
                 let c = outer_package.get_commitments(idx).unwrap();
-                let rho = compute_outer_binding_factor::<Point>(idx, message, &outer_package);
+                let rho = compute_outer_binding_factor::<Point>(idx, &group_key, message, &outer_package);
                 r = r.add(&c.hiding).add(&c.binding.mul_scalar(&rho));
             }
             r
@@ -1148,7 +1148,7 @@ mod tests {
                 let mut r = Point::identity();
                 for &idx in &outer_indices {
                     let c = package.get_commitments(idx).unwrap();
-                    let rho = compute_outer_binding_factor::<Point>(idx, message, &package);
+                    let rho = compute_outer_binding_factor::<Point>(idx, &group_key, message, &package);
                     r = r.add(&c.hiding).add(&c.binding.mul_scalar(&rho));
                 }
                 r
@@ -1205,6 +1205,7 @@ mod tests {
     #[cfg(feature = "legacy-v1")]
     fn compute_outer_binding_factor<P: OsstPoint>(
         index: u32,
+        group_pubkey: &P,
         message: &[u8],
         package: &frost::SigningPackage<P>,
     ) -> P::Scalar {
@@ -1216,11 +1217,13 @@ mod tests {
             encoded.extend_from_slice(c.binding.compress().as_ref());
         }
         let mut h = Sha512::new();
-        h.update(b"frost-binding-v1");
-        h.update(index.to_le_bytes());
+        h.update(b"frost-binding-v2");
+        h.update(group_pubkey.compress());
         h.update((message.len() as u64).to_le_bytes());
         h.update(message);
+        h.update((encoded.len() as u64).to_le_bytes());
         h.update(&encoded);
+        h.update(index.to_le_bytes());
         P::Scalar::from_bytes_wide(&h.finalize().into())
     }
 }
@@ -1444,10 +1447,10 @@ impl<S: OsstScalar> InnerSigningParamsV2<S> {
             .position(|&i| i == nested_index)
             .ok_or(OsstError::InvalidIndex)?;
         let lagrange = compute_lagrange_coefficients::<S>(&indices)?;
-        let group_commitment = package.group_commitment();
+        let group_commitment = package.group_commitment(group_pubkey);
 
         Ok(Self {
-            outer_binding: package.binding_factor(nested_index),
+            outer_binding: package.binding_factor(nested_index, group_pubkey),
             outer_challenge: package.challenge(&group_commitment, group_pubkey),
             outer_lambda: lagrange[pos].clone(),
         })

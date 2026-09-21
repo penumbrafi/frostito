@@ -210,6 +210,10 @@ impl<S: OsstScalar> SubShare<S> {
     /// is the only caller, and it hands the result straight to Noise. See
     /// [`to_bytes`](Self::to_bytes) for why there is no unguarded public
     /// serializer.
+    #[cfg_attr(
+        not(any(feature = "sealed", feature = "unsafe_plaintext")),
+        allow(dead_code)
+    )]
     pub(crate) fn encode_plaintext(&self) -> [u8; 40] {
         let mut buf = [0u8; 40];
         buf[0..4].copy_from_slice(&self.dealer_index.to_le_bytes());
@@ -220,6 +224,10 @@ impl<S: OsstScalar> SubShare<S> {
 
     /// Inverse of [`encode_plaintext`](Self::encode_plaintext); crate-internal
     /// for the same reason.
+    #[cfg_attr(
+        not(any(feature = "sealed", feature = "unsafe_plaintext")),
+        allow(dead_code)
+    )]
     pub(crate) fn decode_plaintext(bytes: &[u8; 40]) -> Result<Self, OsstError> {
         let dealer_index = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
         let player_index = u32::from_le_bytes(bytes[4..8].try_into().unwrap());

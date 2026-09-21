@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use osst::curve::{OsstPoint, OsstScalar};
+use osst::curve::OsstPoint;
 use osst::dkg;
 use osst::frost;
 use osst::reshare::DealerCommitment;
@@ -351,18 +351,13 @@ fn main() {
 
     // Compute outer FROST parameters that inner holders need
     // (In production, the relay distributes these)
-    let group_commitment = {
-        let rho_1 = compute_binding_factor(1, message, &outer_package);
-        let rho_3 = compute_binding_factor(3, message, &outer_package);
-        let buyer_c = outer_package.get_commitments(1).unwrap();
-        let escrow_c = outer_package.get_commitments(3).unwrap();
-        buyer_c.hiding.add(&buyer_c.binding.mul_scalar(&rho_1))
-            .add(&escrow_c.hiding)
-            .add(&escrow_c.binding.mul_scalar(&rho_3))
-    };
-
-    let rho_3 = compute_binding_factor(3, message, &outer_package);
-    let challenge = compute_challenge(&group_commitment, &group_key, message);
+    // `Y` comes from the local key material, never from a coordinator (M-4),
+    // and it is now part of the binding-factor input as well as the challenge
+    // (M-24), so these have to be derived through the package's own methods
+    // rather than re-implemented here.
+    let group_commitment = outer_package.group_commitment(&group_key);
+    let rho_3 = outer_package.binding_factor(3, &group_key);
+    let challenge = outer_package.challenge(&group_commitment, &group_key);
     let outer_lagrange = osst::compute_lagrange_coefficients::<Scalar>(&[1, 3]).unwrap();
     let lambda_3 = outer_lagrange[1]; // λ₃ for index 3 in set {1, 3}
 
@@ -421,45 +416,3 @@ fn main() {
     println!("    - {} escrow holders colluding still cannot sign without buyer/seller", inner_t - 1);
 }
 
-// ============================================================================
-// Helper: recompute FROST internals for the inner signing step
-// (In production, the relay would provide these values)
-// ============================================================================
-
-fn compute_binding_factor(
-    index: u32,
-    message: &[u8],
-    package: &frost::SigningPackage<Point>,
-) -> Scalar {
-    use sha2::{Digest, Sha512};
-    let mut encoded = Vec::new();
-    for idx in package.signer_indices() {
-        let c = package.get_commitments(idx).unwrap();
-        encoded.extend_from_slice(&c.index.to_le_bytes());
-        encoded.extend_from_slice(&OsstPoint::compress(&c.hiding));
-        encoded.extend_from_slice(&OsstPoint::compress(&c.binding));
-    }
-    let mut h = Sha512::new();
-    h.update(b"frost-binding-v1");
-    h.update(index.to_le_bytes());
-    h.update((message.len() as u64).to_le_bytes());
-    h.update(message);
-    h.update(&encoded);
-    let hash: [u8; 64] = h.finalize().into();
-    <Scalar as OsstScalar>::from_bytes_wide(&hash)
-}
-
-fn compute_challenge(
-    group_commitment: &Point,
-    group_pubkey: &Point,
-    message: &[u8],
-) -> Scalar {
-    use sha2::{Digest, Sha512};
-    let mut h = Sha512::new();
-    h.update(b"frost-challenge-v1");
-    h.update(OsstPoint::compress(group_commitment));
-    h.update(OsstPoint::compress(group_pubkey));
-    h.update(message);
-    let hash: [u8; 64] = h.finalize().into();
-    <Scalar as OsstScalar>::from_bytes_wide(&hash)
-}
