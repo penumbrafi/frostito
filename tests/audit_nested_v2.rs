@@ -125,7 +125,6 @@ fn coordinator_cannot_swap_the_message_under_the_inner_group() {
 
     let request = NestedSigningRequest {
         package: &evil_package,
-        group_pubkey: &w.group_pubkey,
         nested_index: 2,
         session_id: SESSION,
         inner_commitments: &commitments,
@@ -135,7 +134,7 @@ fn coordinator_cannot_swap_the_message_under_the_inner_group() {
     // The jury approved APPROVED. Every holder refuses, at the API.
     for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
         assert_eq!(
-            inner_sign_v2::<Point>(n, s, APPROVED, &request).unwrap_err(),
+            inner_sign_v2::<Point>(n, s, &w.group_pubkey, APPROVED, &request).unwrap_err(),
             OsstError::MessageMismatch,
             "a holder must not sign a package over a message it did not approve"
         );
@@ -174,7 +173,6 @@ fn the_approved_message_still_signs() {
         frost::SigningPackage::<Point>::new(APPROVED.to_vec(), vec![commits_1, commits_2]).unwrap();
     let request = NestedSigningRequest {
         package: &package,
-        group_pubkey: &w.group_pubkey,
         nested_index: 2,
         session_id: SESSION,
         inner_commitments: &commitments,
@@ -183,7 +181,7 @@ fn the_approved_message_still_signs() {
 
     let mut sigs = Vec::new();
     for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
-        sigs.push(inner_sign_v2::<Point>(n, s, APPROVED, &request).unwrap());
+        sigs.push(inner_sign_v2::<Point>(n, s, &w.group_pubkey, APPROVED, &request).unwrap());
     }
 
     let params = InnerSigningParamsV2::from_outer::<Point>(&package, &w.group_pubkey, 2).unwrap();
@@ -244,7 +242,6 @@ fn substituted_nested_commitment_is_rejected_by_the_holder() {
 
     let request = NestedSigningRequest {
         package: &package,
-        group_pubkey: &w.group_pubkey,
         nested_index: 2,
         session_id: SESSION,
         inner_commitments: &commitments,
@@ -253,7 +250,7 @@ fn substituted_nested_commitment_is_rejected_by_the_holder() {
 
     for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
         assert_eq!(
-            inner_sign_v2::<Point>(n, s, msg, &request).unwrap_err(),
+            inner_sign_v2::<Point>(n, s, &w.group_pubkey, msg, &request).unwrap_err(),
             OsstError::UnexpectedCommitment,
             "the holder must notice that the outer package is not over its own round"
         );
@@ -302,7 +299,6 @@ fn nonces_from_another_session_are_rejected() {
 
     let request = NestedSigningRequest {
         package: &package,
-        group_pubkey: &w.group_pubkey,
         nested_index: 2,
         session_id: OTHER,
         inner_commitments: &commits_b,
@@ -312,7 +308,7 @@ fn nonces_from_another_session_are_rejected() {
     // Holder 1 still holds round A's nonces; it must not answer round B.
     let n = nonces_a.remove(0);
     assert_eq!(
-        inner_sign_v2::<Point>(n, &w.inner_shares[0], msg, &request).unwrap_err(),
+        inner_sign_v2::<Point>(n, &w.inner_shares[0], &w.group_pubkey, msg, &request).unwrap_err(),
         OsstError::SessionMismatch
     );
 
@@ -362,7 +358,6 @@ fn incomplete_quorum_is_rejected() {
     .unwrap();
     let request = NestedSigningRequest {
         package: &package,
-        group_pubkey: &w.group_pubkey,
         nested_index: 2,
         session_id: SESSION,
         inner_commitments: &commitments,
@@ -372,7 +367,7 @@ fn incomplete_quorum_is_rejected() {
 
     let mut sigs = Vec::new();
     for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
-        sigs.push(inner_sign_v2::<Point>(n, s, msg, &request).unwrap());
+        sigs.push(inner_sign_v2::<Point>(n, s, &w.group_pubkey, msg, &request).unwrap());
     }
     let pubs = public_shares(&w.inner_shares);
 
@@ -455,7 +450,6 @@ fn v2_response_equals_the_flat_frost_response() {
     let params = InnerSigningParamsV2::from_outer::<Point>(&package, &group_pubkey, 2).unwrap();
     let request = NestedSigningRequest {
         package: &package,
-        group_pubkey: &group_pubkey,
         nested_index: 2,
         session_id: SESSION,
         inner_commitments: &commitments,
@@ -464,7 +458,7 @@ fn v2_response_equals_the_flat_frost_response() {
 
     let mut sigs = Vec::new();
     for (n, s) in nonces.into_iter().zip(inner.iter()) {
-        sigs.push(inner_sign_v2::<Point>(n, s, b"m", &request).unwrap());
+        sigs.push(inner_sign_v2::<Point>(n, s, &group_pubkey, b"m", &request).unwrap());
     }
     let mut z_nested = <Scalar as OsstScalar>::zero();
     for s in &sigs {
@@ -486,4 +480,64 @@ fn v2_response_equals_the_flat_frost_response() {
         recon = recon.add(&lag[i].mul(s.scalar()));
     }
     assert_eq!(recon, sigma_2);
+}
+
+/// M-4 / M-21 — `from_coordinator_checked` validates self-consistency, not
+/// provenance, and the group public key is no longer something a request can
+/// carry.
+///
+/// The attack the maintainer review describes: a coordinator substitutes `Y'`
+/// and recomputes ρ, c and λ *using the substituted key*. Every check in
+/// `from_coordinator_checked` passes, because every check recomputes against
+/// the supplied `group_pubkey`. This test asserts that it really does pass —
+/// that the function is not the authenticity check its name suggests — and
+/// that the resulting context differs from the one derived under the holder's
+/// own key, which is why `inner_sign_v2` now takes `Y` as its own parameter
+/// instead of reading it out of `NestedSigningRequest`.
+#[test]
+fn a_substituted_group_key_passes_from_coordinator_checked() {
+    let mut rng = OsRng;
+    let w = world(&mut rng);
+
+    let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
+    let (_, commits_2) = frost::commit::<Point, _>(2, &mut rng).unwrap();
+    let package =
+        frost::SigningPackage::<Point>::new(b"release 10 ZEC to alice".to_vec(), vec![commits_1, commits_2]).unwrap();
+
+    // the coordinator's key, not the holder's
+    let evil_y = <Point as OsstPoint>::generator().mul_scalar(&<Scalar as OsstScalar>::random(&mut rng));
+    assert_ne!(evil_y, w.group_pubkey);
+
+    let indices = package.signer_indices();
+    let lagrange = osst::compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
+    let pos = indices.iter().position(|&i| i == 2).unwrap();
+
+    let evil_r = package.group_commitment(&evil_y);
+    let evil_rho = package.binding_factor(2, &evil_y);
+    let evil_c = package.challenge(&evil_r, &evil_y);
+
+    // self-consistent under the substituted key: accepted.
+    #[allow(deprecated)]
+    let accepted = InnerSigningParamsV2::from_coordinator_checked::<Point>(
+        &evil_rho,
+        &evil_c,
+        &lagrange[pos],
+        &package,
+        &evil_y,
+        2,
+    );
+    assert!(
+        accepted.is_ok(),
+        "the check is self-consistency, not provenance — this is the M-4 trap"
+    );
+
+    // and it is a different context from the holder's own, so signing under it
+    // would have produced a share over an attacker-chosen challenge.
+    let honest = InnerSigningParamsV2::from_outer::<Point>(&package, &w.group_pubkey, 2).unwrap();
+    assert_ne!(honest.outer_challenge(), accepted.as_ref().unwrap().outer_challenge());
+    assert_ne!(honest.outer_binding(), accepted.as_ref().unwrap().outer_binding());
+
+    // the request type cannot carry a group key at all any more: `Y` is a
+    // parameter of `inner_sign_v2`, taken from the holder's own key package.
+    // (Enforced at compile time — `NestedSigningRequest` has no such field.)
 }
