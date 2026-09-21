@@ -687,3 +687,126 @@ fn a_reveal_without_a_matching_precommit_is_rejected() {
     extra.push((9, [0u8; 32]));
     aggregate_inner_commitment_pair::<Point>(&SESSION, &extra, &commitments).unwrap();
 }
+
+/// M-13 — the session id is a mixing guard, not a replay guard, and
+/// `inner_sign_v2_spending` is where a caller bolts on the missing half.
+///
+/// Consuming the nonces by value protects one process. It does not survive a
+/// snapshot-restore, which brings the nonces back and lets them sign again
+/// under a fresh challenge — two responses under one nonce give up the share.
+/// Here the "restore" is a clone of the nonce pair, which is exactly what a
+/// restored VM has.
+#[test]
+fn a_spent_session_cannot_sign_twice_across_a_restore() {
+    use osst::nested::{inner_sign_v2_spending, MemorySpentSessions, SpentSessions};
+
+    let mut rng = OsRng;
+    let w = world(&mut rng);
+
+    let mut nonces = Vec::new();
+    let mut commitments = Vec::new();
+    for &k in &w.quorum {
+        let (n, c) = inner_commit::<Point, _>(k, SESSION, &mut rng);
+        nonces.push(n);
+        commitments.push(c);
+    }
+    let pre = precommits(&commitments);
+    let (d_nested, e_nested) =
+        aggregate_inner_commitment_pair::<Point>(&SESSION, &pre, &commitments).unwrap();
+    let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
+    let commits_2 = SigningCommitments {
+        index: 2,
+        hiding: d_nested,
+        binding: e_nested,
+    };
+    let package =
+        frost::SigningPackage::<Point>::new(b"m".to_vec(), vec![commits_1, commits_2]).unwrap();
+    let request = NestedSigningRequest {
+        package: &package,
+        nested_index: 2,
+        session_id: SESSION,
+        inner_precommits: &pre,
+        inner_commitments: &commitments,
+        active_indices: &w.quorum,
+        inner_threshold: 3,
+    };
+
+    let mut store = MemorySpentSessions::new();
+    assert!(!store.is_spent(&SESSION, 1));
+
+    inner_sign_v2_spending::<Point, _>(
+        &mut store,
+        nonces.remove(0),
+        &w.inner_shares[0],
+        &w.group_pubkey,
+        b"m",
+        &request,
+    )
+    .expect("the first share is produced normally");
+    assert!(store.is_spent(&SESSION, 1));
+
+    // the restore: the node comes back from a snapshot taken before it
+    // signed, re-runs round 1 for the same session, and tries again. Every
+    // in-process guard is satisfied — `InnerNonces` is deliberately not
+    // `Clone`, and these are genuinely fresh nonces — so only the durable
+    // store can tell that this holder already answered this session.
+    let (restored, restored_c) = inner_commit::<Point, _>(1, SESSION, &mut rng);
+    let mut restored_commitments = commitments.clone();
+    restored_commitments[0] = restored_c;
+    let restored_pre = precommits(&restored_commitments);
+    let (rd, re) = aggregate_inner_commitment_pair::<Point>(
+        &SESSION,
+        &restored_pre,
+        &restored_commitments,
+    )
+    .unwrap();
+    let (_, rc1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
+    let restored_package = frost::SigningPackage::<Point>::new(
+        b"m".to_vec(),
+        vec![
+            rc1,
+            SigningCommitments {
+                index: 2,
+                hiding: rd,
+                binding: re,
+            },
+        ],
+    )
+    .unwrap();
+    let restored_request = NestedSigningRequest {
+        package: &restored_package,
+        nested_index: 2,
+        session_id: SESSION,
+        inner_precommits: &restored_pre,
+        inner_commitments: &restored_commitments,
+        active_indices: &w.quorum,
+        inner_threshold: 3,
+    };
+    assert_eq!(
+        inner_sign_v2_spending::<Point, _>(
+            &mut store,
+            restored,
+            &w.inner_shares[0],
+            &w.group_pubkey,
+            b"m",
+            &restored_request,
+        )
+        .unwrap_err(),
+        OsstError::SessionSpent,
+        "a restored node must not answer the same session twice"
+    );
+
+    // another holder in the same session is unaffected: the pair is
+    // (session, holder), not the session alone
+    assert!(!store.is_spent(&SESSION, 2));
+    inner_sign_v2_spending::<Point, _>(
+        &mut store,
+        nonces.remove(0),
+        &w.inner_shares[1],
+        &w.group_pubkey,
+        b"m",
+        &request,
+    )
+    .expect("holder 2 has not signed this session");
+    assert_eq!(store.len(), 2);
+}

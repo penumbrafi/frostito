@@ -1626,11 +1626,22 @@ impl<S: OsstScalar> InnerSigningParamsV2<S> {
 ///
 /// Note `nonces` is taken BY VALUE: the nonce pair is consumed and zeroized on
 /// drop, so a holder cannot produce two shares from one commitment round
-/// without deliberately cloning. Callers that persist state across restarts
-/// MUST additionally record `(session_id, holder_index)` as spent — the type
-/// system cannot see a process boundary. See
-/// [`SpentSessions`](crate::nested::SpentSessions) and
-/// [`inner_sign_v2_spending`].
+/// without deliberately cloning.
+///
+/// # This function is not a replay guard (M-13)
+///
+/// `session_id` is a mixing guard: it stops two concurrent rounds being
+/// spliced together, and it enters neither the binding factor nor the
+/// challenge. Within one process, consuming the nonces by value plus the
+/// commitment check above is sound. Across a process boundary it is nothing —
+/// a snapshot-restore replays the nonces under a fresh challenge and two
+/// responses under one nonce give up the share by elementary algebra.
+///
+/// Any caller whose state can survive or roll back a restart — which is every
+/// daemon — MUST record `(session_id, holder_index)` as spent, durably, before
+/// the share leaves the process. [`inner_sign_v2_spending`] does that ordering
+/// for you against a [`SpentSessions`] store; the full contract is on that
+/// trait.
 ///
 /// # `local_group_pubkey` (M-4)
 ///
@@ -1744,6 +1755,160 @@ pub fn inner_sign_v2<P: OsstPoint>(
         holder_index: nonces.holder_index,
         response,
     })
+}
+
+
+// ============================================================================
+// The session-id contract, and spent-session tracking (M-13)
+// ============================================================================
+
+/// A record of which `(session_id, holder_index)` pairs have already produced
+/// a signature share.
+///
+/// # What `session_id` is, precisely
+///
+/// This is worth stating exactly, because the 0.4.0 CHANGELOG's N-2 entry can
+/// be read as more than it is.
+///
+/// `session_id` is a **mixing guard, not a replay guard.** It threads through
+/// [`InnerNonces`], [`InnerCommitments`] and [`inner_precommit`], and it is
+/// checked for equality in [`inner_sign_v2`],
+/// [`aggregate_inner_commitment_pair`] and [`verify_nested_commitment`]. What
+/// it buys is that two concurrent inner rounds cannot be spliced into each
+/// other: a commitment from round A cannot be presented as part of round B,
+/// and nonces from A cannot sign in B.
+///
+/// It enters **neither** hash that matters. `compute_binding_factor` and
+/// `compute_challenge` never see it, so two sessions over the same message and
+/// the same outer commitment list produce the same ρ and the same `c`. It is
+/// not in the signature, it is not in the transcript a verifier checks, and
+/// nothing about it is enforced across a process boundary.
+///
+/// # What actually prevents nonce reuse, and where it stops
+///
+/// Two things, both in-process:
+///
+/// 1. [`inner_sign_v2`] takes `nonces` **by value**, so the pair is consumed
+///    and zeroized on drop; producing two shares from one commitment round
+///    requires deliberately cloning.
+/// 2. It checks that the published commitment matches the nonces being
+///    consumed, so a second share would have to be for a round that published
+///    the same commitment.
+///
+/// Within one process that is sound. Across a restart it is nothing: a VM
+/// snapshot-restore, a container restarted from an image, or any rollback of
+/// the node's state brings the nonces back and lets them sign a second time
+/// under a fresh challenge. Two responses under one nonce give
+/// `σ = (z₁ − z₂)/(w₁ − w₂)` — the share falls out by elementary algebra. For
+/// a daemon holding long-lived escrow authority this is the failure mode most
+/// likely to actually happen, because snapshots are operational routine rather
+/// than an attack.
+///
+/// The type system cannot see a process boundary. This trait is where a caller
+/// puts the thing that can.
+///
+/// # Implementing this
+///
+/// The implementation must be **durable and write-ahead**: the record has to
+/// be on stable storage, `fsync`'d, *before* the share leaves the process.
+/// [`inner_sign_v2_spending`] calls [`spend`](Self::spend) before it computes
+/// anything, so an implementation that writes synchronously gets the ordering
+/// for free. An implementation that buffers, or that records after the fact,
+/// provides nothing: the crash window is exactly the window that matters.
+///
+/// [`MemorySpentSessions`] is for tests. It is not durable, and its
+/// documentation says so; a deployment that uses it has not implemented this.
+pub trait SpentSessions {
+    /// Mark `(session_id, holder_index)` spent, or refuse if it already is.
+    ///
+    /// Must be atomic with respect to crashes: either the pair is durably
+    /// recorded when this returns `Ok`, or it returns `Err`.
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::SessionSpent`] if the pair has already produced a share.
+    /// An implementation backed by storage may return any other
+    /// [`OsstError`] for a write failure — a failure to record MUST be
+    /// reported, never swallowed, since the caller will otherwise sign.
+    fn spend(&mut self, session_id: &[u8; 32], holder_index: u32) -> Result<(), OsstError>;
+
+    /// Whether the pair has already been spent. Advisory: a caller must still
+    /// go through [`spend`](Self::spend), which is the atomic operation.
+    fn is_spent(&self, session_id: &[u8; 32], holder_index: u32) -> bool;
+}
+
+/// An in-memory [`SpentSessions`], for tests.
+///
+/// **Not durable.** It is exactly the thing M-13 is about — state that does
+/// not survive the process — and it exists so the tests and examples can
+/// exercise the spending path. Do not deploy it.
+#[derive(Clone, Debug, Default)]
+pub struct MemorySpentSessions {
+    spent: alloc::collections::BTreeSet<([u8; 32], u32)>,
+}
+
+impl MemorySpentSessions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many pairs have been recorded.
+    pub fn len(&self) -> usize {
+        self.spent.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spent.is_empty()
+    }
+}
+
+impl SpentSessions for MemorySpentSessions {
+    fn spend(&mut self, session_id: &[u8; 32], holder_index: u32) -> Result<(), OsstError> {
+        if !self.spent.insert((*session_id, holder_index)) {
+            return Err(OsstError::SessionSpent);
+        }
+        Ok(())
+    }
+
+    fn is_spent(&self, session_id: &[u8; 32], holder_index: u32) -> bool {
+        self.spent.contains(&(*session_id, holder_index))
+    }
+}
+
+/// [`inner_sign_v2`], with `(session_id, holder_index)` recorded as spent
+/// before the share is computed (M-13).
+///
+/// This is the form a daemon should use. The write happens first, so a crash
+/// between the record and the share leaves the session burnt rather than
+/// replayable — the safe direction. A caller that records afterwards has
+/// implemented nothing: the crash window is the whole point.
+///
+/// The `session_id` a holder spends is the one in its own nonces, not the one
+/// in the request, so a coordinator cannot get a share recorded against a
+/// session the holder is not in.
+///
+/// # Errors
+///
+/// [`OsstError::SessionSpent`] if this holder has already signed this session,
+/// whatever the store says happened before the process started; anything
+/// [`SpentSessions::spend`] returns for a write failure; and every error of
+/// [`inner_sign_v2`].
+pub fn inner_sign_v2_spending<P: OsstPoint, S: SpentSessions + ?Sized>(
+    store: &mut S,
+    nonces: InnerNonces<P::Scalar>,
+    share: &SecretShare<P::Scalar>,
+    local_group_pubkey: &P,
+    approved_message: &[u8],
+    request: &NestedSigningRequest<'_, P>,
+) -> Result<InnerSignatureShare<P::Scalar>, OsstError> {
+    store.spend(&nonces.session_id, nonces.holder_index)?;
+    inner_sign_v2::<P>(
+        nonces,
+        share,
+        local_group_pubkey,
+        approved_message,
+        request,
+    )
 }
 
 /// [`inner_sign_v2`] with the approved message given as an epoch-bound
