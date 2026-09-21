@@ -13,8 +13,9 @@ use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use osst::curve::{OsstPoint, OsstScalar};
 use osst::frost::{self, SigningCommitments};
 use osst::nested::{
-    aggregate_inner_commitment_pair, aggregate_inner_shares_verified, inner_commit, inner_sign_v2,
-    InnerSigningParamsV2, NestedSigningRequest,
+    aggregate_inner_commitment_pair, aggregate_inner_shares_verified, inner_commit,
+    inner_precommit, inner_sign_v2, InnerCommitments, InnerSigningParamsV2,
+    NestedSigningRequest,
 };
 use osst::{compute_lagrange_coefficients, OsstError, SecretShare};
 use rand::rngs::OsRng;
@@ -72,6 +73,13 @@ fn world(rng: &mut OsRng) -> World {
     }
 }
 
+/// Round 0: every holder's hash commitment to its round-1 reveal (M-20).
+fn precommits(cs: &[InnerCommitments<Point>]) -> Vec<(u32, [u8; 32])> {
+    cs.iter()
+        .map(|c| (c.holder_index, inner_precommit::<Point>(c)))
+        .collect()
+}
+
 fn public_shares(shares: &[SecretShare<Scalar>]) -> Vec<(u32, Point)> {
     shares
         .iter()
@@ -109,7 +117,7 @@ fn coordinator_cannot_swap_the_message_under_the_inner_group() {
         commitments.push(c);
     }
     let (d_nested, e_nested) =
-        aggregate_inner_commitment_pair::<Point>(&SESSION, &commitments).unwrap();
+        aggregate_inner_commitment_pair::<Point>(&SESSION, &precommits(&commitments), &commitments).unwrap();
 
     // The coordinator is the other outer signer. It builds an outer package
     // over UNAPPROVED, using the jury's real commitment pair.
@@ -123,10 +131,12 @@ fn coordinator_cannot_swap_the_message_under_the_inner_group() {
         frost::SigningPackage::<Point>::new(UNAPPROVED.to_vec(), vec![commits_1, commits_2])
             .unwrap();
 
+    let pre = precommits(&commitments);
     let request = NestedSigningRequest {
         package: &evil_package,
         nested_index: 2,
         session_id: SESSION,
+        inner_precommits: &pre,
         inner_commitments: &commitments,
         active_indices: &w.quorum,
         inner_threshold: 3,
@@ -162,7 +172,7 @@ fn the_approved_message_still_signs() {
         commitments.push(c);
     }
     let (d_nested, e_nested) =
-        aggregate_inner_commitment_pair::<Point>(&SESSION, &commitments).unwrap();
+        aggregate_inner_commitment_pair::<Point>(&SESSION, &precommits(&commitments), &commitments).unwrap();
 
     let (nonces_1, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
     let commits_2 = SigningCommitments {
@@ -172,10 +182,12 @@ fn the_approved_message_still_signs() {
     };
     let package =
         frost::SigningPackage::<Point>::new(APPROVED.to_vec(), vec![commits_1, commits_2]).unwrap();
+    let pre = precommits(&commitments);
     let request = NestedSigningRequest {
         package: &package,
         nested_index: 2,
         session_id: SESSION,
+        inner_precommits: &pre,
         inner_commitments: &commitments,
         active_indices: &w.quorum,
         inner_threshold: 3,
@@ -231,7 +243,7 @@ fn substituted_nested_commitment_is_rejected_by_the_holder() {
         commitments.push(c);
     }
     let (d_nested, e_nested) =
-        aggregate_inner_commitment_pair::<Point>(&SESSION, &commitments).unwrap();
+        aggregate_inner_commitment_pair::<Point>(&SESSION, &precommits(&commitments), &commitments).unwrap();
 
     // The coordinator publishes a DIFFERENT pair for position 2.
     let (_, foreign) = frost::commit::<Point, _>(2, &mut rng).unwrap();
@@ -242,10 +254,12 @@ fn substituted_nested_commitment_is_rejected_by_the_holder() {
     let package =
         frost::SigningPackage::<Point>::new(msg.to_vec(), vec![commits_1, foreign]).unwrap();
 
+    let pre = precommits(&commitments);
     let request = NestedSigningRequest {
         package: &package,
         nested_index: 2,
         session_id: SESSION,
+        inner_precommits: &pre,
         inner_commitments: &commitments,
         active_indices: &w.quorum,
         inner_threshold: 3,
@@ -284,7 +298,7 @@ fn nonces_from_another_session_are_rejected() {
         let (_, c) = inner_commit::<Point, _>(k, OTHER, &mut rng);
         commits_b.push(c);
     }
-    let (d_b, e_b) = aggregate_inner_commitment_pair::<Point>(&OTHER, &commits_b).unwrap();
+    let (d_b, e_b) = aggregate_inner_commitment_pair::<Point>(&OTHER, &precommits(&commits_b), &commits_b).unwrap();
 
     let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
     let package = frost::SigningPackage::<Point>::new(
@@ -300,10 +314,12 @@ fn nonces_from_another_session_are_rejected() {
     )
     .unwrap();
 
+    let pre = precommits(&commits_b);
     let request = NestedSigningRequest {
         package: &package,
         nested_index: 2,
         session_id: OTHER,
+        inner_precommits: &pre,
         inner_commitments: &commits_b,
         active_indices: &w.quorum,
         inner_threshold: 3,
@@ -320,7 +336,7 @@ fn nonces_from_another_session_are_rejected() {
     let mut mixed = commits_b.clone();
     mixed[0] = commits_a[0].clone();
     assert_eq!(
-        aggregate_inner_commitment_pair::<Point>(&OTHER, &mixed).unwrap_err(),
+        aggregate_inner_commitment_pair::<Point>(&OTHER, &precommits(&mixed), &mixed).unwrap_err(),
         OsstError::SessionMismatch
     );
 }
@@ -345,7 +361,7 @@ fn incomplete_quorum_is_rejected() {
         commitments.push(c);
     }
     let (d_nested, e_nested) =
-        aggregate_inner_commitment_pair::<Point>(&SESSION, &commitments).unwrap();
+        aggregate_inner_commitment_pair::<Point>(&SESSION, &precommits(&commitments), &commitments).unwrap();
 
     let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
     let package = frost::SigningPackage::<Point>::new(
@@ -360,10 +376,12 @@ fn incomplete_quorum_is_rejected() {
         ],
     )
     .unwrap();
+    let pre = precommits(&commitments);
     let request = NestedSigningRequest {
         package: &package,
         nested_index: 2,
         session_id: SESSION,
+        inner_precommits: &pre,
         inner_commitments: &commitments,
         active_indices: &w.quorum,
         inner_threshold: 3,
@@ -442,7 +460,7 @@ fn v2_response_equals_the_flat_frost_response() {
         commitments.push(c);
     }
     let (d_nested, e_nested) =
-        aggregate_inner_commitment_pair::<Point>(&SESSION, &commitments).unwrap();
+        aggregate_inner_commitment_pair::<Point>(&SESSION, &precommits(&commitments), &commitments).unwrap();
 
     let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
     let commits_2 = SigningCommitments {
@@ -453,10 +471,12 @@ fn v2_response_equals_the_flat_frost_response() {
     let package =
         frost::SigningPackage::<Point>::new(b"m".to_vec(), vec![commits_1, commits_2]).unwrap();
     let params = InnerSigningParamsV2::from_outer::<Point>(&package, &group_pubkey, 2).unwrap();
+    let pre = precommits(&commitments);
     let request = NestedSigningRequest {
         package: &package,
         nested_index: 2,
         session_id: SESSION,
+        inner_precommits: &pre,
         inner_commitments: &commitments,
         active_indices: &quorum,
         inner_threshold: 3,
@@ -589,7 +609,7 @@ fn a_malformed_quorum_is_rejected_by_the_signer() {
             commitments.push(c);
         }
         let (d_nested, e_nested) =
-            aggregate_inner_commitment_pair::<Point>(&SESSION, &commitments).unwrap();
+            aggregate_inner_commitment_pair::<Point>(&SESSION, &precommits(&commitments), &commitments).unwrap();
         let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
         let commits_2 = SigningCommitments {
             index: 2,
@@ -599,10 +619,12 @@ fn a_malformed_quorum_is_rejected_by_the_signer() {
         let package =
             frost::SigningPackage::<Point>::new(b"m".to_vec(), vec![commits_1, commits_2]).unwrap();
 
+        let pre = precommits(&commitments);
         let request = NestedSigningRequest {
             package: &package,
             nested_index: 2,
             session_id: SESSION,
+            inner_precommits: &pre,
             inner_commitments: &commitments,
             active_indices: active,
             inner_threshold: t,
@@ -618,4 +640,50 @@ fn a_malformed_quorum_is_rejected_by_the_signer() {
         .unwrap_err();
         assert_eq!(err, expected, "quorum {:?} must be rejected", active);
     }
+}
+
+/// M-20 — the commit–reveal round is no longer caller convention.
+///
+/// `inner_precommit`/`verify_inner_precommit` existed and nothing called them;
+/// the requirement was a doc comment on `aggregate_inner_commitment_pair`. A
+/// holder revealing last could therefore choose `D_k` with every other
+/// commitment in hand, and nobody would notice a caller that skipped the
+/// check — narsild's accumulator is exactly such a caller.
+///
+/// The precommitments are now an argument, and every reveal must match one.
+#[test]
+fn a_reveal_without_a_matching_precommit_is_rejected() {
+    let mut rng = OsRng;
+    let mut commitments = Vec::new();
+    for k in 1..=3u32 {
+        let (_, c) = inner_commit::<Point, _>(k, SESSION, &mut rng);
+        commitments.push(c);
+    }
+    let good = precommits(&commitments);
+
+    // honest round 0 + round 1 aggregates
+    aggregate_inner_commitment_pair::<Point>(&SESSION, &good, &commitments).unwrap();
+
+    // holder 2 precommitted to a different pair and revealed this one
+    let (_, other) = inner_commit::<Point, _>(2, SESSION, &mut rng);
+    let mut swapped = good.clone();
+    swapped[1] = (2, osst::nested::inner_precommit::<Point>(&other));
+    assert_eq!(
+        aggregate_inner_commitment_pair::<Point>(&SESSION, &swapped, &commitments).unwrap_err(),
+        OsstError::PrecommitMismatch(2),
+        "a reveal that does not match its precommitment names the holder"
+    );
+
+    // holder 3 never precommitted at all
+    let missing: Vec<(u32, [u8; 32])> = good.iter().copied().filter(|(k, _)| *k != 3).collect();
+    assert_eq!(
+        aggregate_inner_commitment_pair::<Point>(&SESSION, &missing, &commitments).unwrap_err(),
+        OsstError::PrecommitMismatch(3)
+    );
+
+    // extra precommitments for holders that did not reveal are fine: a holder
+    // may precommit and then fail to appear
+    let mut extra = good.clone();
+    extra.push((9, [0u8; 32]));
+    aggregate_inner_commitment_pair::<Point>(&SESSION, &extra, &commitments).unwrap();
 }

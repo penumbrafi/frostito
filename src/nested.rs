@@ -608,7 +608,14 @@ mod tests {
             .iter()
             .fold(<Scalar as OsstScalar>::zero(), |acc, n| acc.add(&n.binding));
 
-        let (d_nested, e_nested) = aggregate_inner_commitment_pair::<Point>(&SESSION, &inner_commitments).unwrap();
+        // round 0: the commit-reveal precommitments the aggregate now verifies
+        let inner_precommits: Vec<(u32, [u8; 32])> = inner_commitments
+            .iter()
+            .map(|c| (c.holder_index, inner_precommit::<Point>(c)))
+            .collect();
+        let (d_nested, e_nested) =
+            aggregate_inner_commitment_pair::<Point>(&SESSION, &inner_precommits, &inner_commitments)
+                .unwrap();
         assert_eq!(d_nested, <Point as OsstPoint>::generator().mul_scalar(&d_sum));
         assert_eq!(e_nested, <Point as OsstPoint>::generator().mul_scalar(&e_sum));
 
@@ -658,6 +665,7 @@ mod tests {
             package: &package,
             nested_index: 2,
             session_id: SESSION,
+            inner_precommits: &inner_precommits,
             inner_commitments: &inner_commitments,
             active_indices: &quorum,
             inner_threshold: 3,
@@ -756,7 +764,14 @@ mod tests {
             inner_nonces.push(n);
             inner_commitments.push(c);
         }
-        let (d_nested, e_nested) = aggregate_inner_commitment_pair::<Point>(&SESSION, &inner_commitments).unwrap();
+        // round 0: the commit-reveal precommitments the aggregate now verifies
+        let inner_precommits: Vec<(u32, [u8; 32])> = inner_commitments
+            .iter()
+            .map(|c| (c.holder_index, inner_precommit::<Point>(c)))
+            .collect();
+        let (d_nested, e_nested) =
+            aggregate_inner_commitment_pair::<Point>(&SESSION, &inner_precommits, &inner_commitments)
+                .unwrap();
         let group_pubkey = <Point as OsstPoint>::generator().mul_scalar(&sigma_2);
 
         let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).expect("index is 1-indexed by construction");
@@ -777,6 +792,7 @@ mod tests {
             package: &package,
             nested_index: 2,
             session_id: SESSION,
+            inner_precommits: &inner_precommits,
             inner_commitments: &inner_commitments,
             active_indices: &quorum,
             inner_threshold: 3,
@@ -1302,16 +1318,38 @@ pub fn verify_inner_precommit<P: OsstPoint>(
 /// as `hiding` and `binding` respectively — the nested position then looks
 /// exactly like any other signer and receives a real outer binding factor.
 ///
-/// Callers MUST have verified every precommitment (see
-/// [`verify_inner_precommit`]) before calling this.
+/// # The commit–reveal round is enforced here (M-20)
+///
+/// Through 0.4.x the requirement was a doc comment — "callers MUST have
+/// verified every precommitment" — and nothing called
+/// [`verify_inner_precommit`], including `inner_sign_v2`. "Not load-bearing"
+/// and "unenforced" together mean nobody notices when a caller skips it, and
+/// the callers this crate has do skip it.
+///
+/// So the precommitments are now an argument, and every revealed commitment
+/// must have one that matches. `precommits` is a list of
+/// `(holder_index, precommit)` as produced by [`inner_precommit`]; extra
+/// entries for holders that did not reveal are fine — a holder can precommit
+/// and then fail to appear — but a reveal with no matching precommit, or one
+/// that does not match, is a rejection naming the holder.
+///
+/// On why the round exists at all: the prior audit's A-1 is right that it is
+/// belt-and-braces rather than load-bearing, because the outer ρ covers the
+/// full outer commitment list including the nested aggregate, so a holder
+/// revealing last cannot hold an honest effective nonce fixed. The reason to
+/// enforce it anyway is that the argument depends on the outer protocol
+/// behaving, and this check does not.
 ///
 /// # Errors
 ///
 /// - [`OsstError::EmptyContributions`] if the list is empty.
 /// - [`OsstError::DuplicateIndex`] if a holder appears twice.
 /// - [`OsstError::SessionMismatch`] if any commitment belongs to another round.
+/// - [`OsstError::PrecommitMismatch`] naming a holder whose reveal has no
+///   matching round-0 precommitment.
 pub fn aggregate_inner_commitment_pair<P: OsstPoint>(
     session_id: &[u8; 32],
+    precommits: &[(u32, [u8; 32])],
     inner_commitments: &[InnerCommitments<P>],
 ) -> Result<(P, P), OsstError> {
     if inner_commitments.is_empty() {
@@ -1331,6 +1369,17 @@ pub fn aggregate_inner_commitment_pair<P: OsstPoint>(
             return Err(OsstError::DuplicateIndex(c.holder_index));
         }
         seen.push(c.holder_index);
+
+        // (M-20) the reveal must be the one this holder committed to in round 0
+        let pre = precommits
+            .iter()
+            .find(|(k, _)| *k == c.holder_index)
+            .map(|(_, p)| p)
+            .ok_or(OsstError::PrecommitMismatch(c.holder_index))?;
+        if !verify_inner_precommit::<P>(pre, c) {
+            return Err(OsstError::PrecommitMismatch(c.holder_index));
+        }
+
         d = d.add(&c.hiding);
         e = e.add(&c.binding);
     }
@@ -1354,12 +1403,13 @@ pub fn verify_nested_commitment<P: OsstPoint>(
     package: &crate::frost::SigningPackage<P>,
     nested_index: u32,
     session_id: &[u8; 32],
+    precommits: &[(u32, [u8; 32])],
     inner_commitments: &[InnerCommitments<P>],
 ) -> Result<(), OsstError> {
     let entry = package
         .get_commitments(nested_index)
         .ok_or(OsstError::InvalidIndex)?;
-    let (d, e) = aggregate_inner_commitment_pair::<P>(session_id, inner_commitments)?;
+    let (d, e) = aggregate_inner_commitment_pair::<P>(session_id, precommits, inner_commitments)?;
     if entry.hiding != d || entry.binding != e {
         return Err(OsstError::UnexpectedCommitment);
     }
@@ -1413,7 +1463,13 @@ pub struct NestedSigningRequest<'a, P: OsstPoint> {
     pub nested_index: u32,
     /// The inner round's id, as agreed before round 1.
     pub session_id: [u8; 32],
-    /// The revealed inner commitment set from round 1, precommitments checked.
+    /// The round-0 precommitments, as `(holder_index, precommit)`.
+    ///
+    /// Verified against `inner_commitments` by [`inner_sign_v2`] (M-20) — the
+    /// commit–reveal round is no longer a caller convention. These come from
+    /// the inner group's own round 0, not from the coordinator.
+    pub inner_precommits: &'a [(u32, [u8; 32])],
+    /// The revealed inner commitment set from round 1.
     pub inner_commitments: &'a [InnerCommitments<P>],
     /// The inner quorum actually signing.
     ///
@@ -1661,6 +1717,7 @@ pub fn inner_sign_v2<P: OsstPoint>(
         request.package,
         request.nested_index,
         &request.session_id,
+        request.inner_precommits,
         request.inner_commitments,
     )?;
 

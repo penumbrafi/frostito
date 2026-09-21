@@ -377,6 +377,45 @@ pub fn open_subshare<P: OsstPoint>(
     Ok(subshare)
 }
 
+/// [`open_subshare`], with the dealer's commitment taken from the agreed
+/// round-1 set instead of from the caller (M-5).
+///
+/// `open_subshare` asks the caller for the commitment to check against, and
+/// the caller's obvious source is whatever arrived alongside the sub-share —
+/// which is exactly what a malicious dealer controls. A confirmed
+/// [`AgreedRound1`] is the set every participant echoed and agreed on, so
+/// looking the commitment up in it closes the equivocation gap D-2 left open:
+/// a dealer that sent Alice `C_A` and Bob `C_B` cannot have both in the agreed
+/// set, and the echo round refuses to start round 2 at all when they disagree.
+///
+/// This is the round-2 entry point a caller with a reliable broadcast should
+/// use. `open_subshare` remains for callers that manage the commitment set
+/// themselves.
+///
+/// # Errors
+///
+/// [`OsstError::UnexpectedDealer`] if the agreed set has no commitment for the
+/// package's dealer — it was disqualified, or it never entered the ceremony —
+/// plus every error of [`open_subshare`].
+pub fn open_subshare_agreed<P: OsstPoint>(
+    recipient_x25519_secret: &[u8; 32],
+    recipient_index: u32,
+    roster: &SealedRoster,
+    round: u8,
+    sealed: &SealedSubShare,
+    agreed: &crate::dkg::AgreedRound1<P>,
+) -> Result<SubShare<P::Scalar>, OsstError> {
+    let commitment = agreed.commitment(sealed.dealer_index)?;
+    open_subshare::<P>(
+        recipient_x25519_secret,
+        recipient_index,
+        roster,
+        round,
+        sealed,
+        commitment,
+    )
+}
+
 /// Build a dealer's whole round-2 message set: one sealed package per roster
 /// participant, the dealer included.
 ///
@@ -494,6 +533,102 @@ mod tests {
         assert_eq!(opened.value(), subshare.value());
         assert_eq!(opened.dealer_index, 1);
         assert_eq!(opened.player_index, 2);
+    }
+
+    /// M-5: `open_subshare` takes the commitment from the caller, whose
+    /// obvious source is whatever arrived alongside the sub-share — exactly
+    /// what a malicious dealer controls. Both halves of an equivocation open
+    /// and verify cleanly through that path; `open_subshare_agreed`, which
+    /// looks the commitment up in the echoed round-1 set, accepts only the one
+    /// the group agreed on.
+    #[test]
+    fn the_agreed_set_decides_which_commitment_a_subshare_is_checked_against() {
+        use crate::dkg::DkgState;
+
+        let mut rng = OsRng;
+        let r = roster(SESSION);
+        let (t, n, epoch) = (2u32, 3u32, 4u64);
+
+        // dealer 1 equivocates: polynomial A toward recipient 2, B toward 3
+        let evil_a: Dealer<Point> = Dealer::new(1, t, &mut rng).unwrap();
+        let evil_b: Dealer<Point> = Dealer::new(1, t, &mut rng).unwrap();
+        let honest: Vec<Dealer<Point>> = (2..=n)
+            .map(|i| Dealer::new(i, t, &mut rng).unwrap())
+            .collect();
+
+        let sub_a = evil_a.generate_subshare(2).unwrap();
+        let sealed_a = seal_subshare::<Point>(
+            &x25519_secret_from_seed(&SEED_1),
+            &r,
+            ROUND,
+            &sub_a,
+            evil_a.commitment(),
+        )
+        .unwrap();
+
+        // the D-2 pairing holds for the equivocated half: it opens, its digest
+        // matches, and its Feldman check passes. Nothing here is wrong.
+        open_subshare::<Point>(
+            &x25519_secret_from_seed(&SEED_2),
+            2,
+            &r,
+            ROUND,
+            &sealed_a,
+            evil_a.commitment(),
+        )
+        .expect("each pair is internally consistent — that is the finding");
+
+        // recipient 2's agreed round-1 set contains dealer 1's OTHER
+        // commitment, because that is what was broadcast and echoed
+        let mut st = DkgState::<Point>::new(epoch, t, n);
+        st.submit_commitment(evil_b.round1_package(epoch, &mut rng))
+            .unwrap();
+        for d in &honest {
+            st.submit_commitment(d.round1_package(epoch, &mut rng))
+                .unwrap();
+        }
+        let agreed = st.agreed_round1().unwrap();
+
+        assert_eq!(
+            open_subshare_agreed::<Point>(
+                &x25519_secret_from_seed(&SEED_2),
+                2,
+                &r,
+                ROUND,
+                &sealed_a,
+                &agreed,
+            )
+            .unwrap_err(),
+            OsstError::InvalidSubShare(1),
+            "a sub-share against a commitment outside the agreed set is refused"
+        );
+
+        // a dealer with no commitment in the agreed set at all is named as such
+        let stranger: Dealer<Point> = Dealer::new(3, t, &mut rng).unwrap();
+        let sub_s = stranger.generate_subshare(2).unwrap();
+        let sealed_s = seal_subshare::<Point>(
+            &x25519_secret_from_seed(&SEED_3),
+            &r,
+            ROUND,
+            &sub_s,
+            stranger.commitment(),
+        )
+        .unwrap();
+        let mut thin = DkgState::<Point>::new(epoch, t, 1);
+        thin.submit_commitment(evil_b.round1_package(epoch, &mut rng))
+            .unwrap();
+        assert_eq!(
+            open_subshare_agreed::<Point>(
+                &x25519_secret_from_seed(&SEED_2),
+                2,
+                &r,
+                ROUND,
+                &sealed_s,
+                &thin.agreed_round1().unwrap(),
+            )
+            .unwrap_err(),
+            OsstError::UnexpectedDealer(3)
+        );
     }
 
     /// Recipient binding: it is the responder's static key, so no other

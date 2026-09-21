@@ -312,6 +312,20 @@ impl<P: OsstPoint> Aggregator<P> {
         Self::new(player_index, &set)
     }
 
+    /// Aggregator whose dealer set is the one the echo round agreed on (M-5).
+    ///
+    /// Prefer this to [`new`](Self::new): the dealer set is the single value
+    /// every player has to agree on — sum one dealer more or fewer than your
+    /// peers and you derive a different group key and an incompatible share —
+    /// and taking it from a confirmed [`AgreedRound1`] is what makes that
+    /// agreement explicit rather than a convention.
+    pub fn from_agreed(
+        player_index: u32,
+        agreed: &AgreedRound1<P>,
+    ) -> Result<Self, OsstError> {
+        Self::new(player_index, &agreed.dealer_set())
+    }
+
     #[inline]
     pub fn player_index(&self) -> u32 {
         self.player_index
@@ -636,6 +650,257 @@ impl<P: OsstPoint> DkgState<P> {
     }
 }
 
+
+// ============================================================================
+// Echo round over the round-1 set (M-5)
+// ============================================================================
+
+/// Domain tag for the round-1 echo digest.
+pub const ECHO_DIGEST_DOMAIN: &[u8] = b"osst/dkg-round1-echo/v1";
+
+/// A participant's view of the whole round-1 commitment set, as one hash.
+///
+/// # What this is for (M-5)
+///
+/// [`crate::sealed`] binds a sub-share to the commitment it is verified
+/// against, as that commitment was *delivered to this recipient* (D-2). That
+/// stops a man-in-the-middle substituting a matched pair. It does not stop the
+/// **dealer**, which is the stronger and more relevant adversary: a malicious
+/// dealer sends `(C_A, f_A(a))` to Alice and `(C_B, f_B(b))` to Bob, each pair
+/// internally consistent, each passing its Feldman check and its digest check.
+/// Alice and Bob derive different group keys and neither can tell.
+///
+/// Nothing in a point-to-point protocol can detect that, because the two
+/// honest parties never compare notes. The standard construction is an echo
+/// round: after round 1 closes, every participant publishes a digest of the
+/// **full** commitment set it saw and refuses to enter round 2 until it holds
+/// `n` matching digests. osst cannot provide the broadcast — that is the
+/// caller's job, and a caller without a reliable one must not run this
+/// protocol — but it can make sure every participant computes the digest the
+/// same way, which is what this type is.
+///
+/// # What is hashed
+///
+/// ```text
+/// SHA-512(
+///     ECHO_DIGEST_DOMAIN ‖ epoch:8 ‖ threshold:4 ‖ num_participants:4 ‖ count:4
+///     ‖ for each dealer, ascending by index:
+///         dealer_index:4 ‖ len(commitment):8 ‖ commitment.to_bytes()
+/// )[..32]
+/// ```
+///
+/// Truncated to 32 bytes, as [`crate::sealed::commitment_digest`] is.
+///
+/// The ceremony parameters are inside the hash, not assumed: without them a
+/// digest from one ceremony matches a digest from another with the same
+/// commitments, and the epoch is precisely what the K-1 proof-of-knowledge
+/// fix uses to stop cross-ceremony replay.
+///
+/// **The proofs of knowledge are not hashed, only the commitments.** That is
+/// deliberate and sufficient: the group key, every verification share and
+/// every Feldman check are functions of the commitments alone, so two
+/// participants that agree on the commitment set agree on everything the
+/// ceremony produces. A proof of knowledge is verified on arrival
+/// ([`DkgState::submit_commitment`]) and a dealer whose proof fails never
+/// enters the set, so a disagreement about a proof is already a disagreement
+/// about the set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EchoDigest(pub [u8; 32]);
+
+impl EchoDigest {
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for EchoDigest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for b in &self.0 {
+            write!(f, "{:02x}", b)?;
+        }
+        Ok(())
+    }
+}
+
+/// A round-1 commitment set that every participant has agreed on.
+///
+/// Obtained from [`DkgState::agreed_round1`] once round 1 is complete, then
+/// confirmed against the peers' [`EchoDigest`]s with [`confirm`](Self::confirm)
+/// or [`confirm_all`](Self::confirm_all) before round 2 begins. It is the
+/// handle the rest of the round-2 API takes, so that "which commitment is
+/// dealer `i`'s" is answered from the agreed set rather than from whatever
+/// arrived alongside a sub-share:
+///
+/// - [`Aggregator::from_agreed`] fixes the dealer set from it;
+/// - [`crate::sealed::open_subshare_agreed`] looks the dealer's commitment up
+///   in it instead of accepting a loose one from the caller.
+///
+/// Holding one of these is not by itself proof of agreement — you must call
+/// `confirm_all` with what the peers echoed. It is a place to put the result.
+#[derive(Clone, Debug)]
+pub struct AgreedRound1<P: OsstPoint> {
+    epoch: u64,
+    threshold: u32,
+    digest: EchoDigest,
+    /// ascending by dealer index
+    commitments: Vec<DealerCommitment<P>>,
+}
+
+impl<P: OsstPoint> AgreedRound1<P> {
+    /// This participant's digest of the set, for broadcast.
+    #[inline]
+    pub fn digest(&self) -> EchoDigest {
+        self.digest
+    }
+
+    #[inline]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    #[inline]
+    pub fn threshold(&self) -> u32 {
+        self.threshold
+    }
+
+    /// The agreed dealer set, ascending.
+    pub fn dealer_set(&self) -> Vec<u32> {
+        self.commitments.iter().map(|c| c.dealer_index).collect()
+    }
+
+    /// The commitments, ascending by dealer index.
+    #[inline]
+    pub fn commitments(&self) -> &[DealerCommitment<P>] {
+        &self.commitments
+    }
+
+    /// Dealer `index`'s commitment, from the agreed set.
+    pub fn commitment(&self, dealer_index: u32) -> Result<&DealerCommitment<P>, OsstError> {
+        self.commitments
+            .iter()
+            .find(|c| c.dealer_index == dealer_index)
+            .ok_or(OsstError::UnexpectedDealer(dealer_index))
+    }
+
+    /// Compare one peer's echoed digest against this one.
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::EchoMismatch`] — a dealer equivocated, or the broadcast
+    /// is not reliable. Either way round 2 must not start. Which of the two it
+    /// is cannot be told apart from inside this crate, and the remedy is the
+    /// same: abort the ceremony.
+    pub fn confirm(&self, peer: &EchoDigest) -> Result<(), OsstError> {
+        // public values; the accumulating compare is habit, not necessity
+        let mut diff = 0u8;
+        for (a, b) in self.digest.0.iter().zip(peer.0.iter()) {
+            diff |= a ^ b;
+        }
+        if diff == 0 {
+            Ok(())
+        } else {
+            Err(OsstError::EchoMismatch)
+        }
+    }
+
+    /// Confirm every peer's echo, and that there are enough of them.
+    ///
+    /// `expected` is how many echoes the caller requires — `n`, for the
+    /// standard construction, counting this participant's own.
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::InsufficientContributions`] if fewer than `expected`
+    /// echoes were supplied; [`OsstError::EchoMismatch`] if any disagrees.
+    pub fn confirm_all(&self, peers: &[EchoDigest], expected: usize) -> Result<(), OsstError> {
+        if peers.len() < expected {
+            return Err(OsstError::InsufficientContributions {
+                got: peers.len(),
+                need: expected,
+            });
+        }
+        for p in peers {
+            self.confirm(p)?;
+        }
+        Ok(())
+    }
+}
+
+impl<P: OsstPoint> DkgState<P> {
+    /// The agreed round-1 set and this participant's echo digest over it.
+    ///
+    /// Broadcast [`AgreedRound1::digest`], collect the peers' digests, and
+    /// call [`AgreedRound1::confirm_all`] before any round-2 message is sent
+    /// or opened (M-5).
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::InsufficientContributions`] unless round 1 is complete —
+    /// echoing a partial set agrees on nothing, because a participant that
+    /// has not yet received dealer `i`'s commitment would echo a different
+    /// digest for an entirely honest reason.
+    pub fn agreed_round1(&self) -> Result<AgreedRound1<P>, OsstError> {
+        if !self.is_complete() {
+            return Err(OsstError::InsufficientContributions {
+                got: self.commitment_count(),
+                need: self.num_participants as usize - self.disqualified.len(),
+            });
+        }
+        let mut commitments: Vec<DealerCommitment<P>> =
+            self.commitments.iter().flatten().cloned().collect();
+        commitments.sort_by_key(|c| c.dealer_index);
+
+        let digest = round1_echo_digest::<P>(
+            self.epoch,
+            self.threshold,
+            self.num_participants,
+            &commitments,
+        );
+
+        Ok(AgreedRound1 {
+            epoch: self.epoch,
+            threshold: self.threshold,
+            digest,
+            commitments,
+        })
+    }
+}
+
+/// The canonical round-1 echo digest, for callers that hold the commitment set
+/// outside a [`DkgState`].
+///
+/// `commitments` is sorted by dealer index here, so the caller's ordering does
+/// not change the result. See [`EchoDigest`] for what goes in and why.
+pub fn round1_echo_digest<P: OsstPoint>(
+    epoch: u64,
+    threshold: u32,
+    num_participants: u32,
+    commitments: &[DealerCommitment<P>],
+) -> EchoDigest {
+    use sha2::{Digest, Sha512};
+
+    let mut sorted: Vec<&DealerCommitment<P>> = commitments.iter().collect();
+    sorted.sort_by_key(|c| c.dealer_index);
+
+    let mut h = Sha512::new();
+    h.update(ECHO_DIGEST_DOMAIN);
+    h.update(epoch.to_le_bytes());
+    h.update(threshold.to_le_bytes());
+    h.update(num_participants.to_le_bytes());
+    h.update((sorted.len() as u32).to_le_bytes());
+    for c in sorted {
+        let bytes = c.to_bytes();
+        h.update(c.dealer_index.to_le_bytes());
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(&bytes);
+    }
+    let full: [u8; 64] = h.finalize().into();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&full[..32]);
+    EchoDigest(out)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -646,6 +911,158 @@ mod tests {
     use crate::{verify, Contribution, SecretShare};
     use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
     use rand::rngs::OsRng;
+
+    // ── M-5: dealer equivocation is caught by the echo round ──────────────
+
+    /// Two honest participants that saw the same round-1 set agree, and the
+    /// digest is order-independent and ceremony-bound.
+    #[test]
+    fn honest_participants_echo_the_same_round1_digest() {
+        let mut rng = OsRng;
+        let (n, t, epoch) = (4u32, 3u32, 77u64);
+        let dealers: Vec<Dealer<RistrettoPoint>> = (1..=n)
+            .map(|i| Dealer::new(i, t, &mut rng).unwrap())
+            .collect();
+        let packages: Vec<_> = dealers
+            .iter()
+            .map(|d| d.round1_package(epoch, &mut rng))
+            .collect();
+
+        // alice receives them in order, bob in reverse
+        let mut alice = DkgState::<RistrettoPoint>::new(epoch, t, n);
+        let mut bob = DkgState::<RistrettoPoint>::new(epoch, t, n);
+        for p in &packages {
+            alice.submit_commitment(p.clone()).unwrap();
+        }
+        for p in packages.iter().rev() {
+            bob.submit_commitment(p.clone()).unwrap();
+        }
+
+        let a = alice.agreed_round1().unwrap();
+        let b = bob.agreed_round1().unwrap();
+        assert_eq!(a.digest(), b.digest(), "delivery order must not matter");
+        a.confirm(&b.digest()).unwrap();
+        a.confirm_all(&[a.digest(), b.digest()], 2).unwrap();
+        assert_eq!(a.dealer_set(), (1..=n).collect::<Vec<_>>());
+
+        // the same commitments under a different epoch are a different set
+        let mut other_epoch = DkgState::<RistrettoPoint>::new(epoch + 1, t, n);
+        for d in &dealers {
+            other_epoch
+                .submit_commitment(d.round1_package(epoch + 1, &mut rng))
+                .unwrap();
+        }
+        assert_ne!(
+            a.digest(),
+            other_epoch.agreed_round1().unwrap().digest(),
+            "the digest must bind the ceremony, not just the commitments"
+        );
+    }
+
+    /// M-5, the finding itself: a dealer that commits to one polynomial toward
+    /// Alice and another toward Bob splits the group, and nothing in the
+    /// point-to-point protocol notices — each pair is internally consistent
+    /// and passes its Feldman check and its D-2 commitment-digest check. The
+    /// echo round is what catches it.
+    #[test]
+    fn an_equivocating_dealer_is_caught_by_the_echo_round() {
+        let mut rng = OsRng;
+        let (n, t, epoch) = (3u32, 2u32, 9u64);
+
+        // dealers 2 and 3 are honest
+        let honest: Vec<Dealer<RistrettoPoint>> = (2..=n)
+            .map(|i| Dealer::new(i, t, &mut rng).unwrap())
+            .collect();
+        let honest_packages: Vec<_> = honest
+            .iter()
+            .map(|d| d.round1_package(epoch, &mut rng))
+            .collect();
+
+        // dealer 1 runs two polynomials and shows a different one to each peer
+        let evil_a: Dealer<RistrettoPoint> = Dealer::new(1, t, &mut rng).unwrap();
+        let evil_b: Dealer<RistrettoPoint> = Dealer::new(1, t, &mut rng).unwrap();
+        let pkg_a = evil_a.round1_package(epoch, &mut rng);
+        let pkg_b = evil_b.round1_package(epoch, &mut rng);
+        assert_ne!(pkg_a.commitment.to_bytes(), pkg_b.commitment.to_bytes());
+
+        // both packages are perfectly valid in isolation: the proof of
+        // knowledge verifies for each, so K-1 does not see this
+        pkg_a.verify(epoch).unwrap();
+        pkg_b.verify(epoch).unwrap();
+
+        let mut alice = DkgState::<RistrettoPoint>::new(epoch, t, n);
+        let mut bob = DkgState::<RistrettoPoint>::new(epoch, t, n);
+        alice.submit_commitment(pkg_a).unwrap();
+        bob.submit_commitment(pkg_b).unwrap();
+        for p in &honest_packages {
+            alice.submit_commitment(p.clone()).unwrap();
+            bob.submit_commitment(p.clone()).unwrap();
+        }
+
+        // each derives a group key, and they are different — this is the split
+        let a = alice.agreed_round1().unwrap();
+        let b = bob.agreed_round1().unwrap();
+        assert_ne!(
+            alice.derive_group_key().unwrap(),
+            bob.derive_group_key().unwrap(),
+            "the equivocation really does split the group key"
+        );
+
+        // and the echo round refuses to enter round 2
+        assert_eq!(a.confirm(&b.digest()), Err(OsstError::EchoMismatch));
+        assert_eq!(b.confirm(&a.digest()), Err(OsstError::EchoMismatch));
+        assert_eq!(
+            a.confirm_all(&[a.digest(), b.digest()], 2),
+            Err(OsstError::EchoMismatch)
+        );
+    }
+
+    /// Echoing a partial set agrees on nothing: a participant that has not yet
+    /// received a commitment would echo a different digest for an entirely
+    /// honest reason, so the digest is refused until round 1 closes.
+    #[test]
+    fn a_partial_round1_set_has_no_echo_digest() {
+        let mut rng = OsRng;
+        let (n, t, epoch) = (3u32, 2u32, 1u64);
+        let mut st = DkgState::<RistrettoPoint>::new(epoch, t, n);
+        let d: Dealer<RistrettoPoint> = Dealer::new(1, t, &mut rng).unwrap();
+        st.submit_commitment(d.round1_package(epoch, &mut rng)).unwrap();
+        assert_eq!(
+            st.agreed_round1().unwrap_err(),
+            OsstError::InsufficientContributions { got: 1, need: 3 }
+        );
+    }
+
+    /// The agreed set is where round 2 looks up a dealer's commitment, so the
+    /// aggregator's dealer set comes from it rather than from a convention.
+    #[test]
+    fn the_agreed_set_drives_the_aggregator_and_the_lookup() {
+        let mut rng = OsRng;
+        let (n, t, epoch) = (3u32, 2u32, 5u64);
+        let dealers: Vec<Dealer<RistrettoPoint>> = (1..=n)
+            .map(|i| Dealer::new(i, t, &mut rng).unwrap())
+            .collect();
+        let mut st = DkgState::<RistrettoPoint>::new(epoch, t, n);
+        for d in &dealers {
+            st.submit_commitment(d.round1_package(epoch, &mut rng)).unwrap();
+        }
+        let agreed = st.agreed_round1().unwrap();
+
+        let mut agg = Aggregator::<RistrettoPoint>::from_agreed(2, &agreed).unwrap();
+        assert_eq!(agg.dealer_set(), &[1, 2, 3]);
+        for d in &dealers {
+            let sub = d.generate_subshare(2).unwrap();
+            let c = agreed.commitment(d.index()).unwrap();
+            assert!(agg.add_subshare(sub, c).unwrap());
+        }
+        assert!(agg.is_complete());
+        assert_eq!(agg.derive_group_key().unwrap(), st.derive_group_key().unwrap());
+
+        assert_eq!(
+            agreed.commitment(9).unwrap_err(),
+            OsstError::UnexpectedDealer(9)
+        );
+    }
 
     #[test]
     fn test_basic_dkg() {
