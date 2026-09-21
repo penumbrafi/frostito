@@ -546,8 +546,28 @@ impl<P: OsstPoint> DkgState<P> {
     ///
     /// The dealer's commitment is dropped, so it contributes nothing to the
     /// group key or to any verification share, and further submissions from it
-    /// are refused. Every participant must apply the same complaints, or they
-    /// derive different keys.
+    /// are refused.
+    ///
+    /// # This is a local mutation, and osst provides no agreement (M-6)
+    ///
+    /// Every participant must apply the same complaints or they derive
+    /// different keys — and nothing in this crate makes that true. The 0.4.0
+    /// doc said the first half and not the second, which reads as if the
+    /// library were handling it.
+    ///
+    /// What osst does provide is [`Complaint`]: signed by the accuser's roster
+    /// identity, bound to `(epoch, session_id, round)`, carrying evidence a
+    /// third party re-runs, with a verdict that distinguishes a real offence
+    /// from a false accusation. What it does not and cannot provide is
+    /// reliable broadcast — so a caller without one must not run this
+    /// protocol, because the two policies left are "believe every packet",
+    /// which lets one unauthenticated message abort the ceremony, and "believe
+    /// none", which makes K-1 undetectable again.
+    ///
+    /// Verify a [`Complaint`] and act only on
+    /// [`ComplaintVerdict::Upheld`]; re-broadcast it; and for
+    /// [`ComplaintEvidence::BadSubShare`], which is not transferable, require
+    /// `t` independent complaints against the same dealer.
     ///
     /// # Errors
     ///
@@ -650,6 +670,364 @@ impl<P: OsstPoint> DkgState<P> {
     }
 }
 
+
+
+// ============================================================================
+// Justified complaints (M-6)
+// ============================================================================
+
+/// Domain tag for the complaint signature message.
+pub const COMPLAINT_SIG_DOMAIN: &[u8] = b"osst/dkg-complaint/v1";
+
+/// What a complaint accuses a dealer of, and the evidence for it.
+///
+/// # How verifiable each kind is
+///
+/// The two kinds are **not** equally strong, and pretending otherwise is how a
+/// complaint mechanism becomes a denial-of-service channel.
+///
+/// - [`ForgedProofOfKnowledge`](Self::ForgedProofOfKnowledge) is fully
+///   self-contained. The round-1 package is public and signed by nothing, so a
+///   third party re-runs [`Round1Package::verify`] and reaches the same
+///   verdict with no trust in the accuser at all. A false accusation of this
+///   kind is detected immediately, because the evidence simply verifies.
+///
+/// - [`BadSubShare`](Self::BadSubShare) is weaker, and the limit is a property
+///   of Noise_K rather than of this API. The accuser reveals the plaintext
+///   sub-share it decrypted; any third party can re-run the Feldman check and
+///   confirm that *this scalar* does not lie on *that commitment*. What nobody
+///   but the recipient can confirm is that the dealer actually sent it: the
+///   Noise_K handshake gives the recipient authentication, not
+///   transferability, so a recipient can fabricate a plaintext that its own
+///   key would have produced. The sealed ciphertext is carried so a verdict is
+///   at least pinned to one delivered package, and so a future extension in
+///   which the accuser also reveals its ephemeral/session key can upgrade this
+///   to a transferable proof — but as it stands, a verifier learns "the
+///   accuser says it received this, and if it did, the dealer is at fault".
+///
+/// Revealing the sub-share costs nothing: a share whose secrecy the complaint
+/// is already forfeiting is not an additional loss, and the dealer is about to
+/// be disqualified.
+#[derive(Clone, Debug)]
+pub enum ComplaintEvidence<P: OsstPoint> {
+    /// The dealer's round-1 package, whose proof of knowledge does not verify.
+    /// Publicly checkable by anyone (K-1).
+    ForgedProofOfKnowledge { package: Round1Package<P> },
+    /// The dealer's commitment, the sub-share the accuser decrypted from the
+    /// sealed package, and a digest of that package. Checkable against the
+    /// commitment by anyone; attributable to the dealer only by the accuser.
+    BadSubShare {
+        commitment: DealerCommitment<P>,
+        revealed: SubShare<P::Scalar>,
+        /// SHA-256 of the sealed ciphertext as delivered, so the verdict names
+        /// one package rather than a claim in the abstract.
+        sealed_digest: [u8; 32],
+    },
+}
+
+impl<P: OsstPoint> ComplaintEvidence<P> {
+    /// The dealer this evidence is about.
+    pub fn accused_index(&self) -> u32 {
+        match self {
+            Self::ForgedProofOfKnowledge { package } => package.dealer_index(),
+            Self::BadSubShare { commitment, .. } => commitment.dealer_index,
+        }
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        fn field(out: &mut Vec<u8>, bytes: &[u8]) {
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        match self {
+            Self::ForgedProofOfKnowledge { package } => {
+                out.push(1);
+                field(out, &package.commitment.to_bytes());
+                field(out, package.proof_of_knowledge.r.compress().as_ref());
+                field(out, &package.proof_of_knowledge.z.to_bytes());
+            }
+            Self::BadSubShare {
+                commitment,
+                revealed,
+                sealed_digest,
+            } => {
+                out.push(2);
+                field(out, &commitment.to_bytes());
+                field(out, &revealed.encode_plaintext());
+                field(out, sealed_digest);
+            }
+        }
+    }
+}
+
+/// What a verifier concluded about a complaint whose signature checked out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComplaintVerdict {
+    /// The evidence holds: the accused dealer really did misbehave, as far as
+    /// this evidence can show (see [`ComplaintEvidence`] for how far that is).
+    /// Disqualify it.
+    Upheld,
+    /// The complaint is authentic — the accuser really signed it — but the
+    /// evidence does not show what it claims: the proof of knowledge verifies,
+    /// or the revealed sub-share is a correct evaluation of the commitment.
+    /// The accuser, not the accused, is the problem.
+    Unfounded,
+}
+
+/// A signed, ceremony-bound, justified complaint against a dealer.
+///
+/// # Why this exists (M-6)
+///
+/// `DkgState::disqualify` is a local mutation whose correctness needs every
+/// participant to apply the same complaints, and through 0.4.x osst provided
+/// nothing to make that true. A complaint was not a value at all, let alone a
+/// verifiable one, so the only two policies available to a caller were
+/// "believe everyone" — one packet aborts the ceremony — and "believe no-one",
+/// which makes K-1 undetectable again. narsild chose the first.
+///
+/// A complaint here is signed by the accuser's **roster identity key** and
+/// bound to `(epoch, session_id, round)`, so it cannot be forged, cannot be
+/// replayed into a later ceremony, and names who to blame if it turns out to
+/// be [`Unfounded`](ComplaintVerdict::Unfounded).
+///
+/// # Why a Schnorr key on the curve, and not the roster's X25519 key
+///
+/// The options were: reuse the X25519 static key from
+/// [`SealedRoster`](crate::sealed::SealedRoster) via an XEdDSA-style
+/// conversion; add an ed25519 identity and a dependency; or sign with a
+/// Schnorr key on the curve the ceremony already uses.
+///
+/// The third is what this does. The accuser's *verification share* is not
+/// available — a complaint is raised during the DKG that produces it — so the
+/// key has to be a long-term identity key either way, and once a new key is
+/// needed, the cheapest sound one is a scalar on `P`: it reuses the curve
+/// backend already compiled in, works in `no_std` with no new dependency, and
+/// the Schnorr verification is the same equation the crate already implements
+/// three times. XEdDSA over the X25519 static key was rejected as the
+/// clamping and sign-bit handling are easy to get subtly wrong and this is not
+/// the place to hand-roll it.
+///
+/// **The roster must therefore bind an identity public key per participant.**
+/// osst does not own the roster — the caller does — so this API verifies
+/// against a public key the caller supplies. What that means for a deployment
+/// is written out in the crate README and repeated here: the identity keys
+/// must be part of the same signed roster/manifest whose hash is the ceremony
+/// id, or an attacker supplies the key as well as the complaint.
+///
+/// # What a caller (narsild) still has to do
+///
+/// osst provides the value, the binding and the verifier. Agreement is not
+/// something a library can provide:
+///
+/// 1. Re-broadcast every complaint on receipt. A complaint delivered to one
+///    node aborts that node while the rest finalize — the split-group outcome
+///    the broadcast exists to prevent.
+/// 2. Verify with [`verify`](Self::verify) against the accuser's roster
+///    identity key before acting, and drop anything that does not check —
+///    including [`Unfounded`](ComplaintVerdict::Unfounded), which should
+///    count against the *accuser*.
+/// 3. Apply the same set of upheld complaints on every node, in the same
+///    ceremony, before deriving a key. [`DkgState::disqualify`] mutates local
+///    state only.
+/// 4. For [`BadSubShare`](ComplaintEvidence::BadSubShare), which is not
+///    transferable (see [`ComplaintEvidence`]), require `t` independent
+///    complaints against the same dealer before disqualifying, rather than
+///    acting on one.
+/// 5. Bound the complaint intake: a complaint is attacker-supplied input, and
+///    there is no `reason: String` here precisely so there is nothing
+///    unbounded to log.
+#[derive(Clone, Debug)]
+pub struct Complaint<P: OsstPoint> {
+    /// The ceremony this complaint belongs to.
+    pub epoch: u64,
+    /// The ceremony's session id — the roster/manifest hash, as used for the
+    /// sealed prologue.
+    pub session_id: [u8; 32],
+    /// Which round the offence was observed in (1 or 2).
+    pub round: u8,
+    /// The complainant's roster index.
+    pub accuser_index: u32,
+    /// The accused dealer's index. Must agree with the evidence.
+    pub accused_index: u32,
+    /// What the dealer is accused of, and the proof.
+    pub evidence: ComplaintEvidence<P>,
+    /// Schnorr signature by the accuser's identity key: `R = k·G`,
+    /// `s = k + e·x`, `e = H(domain ‖ R ‖ Y_accuser ‖ body)`.
+    pub r: P,
+    /// The signature scalar.
+    pub s: P::Scalar,
+}
+
+impl<P: OsstPoint> Complaint<P> {
+    /// The signed body: everything but the signature, length-prefixed
+    /// throughout so the encoding is injective.
+    fn body(
+        epoch: u64,
+        session_id: &[u8; 32],
+        round: u8,
+        accuser_index: u32,
+        accused_index: u32,
+        evidence: &ComplaintEvidence<P>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(COMPLAINT_SIG_DOMAIN.len() as u64).to_le_bytes());
+        out.extend_from_slice(COMPLAINT_SIG_DOMAIN);
+        out.extend_from_slice(&epoch.to_le_bytes());
+        out.extend_from_slice(session_id);
+        out.push(round);
+        out.extend_from_slice(&accuser_index.to_le_bytes());
+        out.extend_from_slice(&accused_index.to_le_bytes());
+        evidence.encode_into(&mut out);
+        out
+    }
+
+    fn challenge(r: &P, accuser_pubkey: &P, body: &[u8]) -> P::Scalar {
+        use sha2::{Digest, Sha512};
+        let mut h = Sha512::new();
+        h.update(COMPLAINT_SIG_DOMAIN);
+        h.update(r.compress());
+        h.update(accuser_pubkey.compress());
+        h.update((body.len() as u64).to_le_bytes());
+        h.update(body);
+        let hash: [u8; 64] = h.finalize().into();
+        P::Scalar::from_bytes_wide(&hash)
+    }
+
+    /// Raise a complaint, signed by the accuser's long-term identity key.
+    ///
+    /// `accused_index` is taken from the evidence, so a complaint cannot name
+    /// one dealer and carry another's package.
+    pub fn sign<R: rand_core::RngCore + rand_core::CryptoRng>(
+        epoch: u64,
+        session_id: [u8; 32],
+        round: u8,
+        accuser_index: u32,
+        evidence: ComplaintEvidence<P>,
+        accuser_identity_secret: &P::Scalar,
+        rng: &mut R,
+    ) -> Result<Self, OsstError> {
+        if accuser_index == 0 {
+            return Err(OsstError::InvalidIndex);
+        }
+        let accused_index = evidence.accused_index();
+        let body = Self::body(
+            epoch,
+            &session_id,
+            round,
+            accuser_index,
+            accused_index,
+            &evidence,
+        );
+        let accuser_pubkey = P::generator().mul_scalar(accuser_identity_secret);
+
+        let k = P::Scalar::random(rng);
+        let r = P::generator().mul_scalar(&k);
+        let e = Self::challenge(&r, &accuser_pubkey, &body);
+        let s = k.add(&e.mul(accuser_identity_secret));
+
+        Ok(Self {
+            epoch,
+            session_id,
+            round,
+            accuser_index,
+            accused_index,
+            evidence,
+            r,
+            s,
+        })
+    }
+
+    /// Verify a complaint that any third party received.
+    ///
+    /// Checks, in order: that it belongs to this ceremony; that the accused
+    /// index agrees with the evidence; that the signature verifies under the
+    /// accuser's identity key; and finally whether the evidence actually shows
+    /// what it claims.
+    ///
+    /// `accuser_identity_pubkey` must come from the ceremony's signed roster.
+    /// Passing a key the complaint itself supplied verifies nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`OsstError::InvalidComplaint`] for the wrong ceremony, an index that
+    /// disagrees with the evidence, or a signature that does not verify. A
+    /// complaint that is authentic but wrong returns
+    /// `Ok(`[`ComplaintVerdict::Unfounded`]`)`, not an error: the distinction
+    /// matters, because one is a forgery and the other is a named participant
+    /// making a false accusation.
+    pub fn verify(
+        &self,
+        epoch: u64,
+        session_id: &[u8; 32],
+        accuser_identity_pubkey: &P,
+    ) -> Result<ComplaintVerdict, OsstError> {
+        if self.epoch != epoch || &self.session_id != session_id {
+            return Err(OsstError::InvalidComplaint);
+        }
+        if self.accuser_index == 0
+            || self.accused_index == 0
+            || self.accused_index != self.evidence.accused_index()
+        {
+            return Err(OsstError::InvalidComplaint);
+        }
+
+        let body = Self::body(
+            self.epoch,
+            &self.session_id,
+            self.round,
+            self.accuser_index,
+            self.accused_index,
+            &self.evidence,
+        );
+        let e = Self::challenge(&self.r, accuser_identity_pubkey, &body);
+        // s·G == R + e·Y
+        if P::generator().mul_scalar(&self.s)
+            != self.r.add(&accuser_identity_pubkey.mul_scalar(&e))
+        {
+            return Err(OsstError::InvalidComplaint);
+        }
+
+        Ok(self.adjudicate())
+    }
+
+    /// Re-run the evidence, without checking the signature.
+    ///
+    /// Exposed because it is the half a verifier can run with no roster at all
+    /// — useful for logging and triage — but a caller must not act on it:
+    /// without [`verify`](Self::verify) there is nothing tying the complaint
+    /// to a participant, and anyone can manufacture one.
+    pub fn adjudicate(&self) -> ComplaintVerdict {
+        match &self.evidence {
+            ComplaintEvidence::ForgedProofOfKnowledge { package } => {
+                if package.dealer_index() != self.accused_index {
+                    return ComplaintVerdict::Unfounded;
+                }
+                // upheld exactly when the proof does NOT verify
+                match package.verify(self.epoch) {
+                    Ok(()) => ComplaintVerdict::Unfounded,
+                    Err(_) => ComplaintVerdict::Upheld,
+                }
+            }
+            ComplaintEvidence::BadSubShare {
+                commitment,
+                revealed,
+                ..
+            } => {
+                if commitment.dealer_index != self.accused_index
+                    || revealed.dealer_index != self.accused_index
+                    || revealed.player_index != self.accuser_index
+                {
+                    return ComplaintVerdict::Unfounded;
+                }
+                if commitment.verify_subshare(revealed.player_index, revealed.value()) {
+                    ComplaintVerdict::Unfounded
+                } else {
+                    ComplaintVerdict::Upheld
+                }
+            }
+        }
+    }
+}
 
 // ============================================================================
 // Echo round over the round-1 set (M-5)
@@ -911,6 +1289,180 @@ mod tests {
     use crate::{verify, Contribution, SecretShare};
     use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
     use rand::rngs::OsRng;
+
+    // ── M-6: justified, ceremony-bound, signed complaints ─────────────────
+
+    const CSESSION: [u8; 32] = [0x5Au8; 32];
+
+    /// A forged proof of knowledge is fully transferable evidence: a third
+    /// party with the roster and nothing else reaches the same verdict.
+    #[test]
+    fn a_forged_proof_of_knowledge_is_publicly_adjudicable() {
+        let mut rng = OsRng;
+        let epoch = 3u64;
+        let honest: Dealer<RistrettoPoint> = Dealer::new(2, 2, &mut rng).unwrap();
+
+        // dealer 2 publishes a commitment with someone else's proof attached
+        let other: Dealer<RistrettoPoint> = Dealer::new(2, 2, &mut rng).unwrap();
+        let mut forged = honest.round1_package(epoch, &mut rng);
+        forged.proof_of_knowledge = other.round1_package(epoch, &mut rng).proof_of_knowledge;
+        assert!(forged.verify(epoch).is_err());
+
+        let accuser_secret = Scalar::random(&mut rng);
+        let accuser_pk: RistrettoPoint =
+            <RistrettoPoint as OsstPoint>::generator().mul_scalar(&accuser_secret);
+
+        let complaint = Complaint::<RistrettoPoint>::sign(
+            epoch,
+            CSESSION,
+            1,
+            1,
+            ComplaintEvidence::ForgedProofOfKnowledge { package: forged },
+            &accuser_secret,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(complaint.accused_index, 2);
+        assert_eq!(
+            complaint.verify(epoch, &CSESSION, &accuser_pk).unwrap(),
+            ComplaintVerdict::Upheld
+        );
+
+        // a complaint against an honest package is authentic but unfounded
+        let unfounded = Complaint::<RistrettoPoint>::sign(
+            epoch,
+            CSESSION,
+            1,
+            1,
+            ComplaintEvidence::ForgedProofOfKnowledge {
+                package: honest.round1_package(epoch, &mut rng),
+            },
+            &accuser_secret,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(
+            unfounded.verify(epoch, &CSESSION, &accuser_pk).unwrap(),
+            ComplaintVerdict::Unfounded,
+            "the accuser, not the accused, is the problem here"
+        );
+    }
+
+    /// A bad sub-share is checkable against the commitment by anyone; the
+    /// complaint is bound to the accuser and to one ceremony.
+    #[test]
+    fn a_bad_subshare_complaint_is_bound_and_signed() {
+        let mut rng = OsRng;
+        let epoch = 11u64;
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(2, 2, &mut rng).unwrap();
+        let commitment = dealer.commitment().clone();
+
+        let accuser_secret = Scalar::random(&mut rng);
+        let accuser_pk: RistrettoPoint =
+            <RistrettoPoint as OsstPoint>::generator().mul_scalar(&accuser_secret);
+
+        // a share that is not f_2(1)
+        let bogus = SubShare::new(2, 1, Scalar::random(&mut rng)).unwrap();
+        let complaint = Complaint::<RistrettoPoint>::sign(
+            epoch,
+            CSESSION,
+            2,
+            1,
+            ComplaintEvidence::BadSubShare {
+                commitment: commitment.clone(),
+                revealed: bogus,
+                sealed_digest: [9u8; 32],
+            },
+            &accuser_secret,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(
+            complaint.verify(epoch, &CSESSION, &accuser_pk).unwrap(),
+            ComplaintVerdict::Upheld
+        );
+
+        // the real share is a correct evaluation: unfounded
+        let good = dealer.generate_subshare(1).unwrap();
+        let honest_claim = Complaint::<RistrettoPoint>::sign(
+            epoch,
+            CSESSION,
+            2,
+            1,
+            ComplaintEvidence::BadSubShare {
+                commitment,
+                revealed: good,
+                sealed_digest: [9u8; 32],
+            },
+            &accuser_secret,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(
+            honest_claim.verify(epoch, &CSESSION, &accuser_pk).unwrap(),
+            ComplaintVerdict::Unfounded
+        );
+
+        // wrong ceremony, wrong session, wrong key: all rejected outright
+        assert_eq!(
+            complaint.verify(epoch + 1, &CSESSION, &accuser_pk),
+            Err(OsstError::InvalidComplaint)
+        );
+        assert_eq!(
+            complaint.verify(epoch, &[0u8; 32], &accuser_pk),
+            Err(OsstError::InvalidComplaint)
+        );
+        let impostor: RistrettoPoint =
+            <RistrettoPoint as OsstPoint>::generator().mul_scalar(&Scalar::random(&mut rng));
+        assert_eq!(
+            complaint.verify(epoch, &CSESSION, &impostor),
+            Err(OsstError::InvalidComplaint)
+        );
+    }
+
+    /// The evidence fixes who is accused: a complaint cannot name one dealer
+    /// and carry another's package, and tampering with the body breaks the
+    /// signature.
+    #[test]
+    fn a_complaint_cannot_be_relabelled() {
+        let mut rng = OsRng;
+        let epoch = 2u64;
+        let dealer: Dealer<RistrettoPoint> = Dealer::new(2, 2, &mut rng).unwrap();
+        let accuser_secret = Scalar::random(&mut rng);
+        let accuser_pk: RistrettoPoint =
+            <RistrettoPoint as OsstPoint>::generator().mul_scalar(&accuser_secret);
+
+        let mut complaint = Complaint::<RistrettoPoint>::sign(
+            epoch,
+            CSESSION,
+            2,
+            1,
+            ComplaintEvidence::BadSubShare {
+                commitment: dealer.commitment().clone(),
+                revealed: SubShare::new(2, 1, Scalar::random(&mut rng)).unwrap(),
+                sealed_digest: [0u8; 32],
+            },
+            &accuser_secret,
+            &mut rng,
+        )
+        .unwrap();
+
+        complaint.accused_index = 3;
+        assert_eq!(
+            complaint.verify(epoch, &CSESSION, &accuser_pk),
+            Err(OsstError::InvalidComplaint),
+            "the named dealer must agree with the evidence"
+        );
+
+        complaint.accused_index = 2;
+        complaint.accuser_index = 9;
+        assert_eq!(
+            complaint.verify(epoch, &CSESSION, &accuser_pk),
+            Err(OsstError::InvalidComplaint),
+            "the accuser is inside the signed body"
+        );
+    }
 
     // ── M-5: dealer equivocation is caught by the echo round ──────────────
 
