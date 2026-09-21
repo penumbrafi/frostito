@@ -78,7 +78,7 @@ pub struct InnerShare<S: OsstScalar> {
     /// inner holder's index (1-indexed)
     pub holder_index: u32,
     /// shamir shares of each outer polynomial coefficient
-    /// alpha[j] = holder's share of coefficient j
+    /// `alpha[j]` = holder's share of coefficient `j`
     pub coefficient_shares: Vec<S>,
 }
 
@@ -1480,7 +1480,7 @@ pub struct NestedSigningRequest<'a, P: OsstPoint> {
     /// material.
     ///
     /// Caller-anchored, and the reason it is here rather than derived: a
-    /// [`SecretShare`](crate::SecretShare) carries an index and a scalar and
+    /// [`SecretShare`] carries an index and a scalar and
     /// nothing else, so `inner_sign_v2` has no way to learn `t_in` from its
     /// arguments. Supply the value the inner DKG or reshare fixed; a holder
     /// that passes a coordinator's number has anchored nothing.

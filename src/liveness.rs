@@ -69,7 +69,7 @@ impl CheckpointAnchor {
 /// Domain tag for the liveness contribution signature.
 pub const LIVENESS_SIG_DOMAIN: &[u8] = b"osst/liveness-sig/v1";
 
-/// Domain tag for the message a [`LivenessContribution`] signature covers.
+/// Domain tag for the message a [`DealerContribution`] signature covers.
 ///
 /// `v2` because 0.5.0 length-prefixed the encoding (M-12); the `v1` tag was
 /// the last `SCREAMING-CASE-V1` string in the crate and its digest differs

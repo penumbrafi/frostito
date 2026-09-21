@@ -41,7 +41,7 @@ type Point = RistrettoPoint;
 /// `audit_nested_v2.rs`, which is the other half of M-4.
 mod coordinator_supplied_scalars_are_recomputed {
     use super::*;
-    use osst::frost::{self, SigningCommitments};
+    use osst::frost;
     use osst::nested::InnerSigningParamsV2;
 
     #[test]
@@ -100,9 +100,6 @@ mod coordinator_supplied_scalars_are_recomputed {
             7,
         );
         assert!(matches!(absent, Err(OsstError::InvalidIndex)));
-
-        // unused, but keeps the commitment type in scope for readers
-        let _ = core::mem::size_of::<SigningCommitments<Point>>();
     }
 }
 

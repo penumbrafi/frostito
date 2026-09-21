@@ -233,7 +233,7 @@ impl<P: OsstPoint> SigningPackage<P> {
     /// Compute the binding factor for signer i.
     ///
     /// `ρ_i = H("frost-binding-v2" ‖ Y ‖ len(m) ‖ m ‖ len(B) ‖ B ‖ index)` —
-    /// see [`compute_binding_factor`] for why the group public key is in
+    /// see the `compute_binding_factor` source for why the group public key is in
     /// there (M-24) and why it is a parameter rather than a field of this
     /// type.
     ///
@@ -296,7 +296,7 @@ pub struct SignatureShare<S: OsstScalar> {
 }
 
 impl<S: OsstScalar> SignatureShare<S> {
-    /// Serialize: [index:4][z:32] = 36 bytes
+    /// Serialize: `index:4 || z:32` = 36 bytes
     pub fn to_bytes(&self) -> [u8; 36] {
         let mut buf = [0u8; 36];
         buf[0..4].copy_from_slice(&self.index.to_le_bytes());

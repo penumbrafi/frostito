@@ -653,7 +653,7 @@ impl<P: OsstPoint> DkgState<P> {
 
     /// Derive all verification shares for players 1..=num_participants.
     ///
-    /// Returns a BTreeMap suitable for passing to [`frost::aggregate`].
+    /// Returns a BTreeMap suitable for passing to [`crate::frost::aggregate`].
     pub fn derive_all_verification_shares(
         &self,
     ) -> Result<alloc::collections::BTreeMap<u32, P>, OsstError> {

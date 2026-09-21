@@ -383,7 +383,8 @@ pub fn open_subshare<P: OsstPoint>(
 /// `open_subshare` asks the caller for the commitment to check against, and
 /// the caller's obvious source is whatever arrived alongside the sub-share —
 /// which is exactly what a malicious dealer controls. A confirmed
-/// [`AgreedRound1`] is the set every participant echoed and agreed on, so
+/// [`AgreedRound1`](crate::dkg::AgreedRound1) is the set every participant
+/// echoed and agreed on, so
 /// looking the commitment up in it closes the equivocation gap D-2 left open:
 /// a dealer that sent Alice `C_A` and Bob `C_B` cannot have both in the agreed
 /// set, and the echo round refuses to start round 2 at all when they disagree.

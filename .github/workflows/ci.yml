@@ -21,6 +21,8 @@ jobs:
       - run: cargo build --all-features
       - run: cargo test --all-features
       - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   backends:
     name: backend ${{ matrix.backend }}
