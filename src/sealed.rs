@@ -65,10 +65,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use hkdf::Hkdf;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::curve::OsstPoint;
+use crate::curve::{OsstPoint, OsstScalar};
+use crate::dkg::BadSubShareEvidence;
 use crate::error::OsstError;
 use crate::reshare::{DealerCommitment, SubShare};
 
@@ -89,8 +90,15 @@ pub const TRANSCRIPT_DOMAIN: &[u8] = b"osst/sealed/transcript/v1";
 /// Domain tag for the Noise prologue.
 pub const PROLOGUE_DOMAIN: &[u8] = b"osst/sealed/prologue/v1";
 
+/// Domain tag for the sealed-ciphertext digest carried in complaint evidence.
+pub const SEALED_DIGEST_DOMAIN: &[u8] = b"osst/sealed/ciphertext/v1";
+
 /// Domain tag for the commitment digest carried in a sealed package.
-pub const COMMITMENT_DIGEST_DOMAIN: &[u8] = b"osst/sealed/commitment/v1";
+///
+/// Re-exported from [`crate::dkg`], where it lives so that
+/// [`crate::dkg::Complaint::verify`] — which is compiled without this feature
+/// — can recompute the same digest.
+pub use crate::dkg::COMMITMENT_DIGEST_DOMAIN;
 
 /// Derive a participant's X25519 static secret from its identity seed.
 ///
@@ -222,14 +230,22 @@ pub struct SealedSubShare {
 /// Digest of a dealer's Feldman commitment, carried inside the sealed
 /// plaintext so the sub-share and the commitment it is verified against cannot
 /// be sourced separately (D-2).
-pub fn commitment_digest<P: OsstPoint>(commitment: &DealerCommitment<P>) -> [u8; 32] {
-    let mut h = Sha512::new();
-    h.update(COMMITMENT_DIGEST_DOMAIN);
-    h.update(commitment.to_bytes());
-    let full: [u8; 64] = h.finalize().into();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&full[..32]);
-    out
+///
+/// Re-exported from [`crate::dkg`]: a complaint's evidence names the agreed
+/// commitment by this digest, and the complaint verifier is compiled with or
+/// without the `sealed` feature.
+pub use crate::dkg::commitment_digest;
+
+/// SHA-256 of a sealed package's ciphertext, as delivered.
+///
+/// Carried in [`crate::dkg::BadSubShareEvidence`] so a verdict names one
+/// delivered package rather than a claim in the abstract.
+pub fn sealed_ciphertext_digest(ciphertext: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(SEALED_DIGEST_DOMAIN);
+    h.update((ciphertext.len() as u64).to_le_bytes());
+    h.update(ciphertext);
+    h.finalize().into()
 }
 
 fn noise_seal(
@@ -391,7 +407,9 @@ pub fn open_subshare<P: OsstPoint>(
 ///
 /// This is the round-2 entry point a caller with a reliable broadcast should
 /// use. `open_subshare` remains for callers that manage the commitment set
-/// themselves.
+/// themselves, and [`open_subshare_agreed_with_evidence`] is this function
+/// keeping the rejected plaintext so the recipient can raise a complaint
+/// anyone else can re-check.
 ///
 /// # Errors
 ///
@@ -406,15 +424,171 @@ pub fn open_subshare_agreed<P: OsstPoint>(
     sealed: &SealedSubShare,
     agreed: &crate::dkg::AgreedRound1<P>,
 ) -> Result<SubShare<P::Scalar>, OsstError> {
-    let commitment = agreed.commitment(sealed.dealer_index)?;
-    open_subshare::<P>(
+    open_subshare_agreed_with_evidence::<P>(
         recipient_x25519_secret,
         recipient_index,
         roster,
         round,
         sealed,
-        commitment,
+        agreed,
     )
+    .map_err(OpenFailure::into_error)
+}
+
+/// Why [`open_subshare_agreed_with_evidence`] refused a package.
+///
+/// The split matters: only [`BadSubShare`](Self::BadSubShare) is an accusation
+/// anyone else can check. Everything else is local — a package that did not
+/// open could as easily be a corrupted byte on the wire as a hostile dealer,
+/// and a node that broadcast an accusation for it would be the denial-of-
+/// service channel M-6 is about.
+#[derive(Debug)]
+pub enum OpenFailure {
+    /// Not an accusation: the package did not open under this ceremony's keys
+    /// and prologue, its envelope disagreed with its contents, the dealer is
+    /// not in the agreed set, or the plaintext was malformed. Handle locally.
+    Local(OsstError),
+    /// The package opened, and the scalar inside fails the Feldman check
+    /// against the dealer's commitment in the agreed round-1 set.
+    ///
+    /// The evidence is transferable as far as "this scalar is not a valid
+    /// sub-share for that commitment" and no further — see
+    /// [`crate::dkg::BadSubShareEvidence`]. Sign it into a
+    /// [`Complaint`](crate::dkg::Complaint), broadcast it, and require `t`
+    /// independent upheld complaints ([`crate::dkg::ComplaintTally`]) before
+    /// disqualifying the dealer.
+    BadSubShare { evidence: BadSubShareEvidence },
+}
+
+impl OpenFailure {
+    /// The equivalent [`OsstError`], discarding any evidence — what
+    /// [`open_subshare_agreed`] returns.
+    pub fn into_error(self) -> OsstError {
+        match self {
+            Self::Local(e) => e,
+            Self::BadSubShare { evidence } => OsstError::InvalidSubShare(evidence.dealer_index),
+        }
+    }
+}
+
+impl From<OsstError> for OpenFailure {
+    fn from(e: OsstError) -> Self {
+        Self::Local(e)
+    }
+}
+
+impl core::fmt::Display for OpenFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Local(e) => write!(f, "{}", e),
+            Self::BadSubShare { evidence } => write!(
+                f,
+                "sub-share from dealer {} fails the Feldman check against the agreed commitment",
+                evidence.dealer_index
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OpenFailure {}
+
+/// [`open_subshare_agreed`], keeping the rejected plaintext as complaint
+/// evidence (M-6 residual).
+///
+/// # Why this exists
+///
+/// `open_subshare_agreed` drops the decrypted scalar the moment the Feldman
+/// check fails, which is the right default for a value that is secret until it
+/// is proven not to be — but it leaves a recipient that has just been cheated
+/// with nothing to say. It can abort, and the others finalize: the split-group
+/// outcome. Nothing it could broadcast would be checkable by anyone else.
+///
+/// This entry point hands back
+/// [`BadSubShareEvidence`] instead, which
+/// every other participant re-checks against **its own**
+/// [`AgreedRound1`](crate::dkg::AgreedRound1). The check is exact; the
+/// attribution is not. Read
+/// [`ComplaintEvidence`](crate::dkg::ComplaintEvidence) before acting on a
+/// verdict, and gate disqualification on
+/// [`ComplaintTally`](crate::dkg::ComplaintTally).
+///
+/// # What is and is not evidence
+///
+/// Only a Feldman failure is. A package that does not open, or whose indices
+/// disagree with its envelope, is [`OpenFailure::Local`]: unauthenticated
+/// bytes, and an accusation built from them would be an accusation anyone
+/// could manufacture against anyone.
+///
+/// The commitment-digest field inside the sealed plaintext (D-2) is checked
+/// *after* the Feldman equation, deliberately. A scalar that fails Feldman is
+/// accusable however the digest came out; a scalar that passes it but arrived
+/// with the wrong digest is a protocol error with no evidentiary value, and
+/// returns [`OsstError::InvalidSubShare`] as before.
+///
+/// # Errors
+///
+/// See [`OpenFailure`].
+// The evidence is ~140 bytes, over clippy's `result_large_err` threshold. It is
+// carried by value deliberately: it goes straight into a `ComplaintEvidence`,
+// and a `Box` here would only move the allocation, not remove it.
+#[allow(clippy::result_large_err)]
+pub fn open_subshare_agreed_with_evidence<P: OsstPoint>(
+    recipient_x25519_secret: &[u8; 32],
+    recipient_index: u32,
+    roster: &SealedRoster,
+    round: u8,
+    sealed: &SealedSubShare,
+    agreed: &crate::dkg::AgreedRound1<P>,
+) -> Result<SubShare<P::Scalar>, OpenFailure> {
+    let commitment = agreed.commitment(sealed.dealer_index)?;
+    let dealer = roster.public_key(sealed.dealer_index)?;
+    if sealed.recipient_index != recipient_index {
+        return Err(OsstError::SealedOpenFailed(sealed.dealer_index).into());
+    }
+
+    let plaintext = noise_open(
+        recipient_x25519_secret,
+        dealer,
+        &roster.prologue(round),
+        &sealed.ciphertext,
+    )
+    .ok_or(OsstError::SealedOpenFailed(sealed.dealer_index))?;
+
+    if plaintext.len() != 72 {
+        return Err(OsstError::SealedOpenFailed(sealed.dealer_index).into());
+    }
+    let subshare_bytes: [u8; 40] = plaintext[..40].try_into().unwrap();
+    let subshare = SubShare::<P::Scalar>::decode_plaintext(&subshare_bytes)?;
+
+    if subshare.dealer_index != sealed.dealer_index
+        || subshare.player_index != sealed.recipient_index
+    {
+        return Err(OsstError::SealedOpenFailed(sealed.dealer_index).into());
+    }
+
+    // The accusable check, run against the *agreed* commitment.
+    if !commitment.verify_subshare(recipient_index, subshare.value()) {
+        return Err(OpenFailure::BadSubShare {
+            evidence: BadSubShareEvidence {
+                dealer_index: sealed.dealer_index,
+                recipient_index,
+                session_id: *roster.session_id(),
+                round,
+                subshare: subshare.value().to_bytes(),
+                agreed_digest: commitment_digest(commitment),
+                sealed_digest: sealed_ciphertext_digest(&sealed.ciphertext),
+            },
+        });
+    }
+
+    // D-2: the sub-share and the commitment must be the pair the dealer sent.
+    // It passed the Feldman check, so there is nothing to accuse anyone of;
+    // the package is still refused.
+    if plaintext[40..] != commitment_digest(commitment) {
+        return Err(OsstError::InvalidSubShare(sealed.dealer_index).into());
+    }
+
+    Ok(subshare)
 }
 
 /// Build a dealer's whole round-2 message set: one sealed package per roster
@@ -534,6 +708,119 @@ mod tests {
         assert_eq!(opened.value(), subshare.value());
         assert_eq!(opened.dealer_index, 1);
         assert_eq!(opened.player_index, 2);
+    }
+
+    /// M-6 residual: a recipient that is sent a sub-share which fails the
+    /// Feldman check keeps the plaintext as evidence, and every other node
+    /// re-checks it against its own agreed set and reaches the same verdict.
+    #[test]
+    fn a_cheating_dealer_leaves_evidence_anyone_can_recheck() {
+        use crate::dkg::{
+            commitment_digest, Complaint, ComplaintEvidence, ComplaintTally, ComplaintVerdict,
+            DkgState,
+        };
+        use crate::reshare::SubShare;
+        use curve25519_dalek::scalar::Scalar;
+
+        let mut rng = OsRng;
+        let r = roster(SESSION);
+        let (t, n, epoch) = (2u32, 3u32, 8u64);
+
+        let dealers: Vec<Dealer<Point>> = (1..=n)
+            .map(|i| Dealer::new(i, t, &mut rng).unwrap())
+            .collect();
+        let mut st = DkgState::<Point>::new(epoch, t, n);
+        for d in &dealers {
+            st.submit_commitment(d.round1_package(epoch, &mut rng))
+                .unwrap();
+        }
+        let agreed = st.agreed_round1().unwrap();
+
+        // Dealer 1 broadcast an honest commitment and then sealed a scalar
+        // that is not f_1(2). The digest inside the package is the agreed
+        // one, so D-2 is satisfied and only the Feldman check catches it.
+        let junk = SubShare::<Scalar>::new(1, 2, Scalar::random(&mut rng)).unwrap();
+        let sealed = seal_subshare::<Point>(
+            &x25519_secret_from_seed(&SEED_1),
+            &r,
+            ROUND,
+            &junk,
+            dealers[0].commitment(),
+        )
+        .unwrap();
+
+        // The old path tells recipient 2 nothing it can repeat to anyone.
+        assert_eq!(
+            open_subshare_agreed::<Point>(
+                &x25519_secret_from_seed(&SEED_2),
+                2,
+                &r,
+                ROUND,
+                &sealed,
+                &agreed,
+            )
+            .unwrap_err(),
+            OsstError::InvalidSubShare(1)
+        );
+
+        let err = open_subshare_agreed_with_evidence::<Point>(
+            &x25519_secret_from_seed(&SEED_2),
+            2,
+            &r,
+            ROUND,
+            &sealed,
+            &agreed,
+        )
+        .unwrap_err();
+        let OpenFailure::BadSubShare { evidence } = err else {
+            panic!("a Feldman failure is the accusable case");
+        };
+        assert_eq!(evidence.dealer_index, 1);
+        assert_eq!(evidence.recipient_index, 2);
+        assert_eq!(evidence.session_id, SESSION);
+        assert_eq!(evidence.round, ROUND);
+        assert_eq!(evidence.subshare, junk.value().to_bytes());
+        assert_eq!(
+            evidence.agreed_digest,
+            commitment_digest(agreed.commitment(1).unwrap())
+        );
+        assert_eq!(
+            evidence.sealed_digest,
+            sealed_ciphertext_digest(&sealed.ciphertext)
+        );
+        assert!(
+            alloc::format!("{:?}", evidence).contains("[REDACTED]"),
+            "the scalar is redacted from Debug"
+        );
+
+        // Recipient 2 signs it; a third party with only the roster and its own
+        // agreed set reaches the verdict.
+        let accuser_secret = Scalar::random(&mut rng);
+        let accuser_pk: Point =
+            <Point as OsstPoint>::generator().mul_scalar(&accuser_secret);
+        let complaint = Complaint::<Point>::sign(
+            epoch,
+            SESSION,
+            ROUND,
+            2,
+            ComplaintEvidence::BadSubShare { evidence },
+            &accuser_secret,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(
+            complaint
+                .verify(epoch, &SESSION, &accuser_pk, Some(&agreed))
+                .unwrap(),
+            ComplaintVerdict::Upheld
+        );
+
+        // ...and still does not disqualify dealer 1 on its own.
+        let mut tally = ComplaintTally::new(t);
+        tally.record(2, 1, ComplaintVerdict::Upheld).unwrap();
+        assert!(!tally.reached(1));
+        tally.record(3, 1, ComplaintVerdict::Upheld).unwrap();
+        assert!(tally.reached(1), "t distinct accusers, and only then");
     }
 
     /// M-5: `open_subshare` takes the commitment from the caller, whose
