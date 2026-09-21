@@ -20,15 +20,37 @@ penumbrafi.
 
 ## security
 
-this crate has not had a third-party audit. an internal adversarial review was
-completed on 2026-09-20 — scope, findings and PoCs in
-[`SECURITY-REVIEW-2026-09.md`](SECURITY-REVIEW-2026-09.md) — and everything it
-raised against this crate is fixed in **0.4.0**, with each PoC kept as a
-regression test in `tests/audit_*.rs`. Review is not proof: no formal
-reductions were attempted, and absence of a finding there is not evidence of
-soundness.
+this crate has not had a third-party audit. two internal adversarial reviews
+have been completed:
 
-what 0.4.0 changed, and what it means for you:
+- [`SECURITY-REVIEW-2026-09.md`](SECURITY-REVIEW-2026-09.md) (2026-09-20) —
+  scope, findings and PoCs; everything it raised against this crate is fixed in
+  **0.4.0**, each PoC kept as a regression test in `tests/audit_*.rs`.
+- [`REVIEW-2026-09-21-maintainer.md`](REVIEW-2026-09-21-maintainer.md)
+  (2026-09-21) — a maintainer pass that re-verified each 0.4.0 closure against
+  the code and looked at the callers. It found three new crate findings and a
+  larger set in `narsild`. The crate half is fixed in **0.5.0**.
+
+review is not proof: no formal reductions were attempted, and absence of a
+finding in either document is not evidence of soundness.
+
+what 0.5.0 changed, and what it means for you:
+
+| finding | severity | effect |
+|---------|----------|--------|
+| M-24 | info → fixed | the binding factor now includes the group public key, as RFC 9591 §4.4 does. **signature-incompatible with 0.4.x on every backend** |
+| M-12 | low | the liveness contribution message is length-prefixed and injective; tag `osst/contribution-sig/v2`. **that signature changes too** |
+| M-5 | high | dealer equivocation: `EchoDigest`/`AgreedRound1` ship the echo round over the round-1 set, and `sealed::open_subshare_agreed` resolves commitments from the agreed set |
+| M-4/M-21 | high/low | `NestedSigningRequest` no longer carries the group key — `inner_sign_v2` takes it from your own key package; `from_coordinator_checked` is deprecated |
+| M-6 | high | `Complaint` is signed, ceremony-bound and justified, with a verdict a third party can reach |
+| M-14 | medium | `active_indices` is validated against the commitment set and the inner threshold |
+| M-13 | medium | the session id is documented as a mixing guard, not a replay guard; `SpentSessions` + `inner_sign_v2_spending` are where you put the durable half |
+| M-20 | low | the commit–reveal round is enforced, not documented |
+| M-25 | low | the plaintext sub-share serializers need the `unsafe_plaintext` feature and are deprecated there |
+| M-22 | low | `secp256k1::compress()` has no silent all-zero fallthrough |
+| M-23 | low | negative tests for the named rejection paths, in `tests/audit_rejections.rs` |
+
+and what 0.4.0 changed:
 
 | finding | severity | effect |
 |---------|----------|--------|
@@ -36,7 +58,7 @@ what 0.4.0 changed, and what it means for you:
 | C-1 | high (secp only) | secp256k1 point compression is SEC1 with parity. **wire- and signature-incompatible with 0.3.x on that backend** |
 | R-1 | medium | nested v1 is behind the off-by-default `legacy-v1` feature, RedPallas path included |
 | K-1 | medium | DKG dealers prove knowledge of their constant term; complaints name the dealer and `DkgState::disqualify` acts on them |
-| L-1/H-1 | medium/low | liveness signatures bind the public key; OSST and liveness challenges are domain-separated. **both hashes change** |
+| L-1/H-1 | medium/low | liveness signatures bind the public key; OSST and liveness challenges are domain-separated |
 | D-1/D-2 | critical/high | `osst::sealed` seals round-2 sub-shares per recipient over Noise_K, binding sender, recipient, ceremony and commitment |
 | F-1, Z-1, P-1, B-1 | low | `sign` checks its own commitment; real zeroization on every backend; wire-parsed indices error instead of aborting the process; batch verification pairs by dealer index |
 
@@ -46,7 +68,26 @@ the resulting key as compromised and regenerate it. that is D-1: it is not
 theoretical, and it needs no wire access where sub-shares were broadcast.
 
 nested FROST v1 is insecure (`SECURITY-nested-frost.md`). do not enable
-`legacy-v1` for new code.
+`legacy-v1` for new code. do not enable `unsafe_plaintext` for new code
+either — see M-25.
+
+### what this crate cannot do for you
+
+three properties the API now names explicitly, because 0.4.0 documented them
+as caller obligations and a caller got each one wrong:
+
+- **reliable broadcast.** the echo round (`AgreedRound1`) makes every
+  participant compute the same comparison. it does not deliver the digests. a
+  deployment without a broadcast that every honest party agrees on cannot
+  detect an equivocating dealer, and must not run the DKG.
+- **complaint agreement.** `Complaint` is verifiable and ceremony-bound.
+  nothing in this crate re-broadcasts one, adjudicates across nodes, or makes
+  `DkgState::disqualify` apply the same set everywhere. that is the caller's,
+  and getting it wrong splits the group.
+- **durable nonce state.** `SpentSessions` is a trait, not an implementation.
+  the in-memory one is for tests. a daemon that snapshots and restores without
+  a write-ahead, `fsync`'d spent-session log will eventually sign twice under
+  one nonce and give up the share.
 
 ### OSST verification is not accountable
 
@@ -138,6 +179,14 @@ if you need identifiable aborts:
   the `redpallas` helpers reach for `rand_core::OsRng`, so `pallas` needs
   `std` for those (`--features std,pallas`); the core protocol is no_std on
   every backend.
+
+optional cargo features, all off by default:
+
+| feature | what it is |
+|---|---|
+| `sealed` | confidential, authenticated DKG round 2 over Noise_K (`osst::sealed`). needs `std`. **use this** |
+| `legacy-v1` | nested FROST v1. **insecure** — see `SECURITY-nested-frost.md`. retained only so an existing deployment compiles while it migrates |
+| `unsafe_plaintext` | the plaintext sub-share serializers, `#[deprecated]` when enabled. **secret key material on the wire** — `t` of those 40-byte strings reconstruct the group key (D-1 / M-25). the only sound use is feeding `sealed::seal_subshare`, which does it for you internally, so you should not need this |
 
 ## curves
 

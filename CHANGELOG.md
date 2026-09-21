@@ -1,5 +1,236 @@
 # changelog
 
+## [0.5.0] - 2026-09-21
+
+Follow-on security release addressing `REVIEW-2026-09-21-maintainer.md`, the
+maintainer pass over 0.4.0. **Breaking**, and **signature-incompatible with
+0.4.x on every backend** — see M-24 and M-12.
+
+The 0.4.0 release closed everything the prior audit raised against this crate,
+and this pass re-verified each closure against the code. Three findings were
+new (M-5, M-12, M-25), and one of them — dealer equivocation behind the D-2 fix
+— needed a protocol round rather than a patch. The rest of this release is the
+list the review said it would block 0.5.0 on, plus the two it wanted but did
+not block on.
+
+The risk the review found has largely moved out of this crate and into
+`narsild`, where a cryptographic core with good properties is exposed through
+an HTTP surface with none. Nothing here fixes that; see the review's §(ii).
+
+### breaking
+
+| what changed | why |
+|---|---|
+| `SigningPackage::binding_factor(index, group_pubkey)` and `group_commitment(group_pubkey)` take the group key | M-24 |
+| every signature this crate produces changes | M-24, M-12 |
+| `NestedSigningRequest` loses `group_pubkey`, gains `inner_precommits` and `inner_threshold` | M-4, M-20, M-14 |
+| `inner_sign_v2` / `inner_sign_v2_with_context` take `local_group_pubkey` | M-4 |
+| `aggregate_inner_commitment_pair` and `verify_nested_commitment` take the precommitments | M-20 |
+| `reshare::SubShare::{to_bytes, from_bytes}` need the new `unsafe_plaintext` feature and are deprecated there | M-25 |
+| `InnerSigningParamsV2::from_coordinator_checked` is `#[deprecated]` | M-21 |
+| `liveness::DealerContribution::signing_message` is length-prefixed, tag `osst/contribution-sig/v2` | M-12 |
+| new `OsstError` variants: `UnknownQuorumMember`, `EchoMismatch`, `PrecommitMismatch`, `SessionSpent`, `InvalidComplaint` | M-14, M-5, M-20, M-13, M-6 |
+
+### fixed — the wire and the API
+
+- **M-24 (Info → fixed)** — the binding factor omitted the group public key,
+  where RFC 9591 §4.4 puts it first in the binding-factor input. One commitment
+  set and one message therefore gave the same ρ under every group key, so a
+  signing transcript was not pinned to the key it was collected for — the
+  freedom M-4 hands a coordinator that also gets to assert `Y`. Now
+  `ρ_i = H("frost-binding-v2" ‖ Y ‖ len(m) ‖ m ‖ len(B) ‖ B ‖ i)`, RFC ordering
+  with length prefixes instead of the RFC's intermediate hashes. Carried as
+  A-2/Info since the prior audit; taken now because 0.5.0 already breaks the
+  wire and carrying it further means carrying it a long time.
+
+  `Y` is a parameter, deliberately not a field of `SigningPackage`: a package is
+  coordinator-shaped data, and a group key read out of it would be the
+  coordinator's assertion, which is M-4. The RedPallas package gets the same
+  treatment — its hashes are osst's own construction and never were
+  byte-compatible with ZF `frost-core`/`reddsa`, so `tests/reshare_zf_frost.rs`,
+  which signs with ZF's own `SigningPackage`, is unaffected.
+
+- **M-12 (Low)** — `DealerContribution::signing_message` concatenated a domain
+  tag, the dealer commitment, the liveness proof and the caller's context with
+  no length prefixes. `DealerCommitment::to_bytes` is variable-length with the
+  threshold supplied out of band, so the commitment/liveness boundary was
+  undetermined and the encoding was not injective. Every field is now
+  length-prefixed and the tag is `osst/contribution-sig/v2` — the last
+  `SCREAMING-CASE-V1` string in the crate. The regression test builds an
+  explicit collision against the old rule and asserts the new encoding
+  separates it.
+
+- **M-25 (Low)** — D-1 residual. `reshare::SubShare::{to_bytes, from_bytes}`
+  were plain `pub fn`s with no deprecation and no warning, one call away from
+  the sealed API. Round 2 puts `n−1` evaluations of every dealer's polynomial on
+  the wire, so `t` of those 40-byte strings reconstruct the group key; narsild
+  reached for them and served the result over an unauthenticated HTTP GET. The
+  encoding is now `pub(crate)`, and the public names are behind the new
+  off-by-default **`unsafe_plaintext`** feature and `#[deprecated]` there. The
+  only sound use is feeding `sealed::seal_subshare`, which does it internally
+  without exposing the bytes. `SubShare` is the crate's only plaintext
+  secret-share serializer.
+
+- **M-4 (High, osst half) / M-21 (Low)** — `NestedSigningRequest` carried
+  `group_pubkey`, so the outer group key arrived with the coordinator's request
+  and went into the binding factor and the challenge. `from_coordinator_checked`
+  did not save this: it recomputes ρ, c and λ *using the supplied `Y`*, so a
+  substituted `Y'` yields a self-consistent package that passes every check and
+  an honest holder signs the approved message under an attacker-chosen
+  challenge. Not a forgery, but free choice of `c` over a fixed `m`.
+
+  The field is gone; `Y` is a parameter of `inner_sign_v2`, taken from the
+  holder's own key package. The type documentation no longer stops at "every
+  field is public data" — public is not the same as locally anchored — and names
+  `nested_index` and `active_indices` as caller-anchored.
+  `from_coordinator_checked` is `#[deprecated]`: it validates self-consistency,
+  not provenance, and a caller who stops reading at the name is protected
+  against nothing.
+
+### fixed — the protocol
+
+- **M-5 (High)** — the D-2 fix binds a sub-share to the commitment *as
+  delivered to this recipient*. That stops a man-in-the-middle; it does not stop
+  the **dealer**. A malicious dealer sends `(C_A, f_A(a))` to Alice and
+  `(C_B, f_B(b))` to Bob, each pair internally consistent, each passing its
+  Feldman and digest checks, and the two derive different group keys with no way
+  to tell. Nothing point-to-point can detect this.
+
+  osst cannot supply the reliable broadcast — that is the caller's job, and a
+  caller without one must not run this protocol — but it now ships the echo
+  round so every participant computes the comparison identically:
+
+  - `EchoDigest` / `round1_echo_digest`: a canonical digest over the whole
+    round-1 commitment set, sorted by dealer index, each entry length-prefixed,
+    with epoch, threshold and `n` inside the hash so a digest from another
+    ceremony cannot match. Commitments only, not the proofs of knowledge —
+    the group key, every verification share and every Feldman check are
+    functions of the commitments alone, and a dealer whose PoK fails never
+    enters the set.
+  - `DkgState::agreed_round1() -> AgreedRound1`, which refuses a partial set.
+  - `AgreedRound1::confirm` / `confirm_all` → `OsstError::EchoMismatch`.
+  - `Aggregator::from_agreed`, so the dealer set — the one value every player
+    must agree on — comes from the confirmed set.
+  - `sealed::open_subshare_agreed`, which looks a dealer's commitment up in the
+    agreed set instead of accepting whatever arrived beside the sub-share. That
+    loose argument is exactly what an equivocating dealer controls.
+
+  `an_equivocating_dealer_is_caught_by_the_echo_round` builds the attack end to
+  end: both packages verify, both are accepted in isolation, the group keys
+  really do differ, and the echo comparison refuses round 2.
+
+- **M-20 (Low)** — the commit–reveal round was caller convention:
+  `inner_precommit`/`verify_inner_precommit` existed and nothing called them.
+  `aggregate_inner_commitment_pair` now takes the precommitments and verifies
+  every reveal against one, returning `PrecommitMismatch(holder)`; extra
+  precommitments for holders that did not reveal are fine. This threads through
+  `verify_nested_commitment` and `NestedSigningRequest`, so `inner_sign_v2`
+  enforces it for every holder.
+
+- **M-14 (Medium)** — `active_indices` is coordinator-supplied and
+  `inner_sign_v2` checked only that this holder had a position in it. It now
+  rejects, before touching the nonces: index 0, a repeated index, an index with
+  no round-1 commitment (`UnknownQuorumMember`), and a set smaller than `t_in`.
+  `t_in` cannot be derived from the arguments — a `SecretShare` carries an index
+  and a scalar — so `NestedSigningRequest` gains `inner_threshold`, documented
+  as caller-anchored. N-3 fixed this on the aggregation side and left the
+  signing side open.
+
+- **M-6 (High, osst half)** — complaints were not a value at all, so a caller's
+  only policies were "believe everyone" — one packet aborts the ceremony — and
+  "believe no-one", which makes K-1 undetectable again.
+
+  `Complaint<P>` is signed by the accuser's roster identity key and bound to
+  `(epoch, session_id, round)`. `verify(epoch, session_id, accuser_pk)` checks
+  the ceremony binding, the accused/evidence agreement and the signature, then
+  returns a `ComplaintVerdict`: `Upheld`, or `Unfounded` when the complaint is
+  authentic but wrong — a named participant making a false accusation is a
+  different problem from a forgery, and collapsing them would lose the
+  accountability the mechanism exists for.
+
+  `ComplaintEvidence` has two kinds of deliberately unequal strength, and says
+  so. `ForgedProofOfKnowledge` is fully transferable: the round-1 package is
+  public, any third party re-runs `Round1Package::verify`. `BadSubShare`
+  (commitment, revealed plaintext sub-share, digest of the sealed package) lets
+  anyone confirm the scalar does not lie on the commitment, but **not** that the
+  dealer sent it — Noise_K gives the recipient authentication, not
+  transferability, so a recipient can fabricate a plaintext its own key would
+  have produced. That gap is documented, the ciphertext digest is carried so a
+  future key-reveal extension can close it, and callers are told to require `t`
+  independent complaints for that kind.
+
+  Identity key: a Schnorr key on the ceremony's own curve. The accuser's
+  verification share does not exist yet — the complaint is raised during the DKG
+  that produces it — so a long-term identity key is needed either way, and a
+  scalar on `P` reuses the backend already compiled in, works in `no_std` with
+  no new dependency, and verifies with an equation the crate already implements
+  three times. XEdDSA over the roster's X25519 static key was rejected: clamping
+  and sign-bit handling are easy to get subtly wrong. **The roster must bind an
+  identity public key per participant**; osst does not own the roster, so
+  verification is against a caller-supplied key.
+
+  `DkgState::disqualify` no longer says "every participant must apply the same
+  complaints" as though the library handled it. It now states that osst provides
+  no agreement mechanism and that a caller without reliable broadcast must not
+  use it.
+
+- **M-13 (Medium)** — the session-id contract, stated precisely. `session_id`
+  is a **mixing guard, not a replay guard**: it stops two concurrent rounds
+  being spliced together and enters neither the binding factor nor the
+  challenge, so two sessions over the same message and commitment list produce
+  the same ρ and the same `c`. What prevents nonce reuse is in-process only —
+  the nonces are consumed by value and checked against the published commitment.
+  Across a restart that is nothing: a VM snapshot-restore replays them under a
+  fresh challenge, and two responses under one nonce give up the share.
+
+  New `SpentSessions` trait (`spend` → `OsstError::SessionSpent`), documented as
+  needing to be durable, `fsync`'d and **write-ahead** — an implementation that
+  buffers provides nothing, because the crash window is the whole point.
+  `inner_sign_v2_spending` records before it computes, so a crash burns the
+  session rather than leaving it replayable, and it spends the id in the
+  holder's own nonces rather than the request's. `MemorySpentSessions` is for
+  tests and says so.
+
+### fixed — smaller
+
+- **M-22 (Low)** — `secp256k1::compress()` returned an all-zero buffer for any
+  encoding that was not 33 bytes, which `decompress` maps to the identity: a
+  silently wrong hash input in the function whose lossiness was C-1. The length
+  check is now an exhaustive `match` with both real cases named and an
+  `unreachable!` for anything else, with the infallibility argument written out.
+  The panic is over k256's own encoder, never over wire input, so P-1 does not
+  apply. Tests pin both branches and assert the premise directly.
+
+### tests
+
+- **M-23 (Low)** — `tests/audit_rejections.rs` adds the rejection paths the
+  review named as untested, against the public API:
+  `ChallengeMismatch` from `from_coordinator_checked` (each scalar perturbed
+  alone); `InvalidProofOfKnowledge` from a forged `Round1Package`, including an
+  honest package replayed into another epoch; `DkgAborted` on
+  over-disqualification and the state afterwards; and the four sealed paths —
+  wrong prologue, wrong sender, wrong recipient, digest mismatch — plus
+  ciphertext tampering.
+
+  Two of the seven were already covered and are cross-referenced rather than
+  duplicated: the duplicate branch of N-3 (`incomplete_quorum_is_rejected`
+  asserts `vec![1, 3]`, so both branches were covered) and `SessionMismatch` in
+  `aggregate_inner_commitment_pair` as distinct from `inner_sign_v2`.
+
+- New regression tests for each finding above: the M-12 collision, the M-24 key
+  dependence, the M-4 substituted-key trap, the M-14 malformed quorum, the M-5
+  equivocating dealer (in both `dkg` and `sealed`), the M-20 unmatched reveal,
+  the M-6 complaint verdicts, and the M-13 restore.
+
+### still open, and not this crate's to close
+
+- The review's `narsild` list (§ii) — unauthenticated endpoints, the secret
+  shares on `/dkg/status`, irreversible key destruction, epoch rollback, the
+  absent durable nonce store. osst now provides the pieces (`SpentSessions`,
+  `AgreedRound1`, `Complaint`); wiring them up is PR #31's job.
+- `legacy-v1` removal: still present, still off by default, still insecure. A
+  removal plan belongs in 0.6.0.
+
 ## [0.4.0] - 2026-09-20
 
 Security release addressing SECURITY-REVIEW-2026-09.md. **Breaking**, and on
