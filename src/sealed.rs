@@ -295,7 +295,7 @@ pub fn seal_subshare<P: OsstPoint>(
     roster.public_key(subshare.dealer_index)?;
 
     let mut plaintext = Vec::with_capacity(72);
-    plaintext.extend_from_slice(&subshare.to_bytes());
+    plaintext.extend_from_slice(&subshare.encode_plaintext());
     plaintext.extend_from_slice(&commitment_digest(commitment));
 
     let ciphertext = noise_seal(
@@ -354,7 +354,7 @@ pub fn open_subshare<P: OsstPoint>(
         return Err(OsstError::SealedOpenFailed(sealed.dealer_index));
     }
     let subshare_bytes: [u8; 40] = plaintext[..40].try_into().unwrap();
-    let subshare = SubShare::<P::Scalar>::from_bytes(&subshare_bytes)?;
+    let subshare = SubShare::<P::Scalar>::decode_plaintext(&subshare_bytes)?;
 
     if subshare.dealer_index != sealed.dealer_index
         || subshare.player_index != sealed.recipient_index
@@ -463,7 +463,7 @@ mod tests {
         let r = roster(SESSION);
         let dealer: Dealer<Point> = Dealer::new(1, 2, &mut rng).expect("index is 1-indexed by construction");
         let subshare = dealer.generate_subshare(2).expect("index is 1-indexed by construction");
-        let plaintext = subshare.to_bytes();
+        let plaintext = subshare.encode_plaintext();
 
         let sealed = seal_subshare::<Point>(
             &x25519_secret_from_seed(&SEED_1),

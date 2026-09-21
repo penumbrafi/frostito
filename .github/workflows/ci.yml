@@ -48,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        feature: [sealed, legacy-v1]
+        feature: [sealed, legacy-v1, unsafe_plaintext]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
