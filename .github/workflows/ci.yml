@@ -50,7 +50,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        feature: [sealed, legacy-v1, unsafe_plaintext]
+        feature: [sealed, zf-decaf377, zf-ristretto255]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

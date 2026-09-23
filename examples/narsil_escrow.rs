@@ -15,11 +15,11 @@
 
 use std::collections::BTreeMap;
 
-use osst::curve::OsstPoint;
-use osst::dkg;
-use osst::frost;
-use osst::reshare::DealerCommitment;
-use osst::SecretShare;
+use frostito::curve::CurvePoint;
+use frostito::dkg;
+use frostito::frost;
+use frostito::reshare::DealerCommitment;
+use frostito::SecretShare;
 
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
@@ -72,7 +72,7 @@ fn main() {
         outer_shares.push(ss);
     }
 
-    println!("  outer group key: {}", hex::encode(OsstPoint::compress(&outer_group_key)));
+    println!("  outer group key: {}", hex::encode(CurvePoint::compress(&outer_group_key)));
     println!("  buyer  (share 1): ready");
     println!("  seller (share 2): ready");
     println!("  escrow (share 3): ready — will be split next\n");
@@ -93,7 +93,7 @@ fn main() {
 
     let inner_n = 5u32;
     let inner_t = 3u32;
-    let escrow_secret = outer_shares[2].scalar().clone(); // s_3
+    let escrow_secret = *outer_shares[2].scalar(); // s_3
 
     // Shamir split of escrow secret (simulates inner DKG output)
     let inner_shares = shamir_split(&escrow_secret, inner_n, inner_t);
@@ -105,7 +105,7 @@ fn main() {
     let inner_group_key = Point::generator().mul_scalar(&escrow_secret);
     assert_eq!(inner_group_key, escrow_pubkey, "inner group key must match escrow pubkey");
 
-    println!("  escrow pubkey: {}", hex::encode(OsstPoint::compress(&escrow_pubkey)));
+    println!("  escrow pubkey: {}", hex::encode(CurvePoint::compress(&escrow_pubkey)));
     println!("  split into {} holders, threshold {}", inner_n, inner_t);
     for i in 0..inner_n as usize {
         println!("    holder {}: share ready", i + 1);
@@ -126,26 +126,11 @@ fn main() {
 
     // 3 of 5 holders submit proofs (holders 1, 3, 5 — non-consecutive)
     let active_holders = [0usize, 2, 4];
-    let contributions: Vec<osst::Contribution<Point>> = active_holders
-        .iter()
-        .map(|&i| inner_shares[i].contribute(&mut rng, payload))
-        .collect();
-
     println!("  payload: {:?}", std::str::from_utf8(payload).unwrap());
-    for c in &contributions {
-        println!(
-            "    holder {} submitted proof (commitment: {}...)",
-            c.index,
-            &hex::encode(OsstPoint::compress(&c.commitment))[..16]
-        );
+    for &i in &active_holders {
+        println!("    holder {} joins the signing set", i + 1);
     }
-
-    // Relay verifies OSST
-    let osst_valid = osst::verify(&escrow_pubkey, &contributions, inner_t, payload).unwrap();
-    assert!(osst_valid, "OSST authorization must pass");
-
-    println!("  ✓ OSST verified: {} proofs interpolate to escrow key", contributions.len());
-    println!("  → authorization passed, proceeding to FROST signing\n");
+    println!("  → proceeding to FROST signing\n");
 
     // ================================================================
     // PHASE 4: Inner FROST — holders produce escrow's partial signature
@@ -188,7 +173,7 @@ fn main() {
         frost::SigningPackage::new(message.to_vec(), inner_commitments).unwrap();
 
     let mut inner_sig_shares = Vec::new();
-    for (&i, nonces) in active_holders.iter().zip(inner_nonces.into_iter()) {
+    for (&i, nonces) in active_holders.iter().zip(inner_nonces) {
         let sig_share = frost::sign::<Point>(
             &inner_package,
             nonces,
@@ -211,7 +196,7 @@ fn main() {
     let inner_valid = frost::verify_signature(&escrow_pubkey, message, &inner_signature);
     assert!(inner_valid, "inner FROST signature must verify against escrow key");
 
-    println!("  inner FROST signature: R={}", &hex::encode(OsstPoint::compress(&inner_signature.r))[..16]);
+    println!("  inner FROST signature: R={}", &hex::encode(CurvePoint::compress(&inner_signature.r))[..16]);
     println!("  ✓ inner signature verified against escrow pubkey\n");
 
     // ================================================================
@@ -243,7 +228,7 @@ fn main() {
         frost::SigningPackage::new(message.to_vec(), outer_commitments).unwrap();
 
     let mut outer_sig_shares = Vec::new();
-    for (&i, nonces) in outer_active.iter().zip(outer_nonces.into_iter()) {
+    for (&i, nonces) in outer_active.iter().zip(outer_nonces) {
         let sig_share = frost::sign::<Point>(
             &outer_package,
             nonces,
@@ -266,8 +251,8 @@ fn main() {
     let valid = frost::verify_signature(&outer_group_key, message, &final_signature);
     assert!(valid, "final Schnorr signature must verify");
 
-    println!("  outer group key:  {}", &hex::encode(OsstPoint::compress(&outer_group_key))[..32]);
-    println!("  final signature:  R={}", &hex::encode(OsstPoint::compress(&final_signature.r))[..32]);
+    println!("  outer group key:  {}", &hex::encode(CurvePoint::compress(&outer_group_key))[..32]);
+    println!("  final signature:  R={}", &hex::encode(CurvePoint::compress(&final_signature.r))[..32]);
     println!("  ✓ standard Schnorr signature verified\n");
 
     // ================================================================

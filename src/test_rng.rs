@@ -1,6 +1,6 @@
 //! Test-only RNG adapter.
 //!
-//! osst's own APIs take rand_core 0.6's `RngCore`, so `rand::rngs::OsRng` is
+//! frostito's own APIs take rand_core 0.6's `RngCore`, so `rand::rngs::OsRng` is
 //! fine for them. Zakura Common 1.0's ff 0.14, however, bounds
 //! `Field::random` on rand_core 0.10's `Rng` — a pure-trait crate with no
 //! bundled `OsRng`. This zero-sized adapter bridges rand 0.8's `OsRng` to
@@ -15,45 +15,45 @@
 pub(crate) struct OsRng10;
 
 impl rand_core_10::TryRng for OsRng10 {
-    type Error = core::convert::Infallible;
+ type Error = core::convert::Infallible;
 
-    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
-        let mut b = [0u8; 4];
-        self.try_fill_bytes(&mut b)?;
-        Ok(u32::from_le_bytes(b))
-    }
+ fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+ let mut b = [0u8; 4];
+ self.try_fill_bytes(&mut b)?;
+ Ok(u32::from_le_bytes(b))
+ }
 
-    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
-        let mut b = [0u8; 8];
-        self.try_fill_bytes(&mut b)?;
-        Ok(u64::from_le_bytes(b))
-    }
+ fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+ let mut b = [0u8; 8];
+ self.try_fill_bytes(&mut b)?;
+ Ok(u64::from_le_bytes(b))
+ }
 
-    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
-        use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(dst);
-        Ok(())
-    }
+ fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+ use rand::RngCore;
+ rand::rngs::OsRng.fill_bytes(dst);
+ Ok(())
+ }
 }
 
 impl rand_core_10::TryCryptoRng for OsRng10 {}
 
 #[cfg(test)]
 mod tests {
-    use super::OsRng10;
+ use super::OsRng10;
 
-    /// The bridge is the only way to reach ff 0.14's `Field::random` from this
-    /// crate's rand 0.8 test RNG. osst's own `OsstScalar::random` deliberately
-    /// does not go through it (see `curve::pallas`), so this test is what keeps
-    /// the adapter honest.
-    #[test]
-    fn os_rng10_drives_ff_014_field_random() {
-        use pasta_curves::group::ff::Field;
-        use pasta_curves::pallas::Scalar;
+ /// The bridge is the only way to reach ff 0.14's `Field::random` from this
+ /// crate's rand 0.8 test RNG. frostito's own `CurveScalar::random` deliberately
+ /// does not go through it (see `curve::pallas`), so this test is what keeps
+ /// the adapter honest.
+ #[test]
+ fn os_rng10_drives_ff_014_field_random() {
+ use pasta_curves::group::ff::Field;
+ use pasta_curves::pallas::Scalar;
 
-        let a = <Scalar as Field>::random(&mut OsRng10);
-        let b = <Scalar as Field>::random(&mut OsRng10);
-        assert_ne!(a, b, "two draws must not collide");
-        assert!(bool::from(!<Scalar as Field>::is_zero(&a)));
-    }
+ let a = <Scalar as Field>::random(&mut OsRng10);
+ let b = <Scalar as Field>::random(&mut OsRng10);
+ assert_ne!(a, b, "two draws must not collide");
+ assert!(bool::from(!<Scalar as Field>::is_zero(&a)));
+ }
 }

@@ -478,6 +478,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "frost-core"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81ef2787af391c7e8bedc037a3b9ea03dde803fbd93e778e6bb369547800e5cd"
+dependencies = [
+ "byteorder",
+ "const-crc32-nostd",
+ "derive-getters",
+ "document-features",
+ "hex",
+ "itertools",
+ "postcard",
+ "rand_core 0.6.4",
+ "serde",
+ "serdect",
+ "thiserror",
+ "visibility",
+ "zeroize",
+ "zeroize_derive",
+]
+
+[[package]]
 name = "frost-rerandomized"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -485,9 +507,78 @@ checksum = "4c5eb1ea58c0250b7ce834337f7b19e0417686d14ffc7f626137dea9149762d4"
 dependencies = [
  "derive-getters",
  "document-features",
- "frost-core",
+ "frost-core 2.2.0",
  "hex",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "frost-rerandomized"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f4c5cedd2426728adef2c0b1720f57676354c473836d1ccc50d0f0d1c91942b"
+dependencies = [
+ "derive-getters",
+ "document-features",
+ "frost-core 3.0.0",
+ "hex",
+ "rand_core 0.6.4",
+]
+
+[[package]]
+name = "frost-ristretto255"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0159efb722280263c3a92f3f8d8f2f9a03174304d46e85595f0243ba0eb16cf8"
+dependencies = [
+ "curve25519-dalek",
+ "document-features",
+ "frost-core 3.0.0",
+ "frost-rerandomized 3.0.0",
+ "rand_core 0.6.4",
+ "sha2",
+]
+
+[[package]]
+name = "frost-secp256k1"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d69a97ae720bc1f01efd7a87c6c8451582bd00a45383052b01e83ba9c6faa5c5"
+dependencies = [
+ "document-features",
+ "frost-core 3.0.0",
+ "frost-rerandomized 3.0.0",
+ "k256",
+ "rand_core 0.6.4",
+ "sha2",
+]
+
+[[package]]
+name = "frostito"
+version = "0.6.0"
+dependencies = [
+ "blake2b_simd",
+ "curve25519-dalek",
+ "decaf377",
+ "frost-core 3.0.0",
+ "frost-ristretto255",
+ "frost-secp256k1",
+ "generic-array",
+ "hex",
+ "hkdf",
+ "k256",
+ "parity-scale-codec",
+ "rand 0.8.7",
+ "rand_core 0.10.1",
+ "rand_core 0.6.4",
+ "reddsa",
+ "scale-info",
+ "serde",
+ "sha2",
+ "snow",
+ "x25519-dalek",
+ "zakura-pasta-curves",
+ "zeroize",
 ]
 
 [[package]]
@@ -717,31 +808,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
-name = "osst"
-version = "0.5.1"
-dependencies = [
- "blake2b_simd",
- "curve25519-dalek",
- "decaf377",
- "generic-array",
- "hex",
- "hkdf",
- "k256",
- "parity-scale-codec",
- "rand 0.8.7",
- "rand_core 0.10.1",
- "rand_core 0.6.4",
- "reddsa",
- "scale-info",
- "serde",
- "sha2",
- "snow",
- "x25519-dalek",
- "zakura-pasta-curves",
- "zeroize",
-]
-
-[[package]]
 name = "parity-scale-codec"
 version = "3.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -910,7 +976,7 @@ source = "git+https://github.com/ZcashFoundation/reddsa.git?rev=475a552#475a552c
 dependencies = [
  "blake2b_simd",
  "byteorder",
- "frost-rerandomized",
+ "frost-rerandomized 2.2.0",
  "group 0.13.0",
  "hex",
  "jubjub",
