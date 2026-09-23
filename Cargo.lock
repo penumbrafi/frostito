@@ -554,8 +554,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "frost-secp256k1-tr"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6fca4ca9f057cf22066f3eb5bbda59d2af51f429f2aac5982a11a8a841c0993"
+dependencies = [
+ "document-features",
+ "frost-core 3.0.0",
+ "frost-rerandomized 3.0.0",
+ "k256",
+ "rand_core 0.6.4",
+ "sha2",
+]
+
+[[package]]
 name = "frostito"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "blake2b_simd",
  "curve25519-dalek",
@@ -563,6 +577,7 @@ dependencies = [
  "frost-core 3.0.0",
  "frost-ristretto255",
  "frost-secp256k1",
+ "frost-secp256k1-tr",
  "generic-array",
  "hex",
  "hkdf",

@@ -257,16 +257,32 @@ use frost_core::{
 
 /// This crate's `u32` share index, from a ZF [`Identifier`].
 ///
-/// Identifiers are field elements; this crate indexes shares by `u32`. For the
-/// identifiers an implementation actually deals — small integers, canonically
-/// little-endian — the two agree, and anything that does not fit is refused
-/// rather than silently truncated to a different share.
+/// Identifiers are field elements; this crate indexes shares by `u32`.
+///
+/// # Endianness is the ciphersuite's, not ours
+///
+/// [`Identifier::serialize`] uses the ciphersuite's field encoding, and that
+/// differs between suites: ristretto255 serializes scalars little-endian,
+/// secp256k1 big-endian. So both orders are tried, and exactly one can
+/// succeed for the small integers an implementation actually deals — the
+/// other leaves nonzero bytes where a `u32` cannot reach. Anything that fits
+/// neither is refused rather than silently truncated to a different share.
 pub fn identifier_to_index<C: Cs>(id: &Identifier<C>) -> Result<u32, FrostitoError> {
-    let bytes = id.serialize();
-    if bytes.len() < 4 || bytes[4..].iter().any(|b| *b != 0) {
+    let b = id.serialize();
+    if b.len() < 4 {
         return Err(FrostitoError::InvalidIndex);
     }
-    let v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let little = b[4..].iter().all(|x| *x == 0);
+    let big = b[..b.len() - 4].iter().all(|x| *x == 0);
+
+    let v = match (little, big) {
+        (true, _) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        (false, true) => {
+            let t = &b[b.len() - 4..];
+            u32::from_be_bytes([t[0], t[1], t[2], t[3]])
+        }
+        (false, false) => return Err(FrostitoError::InvalidIndex),
+    };
     if v == 0 {
         return Err(FrostitoError::InvalidIndex);
     }

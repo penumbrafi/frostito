@@ -1,6 +1,6 @@
 [package]
 name = "frostito"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "nested FROST, hardened DKG, and proactive resharing, on ZF frost-core"
@@ -43,6 +43,8 @@ decaf377 = ["dep:decaf377"]
 # signing core.
 zf-ristretto255 = ["ristretto255", "dep:frost-ristretto255"]
 zf-secp256k1 = ["secp256k1", "dep:frost-secp256k1"]
+# BIP340/Taproot ciphersuite — what Bitcoin actually verifies.
+zf-secp256k1-tr = ["secp256k1", "dep:frost-secp256k1-tr"]
 
 [dependencies]
 # hashing
@@ -92,6 +94,7 @@ scale-info = { version = "2.11", default-features = false, features = ["derive"]
 frost-core = { version = "3", default-features = false, features = ["internals", "serialization"] }
 frost-ristretto255 = { version = "3", default-features = false, optional = true }
 frost-secp256k1 = { version = "3", default-features = false, optional = true }
+frost-secp256k1-tr = { version = "3", default-features = false, optional = true }
 
 [dev-dependencies]
 rand = "0.8"

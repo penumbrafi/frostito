@@ -1,5 +1,30 @@
 # changelog
 
+## [0.7.1] - 2026-09-23
+
+### fixed: the nested bridge was broken on secp256k1
+
+`zf::identifier_to_index` read `Identifier::serialize()` as little-endian.
+That encoding is the **ciphersuite's**, and it differs between suites:
+ristretto255 serializes scalars little-endian, secp256k1 big-endian. So
+`inner_params_from_zf` returned `InvalidIndex` for every secp256k1 identifier,
+and with it the whole nested v2 signing path on that backend. ristretto255 was
+unaffected, which is why the existing tests passed.
+
+Both orders are now tried; for the small integers an implementation deals,
+exactly one can succeed, and anything fitting neither is refused rather than
+truncated to a different share.
+
+### added
+
+- `zf-secp256k1-tr` — ZF's BIP340/Taproot ciphersuite. RFC 9591's registered
+  `FROST(secp256k1, SHA-256)` is *not* what Bitcoin verifies: different
+  challenge construction, 33-byte points, no even-Y rule. `frost-secp256k1-tr`
+  is, and its element and scalar types are the same `k256` ones, so the nested
+  bridge takes it unchanged.
+- `tests/zf_taproot.rs` — Taproot threshold signing end to end, and the nested
+  bridge under that suite. This is what caught the endianness bug.
+
 ## [0.7.0] - 2026-09-23
 
 ### the signing core is ZF frost-core
