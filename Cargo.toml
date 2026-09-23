@@ -10,6 +10,12 @@ readme = "README.md"
 keywords = ["threshold", "frost", "schnorr", "mpc", "reshare"]
 categories = ["cryptography", "no-std"]
 
+# docs.rs builds with default features only, which would hide `sealed`, the
+# ZF integration and three of the four backends. Show everything.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 default = ["std", "ristretto255"]
 std = [
