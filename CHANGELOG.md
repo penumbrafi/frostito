@@ -1,6 +1,6 @@
 # changelog
 
-## [Unreleased]
+## [0.7.0] - 2026-09-23
 
 ### the signing core is ZF frost-core
 

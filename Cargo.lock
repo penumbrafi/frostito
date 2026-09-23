@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "frostito"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "blake2b_simd",
  "curve25519-dalek",
