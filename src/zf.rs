@@ -7,6 +7,15 @@
 //! fourth — decaf377 — so every backend can be rooted in their implementation
 //! rather than ours.
 //!
+//! # `Decaf377Sha512` is not Penumbra's suite
+//!
+//! Penumbra spend authorization is `decaf377-rdsa`, and Penumbra already
+//! implements FROST over it as `decaf377-frost` (ciphersuite `Decaf377Rdsa`,
+//! BLAKE2b personalised `FROST-decaf377`, re-randomizable). Same curve, same
+//! basepoint — different hash and context string, so nothing signed here
+//! verifies there. Use `decaf377-frost` for Penumbra; this suite is for a
+//! decaf377 group that is not Penumbra's.
+//!
 //! # decaf377 is not a standardized ciphersuite
 //!
 //! RFC 9591 registers ristretto255, Ed25519, Ed448, P-256 and secp256k1.

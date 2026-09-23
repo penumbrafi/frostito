@@ -38,7 +38,7 @@ default build is `std` + `ristretto255`. everything else is off by default.
 | Zcash shielded (Orchard) | yes | `reddsa` RedPallas; reshare into ZF key packages is tested |
 | Zcash transparent | no | ECDSA. FROST is Schnorr-only |
 | Bitcoin pre-Taproot | no | ECDSA, same reason |
-| Penumbra (UM) | **no** | spend auth is `decaf377-rdsa`: BLAKE2b personalised `decaf377-rdsa---`, over a hashed basepoint, re-randomizable. `zf::Decaf377Sha512` is SHA-512 over decaf377's standard generator — a different scheme entirely. A Penumbra-compatible suite would follow `reddsa`'s pattern: rerandomized FROST over the spend-auth basepoint. It does not exist here yet |
+| Penumbra (UM) | **not yet** | Penumbra already ships this as `decaf377-frost` — ciphersuite `Decaf377Rdsa`, BLAKE2b personalised `FROST-decaf377` / `decaf377-rdsa---`, over decaf377's conventional basepoint, re-randomizable. It is on `frost-core` 0.7; this crate is on 3.0, and that is the only thing in the way. `zf::Decaf377Sha512` is **not** it — same curve and basepoint, different hash and context string, so nothing it signs verifies under Penumbra |
 
 ## curves
 
