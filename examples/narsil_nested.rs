@@ -18,11 +18,11 @@
 
 use std::collections::BTreeMap;
 
-use osst::curve::OsstPoint;
-use osst::dkg;
-use osst::frost;
-use osst::reshare::DealerCommitment;
-use osst::SecretShare;
+use frostito::curve::CurvePoint;
+use frostito::dkg;
+use frostito::frost;
+use frostito::reshare::DealerCommitment;
+use frostito::SecretShare;
 
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
@@ -135,7 +135,7 @@ fn main() {
 
     println!("  inner DKG #1 (a₃): {} holders, threshold {}", inner_n, inner_t);
     println!("  inner DKG #2 (b₃): {} holders, threshold {}", inner_n, inner_t);
-    println!("  g^a₃ = {}", &hex::encode(OsstPoint::compress(&a3_pubkey))[..16]);
+    println!("  g^a₃ = {}", &hex::encode(CurvePoint::compress(&a3_pubkey))[..16]);
     println!("  nobody knows a₃ or b₃\n");
 
     // ================================================================
@@ -158,7 +158,7 @@ fn main() {
     // Using inner holders 1,2,3 (any t=3 of 5)
     let active_for_eval = [0usize, 1, 2]; // holders 1,2,3
     let active_indices: Vec<u32> = active_for_eval.iter().map(|&i| (i + 1) as u32).collect();
-    let lagrange = osst::compute_lagrange_coefficients::<Scalar>(&active_indices).unwrap();
+    let lagrange = frostito::compute_lagrange_coefficients::<Scalar>(&active_indices).unwrap();
 
     // f₃(1) = a₃ + 1·b₃, reconstructed via Lagrange from inner shares
     let mut f3_at_1 = Scalar::ZERO;
@@ -225,8 +225,8 @@ fn main() {
 
     // Group public key: Y = g^{f₁(0)} · g^{f₂(0)} · g^{f₃(0)}
     // g^{f₁(0)} from buyer's commitment, g^{f₂(0)} from seller's, g^{f₃(0)} = g^{a₃}
-    let y1 = buyer_dealer.commitment().share_commitment().clone();
-    let y2 = seller_dealer.commitment().share_commitment().clone();
+    let y1 = *buyer_dealer.commitment().share_commitment();
+    let y2 = *seller_dealer.commitment().share_commitment();
     let y3 = a3_pubkey; // g^{a₃} = g^{f₃(0)}
     let group_key = y1.add(&y2).add(&y3);
 
@@ -242,30 +242,21 @@ fn main() {
     outer_vshares.insert(2, Point::generator().mul_scalar(seller_share.scalar()));
     outer_vshares.insert(3, y3_verify);
 
-    println!("  group key:     {}", &hex::encode(OsstPoint::compress(&group_key))[..32]);
-    println!("  buyer  Y₁:     {}", &hex::encode(OsstPoint::compress(&outer_vshares[&1]))[..32]);
-    println!("  seller Y₂:     {}", &hex::encode(OsstPoint::compress(&outer_vshares[&2]))[..32]);
-    println!("  escrow Y₃:     {}", &hex::encode(OsstPoint::compress(&y3_verify))[..32]);
+    println!("  group key:     {}", &hex::encode(CurvePoint::compress(&group_key))[..32]);
+    println!("  buyer  Y₁:     {}", &hex::encode(CurvePoint::compress(&outer_vshares[&1]))[..32]);
+    println!("  seller Y₂:     {}", &hex::encode(CurvePoint::compress(&outer_vshares[&2]))[..32]);
+    println!("  escrow Y₃:     {}", &hex::encode(CurvePoint::compress(&y3_verify))[..32]);
     println!("  s₃ status:     NEVER EXISTED\n");
 
     // ================================================================
     // PHASE 4: OSST authorization
     // ================================================================
 
-    println!("--- phase 4: OSST authorization ---");
+    println!("--- phase 4: the inner signing set ---");
 
-    let payload = b"authorize dispute tx:deadbeef";
-
-    // Holders 1, 3, 5 authorize
+    // Holders 1, 3, 5 take part.
     let osst_active = [0usize, 2, 4];
-    let contributions: Vec<osst::Contribution<Point>> = osst_active
-        .iter()
-        .map(|&i| escrow_shares[i].contribute(&mut rng, payload))
-        .collect();
-
-    let osst_ok = osst::verify(&y3_verify, &contributions, inner_t, payload).unwrap();
-    assert!(osst_ok, "OSST must verify");
-    println!("  ✓ OSST: 3-of-5 holders authorized (async, non-interactive)\n");
+    println!("  ✓ 3-of-5 inner holders selected\n");
 
     // ================================================================
     // PHASE 5: Nested FROST signing
@@ -287,7 +278,7 @@ fn main() {
     // 5a: inner holders generate nonces
     let inner_active = osst_active; // same holders who passed OSST
     let inner_active_indices: Vec<u32> = inner_active.iter().map(|&i| (i + 1) as u32).collect();
-    let inner_lagrange = osst::compute_lagrange_coefficients::<Scalar>(&inner_active_indices).unwrap();
+    let inner_lagrange = frostito::compute_lagrange_coefficients::<Scalar>(&inner_active_indices).unwrap();
 
     // Each holder generates nonce pair
     let mut inner_hiding_nonces: Vec<Scalar> = Vec::new();
@@ -358,7 +349,7 @@ fn main() {
     let group_commitment = outer_package.group_commitment(&group_key);
     let rho_3 = outer_package.binding_factor(3, &group_key);
     let challenge = outer_package.challenge(&group_commitment, &group_key);
-    let outer_lagrange = osst::compute_lagrange_coefficients::<Scalar>(&[1, 3]).unwrap();
+    let outer_lagrange = frostito::compute_lagrange_coefficients::<Scalar>(&[1, 3]).unwrap();
     let lambda_3 = outer_lagrange[1]; // λ₃ for index 3 in set {1, 3}
 
     // Each inner holder computes their piece

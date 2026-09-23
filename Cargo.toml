@@ -1,13 +1,13 @@
 [package]
-name = "osst"
-version = "0.5.1"
+name = "frostito"
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "frostito: nested FROST with OSST identification, DKG, and proactive resharing"
+description = "nested FROST, hardened DKG, and proactive resharing, on ZF frost-core"
 repository = "https://github.com/penumbrafi/frostito"
-documentation = "https://docs.rs/osst"
+documentation = "https://docs.rs/frostito"
 readme = "README.md"
-keywords = ["threshold", "cryptography", "schnorr", "mpc", "reshare"]
+keywords = ["threshold", "frost", "schnorr", "mpc", "reshare"]
 categories = ["cryptography", "no-std"]
 
 [features]
@@ -22,36 +22,20 @@ std = [
 # SubShare/Dealer API is unchanged beneath it.
 sealed = ["std", "dep:snow", "dep:x25519-dalek", "dep:hkdf"]
 
-# Plaintext sub-share serializers — DANGEROUS, off by default.
-#
-# `reshare::SubShare::{to_bytes, from_bytes}` put the secret Shamir scalar on
-# the wire in the clear; `t` of them reconstruct the group signing key. That is
-# finding D-1 of SECURITY-REVIEW-2026-09.md, rated Critical, and the whole
-# reason the `sealed` module exists. They were plain `pub fn`s through 0.4.x,
-# with nothing in the type system distinguishing them from the sealed path, and
-# a caller took them (M-25 / M-1 of REVIEW-2026-09-21-maintainer.md).
-#
-# They are now crate-private unless a caller names this feature in its own
-# Cargo.toml, and `#[deprecated]` when it does. The only sound use is feeding
-# `sealed::seal_subshare` — which does it internally without exposing the
-# bytes, so enabling this should not be necessary. Do not enable for new code.
-unsafe_plaintext = []
 
-# Nested FROST v1 — INSECURE, off by default.
-#
-# v1 pre-binds the inner nonces and hands the outer protocol a single point
-# with an identity binding commitment, which severs the outer binding coupling
-# and admits a ROS-style forgery (SECURITY-nested-frost.md §2, finding R-1 of
-# SECURITY-REVIEW-2026-09.md). It is retained ONLY so an existing deployment
-# can compile while it migrates to v2, and a caller has to say so in its own
-# Cargo.toml to reach it. Do not enable for new code.
-legacy-v1 = []
 
 # Curve backends
 ristretto255 = ["dep:curve25519-dalek"]
 pallas = ["dep:pasta_curves", "dep:blake2b_simd"]
 secp256k1 = ["dep:k256"]
 decaf377 = ["dep:decaf377"]
+# ZF frost-core integration. `zf` alone brings in the audited signing core;
+# the per-backend features add ZF's ciphersuite for that curve, except
+# decaf377, which RFC 9591 does not register and which `src/zf.rs` supplies.
+zf = ["dep:frost-core"]
+zf-ristretto255 = ["zf", "ristretto255", "dep:frost-ristretto255"]
+zf-secp256k1 = ["zf", "secp256k1", "dep:frost-secp256k1"]
+zf-decaf377 = ["zf", "decaf377"]
 
 [dependencies]
 # hashing
@@ -98,6 +82,9 @@ serde = { version = "1.0", default-features = false, features = ["derive", "allo
 # substrate compatibility
 codec = { version = "3.6", package = "parity-scale-codec", default-features = false, features = ["derive"], optional = true }
 scale-info = { version = "2.11", default-features = false, features = ["derive"], optional = true }
+frost-core = { version = "3", default-features = false, features = ["internals", "serialization"], optional = true }
+frost-ristretto255 = { version = "3", default-features = false, optional = true }
+frost-secp256k1 = { version = "3", default-features = false, optional = true }
 
 [dev-dependencies]
 rand = "0.8"

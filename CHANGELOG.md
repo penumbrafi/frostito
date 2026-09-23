@@ -1,5 +1,157 @@
 # changelog
 
+## [0.6.0] - 2026-09-23
+
+### pruned
+
+Dead and duplicated code removed.
+
+- **nested FROST v1** (`legacy-v1`, ~487 lines in `nested.rs`). Known-insecure,
+  off by default, retained only so an existing deployment could compile while
+  it migrated. The feature is gone.
+- **the plaintext sub-share serializers** (`unsafe_plaintext`, ~46 lines in
+  `reshare.rs`). `SubShare::{to_bytes, from_bytes}` put the secret Shamir
+  scalar on the wire; `sealed::seal_subshare` serializes internally, so there
+  was never a sound reason to enable them. The feature is gone.
+- **`src/redpallas.rs`** (415 lines). After the escrow layer moved out, what
+  remained was a RedPallas ciphersuite wrapping this crate's own FROST — which
+  is not RFC 9591. ZF's `reddsa` provides the audited equivalent and
+  `tests/reshare_zf_frost.rs` already uses it.
+- clippy is clean at `--all-features --all-targets`.
+
+`src/` drops from 11,502 lines to 10,548.
+
+### renamed: `osst` -> `frostito`
+
+The crate no longer contains the protocol it was named after, so the package
+takes the repository's name. Package `frostito`, `use frostito::...`.
+
+Identifiers follow: `OsstError` -> `Error`, `OsstPoint` -> `CurvePoint`,
+`OsstScalar` -> `CurveScalar`, `OsstCurve` -> `Curve`.
+
+**The wire domain tags change too**, from `b"osst/..."` to `b"frostito/..."` —
+`DKG_POK_DOMAIN`, `COMPLAINT_SIG_DOMAIN`, `COMMITMENT_DIGEST_DOMAIN`,
+`ECHO_DIGEST_DOMAIN`, the four `sealed` constants, `SIGNING_CONTEXT_DOMAIN`,
+`LIVENESS_SIG_DOMAIN` and `CONTRIBUTION_SIG_MSG_DOMAIN`. Every proof-of-
+knowledge, complaint signature, commitment digest, echo digest, sealed
+transcript, signing context and liveness signature therefore changes. This is
+deliberate — a rename that left the old tags on the wire would be worse — but
+it means a ceremony cannot span the two versions.
+
+`osst` 0.1.1 remains the only version ever published to crates.io and should
+be yanked; `frostito` starts here.
+
+`verify` rejects two contributions that carry the same Schnorr commitment.
+
+The OSST challenge `c_i = H(u_i || payload)` does not bind the contributor's
+index, so one nonce used across two indices over one payload gives
+`s_i - s_j = c(x_i - x_j)` and publishes the difference of the two shares.
+Unreachable by accident when a holder has one share; reachable when one process
+holds several, which is what a weighted deployment looks like once a weight-`w`
+validator is virtualized into `w` indices.
+
+Rejecting does not undo the leak — the contributions are already published — it
+refuses the aggregate and names the two indices. Binding the index into the
+challenge is the actual fix and is a signature break on every backend; it is
+not done here.
+
+### removed: OSST
+
+The OSST identification protocol is gone — `Contribution`, `verify`,
+`verify_incremental`, `compute_weights`, `hash_to_challenge`,
+`SecretShare::contribute`, `OsstProof`, `OsstBuilder`, the per-backend
+`*Contribution` aliases, and `src/types.rs`.
+
+Why, in the order it became clear:
+
+- **Nothing in the crate used it.** Only its own API wrappers and test code.
+  `osst::liveness` — the attestation niche it was supposed to serve — does not
+  touch it, and does attestation *with* attribution, which OSST cannot.
+- **The privacy claim was false.** `Contribution` carries a public `index`, and
+  verification needs those indices for the Lagrange weights, so the verifier
+  learns exactly which subset contributed. "Share-free" means the verifier does
+  not need the individual `y_i`; it never meant the signer set was hidden.
+- **FROST dominates it for signing.** 64 bytes against `t x 64`, a standard
+  verifier instead of one only this crate implements, identifiable abort
+  (RFC 9591 section 5.3), and the same `Y`-only verification.
+- **Plain Schnorr dominates it for consensus.** A closed validator set already
+  holds every `y_i`, which is precisely what OSST exists to avoid needing, so
+  it paid the no-attribution cost for a benefit that did not apply.
+- **It was upstream of the ciphersuite divergence.** OSST is why
+  `OsstCurve`/`OsstPoint` had to exist, which is what made writing a separate
+  FROST look cheap, which is how the non-standard context strings got there.
+
+`SecretShare`, `compute_lagrange_coefficients` and the curve traits stay — the
+DKG, reshare, nested and frost paths all use them.
+
+The DKG tests that used an OSST proof as their success condition now assert the
+property directly: any `t` dealt shares interpolate to the secret behind the
+group key.
+
+`src/lib.rs` drops from 1,092 lines to 179; the crate from 13,592 to 11,500.
+
+### rooting in ZF frost-core
+
+Steps toward replacing this crate's own signing math with ZF's audited
+`frost-core`, so what remains is only what is genuinely ours.
+
+- **`osst::zf`** (features `zf-decaf377` + `decaf377`) — `Decaf377Sha512`, a
+  `frost_core::Ciphersuite` for decaf377, with its `Field` and `Group` impls.
+  ZF ships ciphersuites for the other three backends
+  (`frost-ristretto255`, `frost-secp256k1`, `reddsa` for Pallas); decaf377 is
+  not an RFC 9591 registered suite, so this one is ours. It follows the
+  FROST(ristretto255, SHA-512) structure with its own context string, so a
+  signature under it cannot be reinterpreted under another suite.
+- `Decaf377Element`, a newtype over `decaf377::Element` supplying the `Eq`
+  that `frost_core::Group::Element` requires and decaf377 does not derive.
+- new optional features `zf`, `zf-ristretto255`, `zf-secp256k1`,
+  `zf-decaf377`, on `frost-core` 3.0 with `internals`.
+- `tests/zf_decaf377.rs` — trusted-dealer keygen, commit, sign, aggregate and
+  verify end to end inside `frost-core`; the full three-round DKG; and the two
+  seams this crate's hardening plugs into, since `round1::Package` and
+  `round2::Package` both serialize: an echo digest over the round-1 set, and
+  round-2 packages as bytes for `osst::sealed` to carry.
+
+- **`osst::frost` is not RFC 9591.** `tests/zf_differential.rs` drives this
+  crate and `frost-core` from one set of ristretto255 key material and one set
+  of nonces. The protocol structure matches — the challenge is `H(R || Y ||
+  msg)` exactly as §4.6 specifies — but the context strings are ours
+  (`"frost-challenge-v1"`, `"frost-binding-v2"`) rather than the registered
+  `"FROST-RISTRETTO255-SHA512-v1"` with `"chal"`/`"rho"`. So it is correct
+  FROST under a non-standard ciphersuite, and nothing outside this crate
+  verifies its signatures.
+
+  What that means for rooting the signing path in `frost-core`: it is a
+  **signature-breaking migration on every backend**, not a refactor. The test
+  pins both halves — key material is interchangeable (a share dealt here signs
+  and verifies under `frost-core`), signatures are not, and neither verifier
+  accepts the other's output.
+
+- `frost::Nonces::from_scalars`, gated on `test`/`zf`, so both implementations
+  can be driven from the same nonces. Not for deployments: [`commit`] samples.
+
+### moved out
+
+- the zk.poker escrow and jury-dispute layer leaves `osst::redpallas`
+  (1,592 -> 415 lines): `JuryNetwork`, `setup_escrow`, `jury_sign_share`,
+  `jury_sign_with_osst_consensus`, `nested_redpallas_sign`,
+  `derive_address_bytes`, the dispute state machine (`DisputeOpen`,
+  `JuryAccepted`, `PlayerDispute`, `JuryDispute`, `DisputeResolved`) and their
+  nine tests. Application logic, not threshold cryptography, and nothing in
+  this crate used it. Staged in `migration/zkpoker_escrow.rs` for zk.poker;
+  the RedPallas ciphersuite itself stays.
+
+### breaking
+
+- `osst::redpallas::zcash` no longer exports the escrow layer (see above).
+- new `OsstError::DuplicateCommitment(u32, u32)`. `OsstError` is not
+  `#[non_exhaustive]`, so an exhaustive match on it no longer compiles.
+
+### added
+
+- `tests/audit_shared_nonce.rs` — the leak as arithmetic, the rejection, and a
+  positive control with independent nonces.
+
 ## [0.5.1] - 2026-09-21
 
 Closes the last item on the 2026-09-21 maintainer review's block list (ii):
