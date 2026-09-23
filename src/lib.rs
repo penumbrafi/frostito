@@ -49,6 +49,7 @@ mod lagrange;
 pub mod liveness;
 pub mod nested;
 pub mod reshare;
+pub mod signer;
 pub mod zf;
 #[cfg(feature = "sealed")]
 pub mod sealed;

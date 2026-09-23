@@ -834,3 +834,83 @@ fn a_dishonest_inner_holder_is_named() {
     .expect_err("a tampered share must be rejected");
     assert_eq!(err, vec![2], "the cheating holder must be identified");
 }
+
+/// Spending and epoch-binding at once — which the free functions could not do.
+///
+/// `inner_sign_v2_spending` and `inner_sign_v2_with_context` each added one
+/// concern and there was no third function for both. A caller who wanted a
+/// durable spend record *and* an epoch-bound message had to write it, and the
+/// order is not obvious: spend first, or bind first? Get it wrong and you
+/// record a session you then refuse to sign, or sign one you never recorded.
+///
+/// As a stack the order is in the composition, and both hold.
+#[test]
+fn a_stack_composes_spending_and_epoch_binding() {
+    use frostito::nested::MemorySpentSessions;
+    use frostito::signer::{Bind, Holder, SignRequest, Signer, Spend, Stack};
+    use frostito::SigningContext;
+
+    let mut rng = OsRng;
+    let w = world(&mut rng);
+
+    let ctx = SigningContext::new(7, [0x5a; 32], b"release the escrow");
+    let bound = ctx.encode();
+
+    let mut nonces = Vec::new();
+    let mut commitments = Vec::new();
+    for &k in &w.quorum {
+        let (n, c) = inner_commit::<Point, _>(k, SESSION, &mut rng);
+        nonces.push(n);
+        commitments.push(c);
+    }
+    let pre = precommits(&commitments);
+    let (d, e) = aggregate_inner_commitment_pair::<Point>(&SESSION, &pre, &commitments).unwrap();
+
+    let (_, commits_1) = zf_commit(&mut rng);
+    let package = zf_package(&bound, vec![(1, commits_1), (2, zf_commitments(d, e))]);
+
+    let request = NestedSigningRequest {
+        package: &package,
+        nested_index: 2,
+        session_id: SESSION,
+        inner_precommits: &pre,
+        inner_commitments: &commitments,
+        active_indices: &w.quorum,
+        inner_threshold: 3,
+    };
+
+    let mut log = MemorySpentSessions::new();
+    let share = &w.inner_shares[0];
+    let key = vk(w.group_pubkey);
+
+    // Spend outermost, so the session is durable before any signing happens.
+    let mut signer = Stack::new(Holder::new(share, &key))
+        .layer(Bind::new(&ctx))
+        .layer(Spend::new(&mut log))
+        .into_inner();
+
+    let first = signer.sign(SignRequest {
+        nonces: nonces.remove(0),
+        // `Bind` replaces this with ctx.encode(), so a bare payload is fine.
+        approved_message: b"release the escrow",
+        nested: &request,
+    });
+    assert!(first.is_ok(), "the composed stack must sign: {first:?}");
+
+    // The epoch binding held: the package carries ctx.encode(), and
+    // `inner_sign_v2` refuses a package whose message is not what it signed.
+    assert_eq!(package.message(), bound.as_slice());
+
+    // And the spend record went in, so the same nonces cannot answer twice.
+    let (n2, _) = inner_commit::<Point, _>(w.quorum[0], SESSION, &mut rng);
+    let again = signer.sign(SignRequest {
+        nonces: n2,
+        approved_message: b"release the escrow",
+        nested: &request,
+    });
+    assert_eq!(
+        again.unwrap_err(),
+        frostito::Error::SessionSpent,
+        "the spend layer must refuse a second answer for the same session"
+    );
+}

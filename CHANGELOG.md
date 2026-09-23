@@ -1,5 +1,34 @@
 # changelog
 
+## [Unreleased]
+
+### composable signing: `frostito::signer`
+
+`inner_sign_v2`, `inner_sign_v2_spending` and `inner_sign_v2_with_context`
+were the same computation with one concern each and no way to have two at
+once. Three concerns is eight combinations; the crate shipped three, and a
+caller wanting a durable spend record *and* an epoch-bound message wrote it
+themselves — including deciding an ordering that is not obvious.
+
+So: one `Signer`, and `Layer`s that wrap it, in the shape `tower` uses.
+
+```rust
+let mut signer = Stack::new(Holder::new(&share, &verifying_key))
+    .layer(Bind::new(&ctx))
+    .layer(Spend::new(&mut log))
+    .into_inner();
+```
+
+Outermost runs first, as in `tower`: the session is recorded before any
+signing work begins. `tests/audit_nested_v2.rs` exercises the combination that
+had no function.
+
+Ciphersuite semantics are not layers. BIP340's parity normalisation is part of
+what signing means under Taproot, not a policy — and a layer can be left off,
+where leaving that one off gives silently invalid signatures.
+
+The free functions remain.
+
 ## [0.7.1] - 2026-09-23
 
 ### fixed: the nested bridge was broken on secp256k1
