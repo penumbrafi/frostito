@@ -655,7 +655,7 @@ impl<P: CurvePoint> DkgState<P> {
 
  /// Derive all verification shares for players 1..=num_participants.
  ///
- /// Returns a BTreeMap suitable for passing to [`crate::frost::aggregate`].
+ /// Returns a BTreeMap suitable for building a `frost_core::keys::PublicKeyPackage`.
  pub fn derive_all_verification_shares(
  &self,
  ) -> Result<alloc::collections::BTreeMap<u32, P>, Error> {

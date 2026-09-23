@@ -321,371 +321,14 @@ impl<S: CurveScalar> core::fmt::Debug for InnerSignatureShare<S> {
 #[cfg(all(test, feature = "ristretto255"))]
 mod tests {
  use super::*;
- use crate::frost;
  use curve25519_dalek::ristretto::RistrettoPoint;
  use curve25519_dalek::scalar::Scalar;
  use rand::rngs::OsRng;
 
  type Point = RistrettoPoint;
 
- const SESSION: [u8; 32] = [0xA5; 32];
 
- /// `from_outer` must reproduce, exactly, the derivation every call site
- /// was hand-rolling — otherwise inner shares silently fail to verify.
- #[test]
- fn from_outer_matches_the_hand_rolled_derivation() {
- let mut rng = OsRng;
- let msg = b"outer context derivation";
 
- let secret = <Scalar as CurveScalar>::random(&mut rng);
- let group_pubkey = <Point as CurvePoint>::generator().mul_scalar(&secret);
-
- let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).expect("index is 1-indexed by construction");
- let (_, commits_2) = frost::commit::<Point, _>(2, &mut rng).expect("index is 1-indexed by construction");
- let package =
- frost::SigningPackage::new(msg.to_vec(), vec![commits_1, commits_2]).unwrap();
-
- // hand-rolled, as jury.rs / escrow.rs do it today
- let rho_2 = package.binding_factor(2, &group_pubkey);
- let r_outer = package.group_commitment(&group_pubkey);
- let challenge = package.challenge(&r_outer, &group_pubkey);
- let indices = package.signer_indices();
- let outer_lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
- let pos_2 = indices.iter().position(|&i| i == 2).unwrap();
-
- let derived = InnerSigningParamsV2::from_outer::<Point>(&package, &group_pubkey, 2).unwrap();
-
- assert_eq!(derived.outer_binding, rho_2);
- assert_eq!(derived.outer_challenge, challenge);
- assert_eq!(derived.outer_lambda, outer_lagrange[pos_2]);
-
- // position 1 gets a different context, as it must
- let derived_1 =
- InnerSigningParamsV2::from_outer::<Point>(&package, &group_pubkey, 1).unwrap();
- assert_ne!(derived_1.outer_binding, derived.outer_binding);
- assert_ne!(derived_1.outer_lambda, derived.outer_lambda);
- // the challenge is a property of the session, not the position
- assert_eq!(derived_1.outer_challenge, derived.outer_challenge);
-
- // an index outside the outer signing set has no context at all
- assert!(matches!(
- InnerSigningParamsV2::from_outer::<Point>(&package, &group_pubkey, 7),
- Err(Error::InvalidIndex)
- ));
- }
-
- /// THE property that makes v2 reviewable: a nested position is
- /// indistinguishable from a flat FROST signer.
- ///
- /// We build a real outer 2-of-2 over positions {1, 2}. Position 2's key is
- /// split 3-of-5 among inner holders, and its nonce is the sum of the inner
- /// holders' nonces. We then produce the signature TWICE — once through the
- /// nested v2 path, once with position 2 as an ordinary signer holding the
- /// reconstructed scalar — and assert the signature shares and the final
- /// signatures are IDENTICAL, and that both verify.
- ///
- /// If this holds, security reduces to FROST's own proof: the outer
- /// protocol cannot tell a nested position from a flat one, so an adversary
- /// against the nested scheme is an adversary against FROST.
- #[test]
- fn nested_v2_equals_flat_frost() {
- let mut rng = OsRng;
- let msg = b"settlement: a=1000 b=0";
-
- // ── outer key: degree-1 polynomial ⇒ 2-of-2 over positions 1,2 ──────
- let secret = Scalar::random(&mut rng);
- let a1 = Scalar::random(&mut rng);
- let eval = |x: u32| {
- let x = <Scalar as CurveScalar>::from_u32(x);
- secret.add(&a1.mul(&x))
- };
- let sigma_1 = eval(1);
- let sigma_2 = eval(2); // the NESTED position's outer share
- let group_pubkey = <Point as CurvePoint>::generator().mul_scalar(&secret);
-
- let share_1 = SecretShare::new(1, sigma_1).expect("index is 1-indexed by construction");
- let share_2_flat = SecretShare::new(2, sigma_2).expect("index is 1-indexed by construction");
-
- // ── split position 2's key 3-of-5 among inner holders ──────────────
- let inner_t = 3u32;
- let inner_n = 5u32;
- let (inner_pieces, dealer_commitment) =
- split_evaluation_for_inner::<Point, _>(&sigma_2, inner_n, inner_t, &mut rng);
-
- // every holder verifies its piece against the Feldman commitment
- for (k, piece) in &inner_pieces {
- assert!(
- verify_split_piece::<Point>(&dealer_commitment, *k, piece),
- "inner piece {} failed Feldman verification",
- k
- );
- }
-
- let quorum: Vec<u32> = vec![1, 2, 3];
- let inner_shares: Vec<SecretShare<Scalar>> = quorum
- .iter()
- .map(|k| {
- let (_, piece) = inner_pieces.iter().find(|(i, _)| i == k).unwrap();
- SecretShare::new(*k, *piece).expect("index is 1-indexed by construction")
- })
- .collect();
-
- // sanity: the quorum reconstructs position 2's outer share
- {
- let lag = compute_lagrange_coefficients::<Scalar>(&quorum).unwrap();
- let mut recon = <Scalar as CurveScalar>::zero();
- for (i, s) in inner_shares.iter().enumerate() {
- recon = recon.add(&lag[i].mul(s.scalar()));
- }
- assert_eq!(recon, sigma_2, "inner quorum must reconstruct the outer share");
- }
-
- // ── inner round 0/1: commit–reveal ─────────────────────────────────
- let mut inner_nonces = Vec::new();
- let mut inner_commitments = Vec::new();
- let mut precommits = Vec::new();
- for &k in &quorum {
- let (n, c) = inner_commit::<Point, _>(k, SESSION, &mut rng);
- precommits.push(inner_precommit(&c));
- inner_nonces.push(n);
- inner_commitments.push(c);
- }
- for (pre, revealed) in precommits.iter().zip(inner_commitments.iter()) {
- assert!(verify_inner_precommit::<Point>(pre, revealed));
- }
- // a tampered reveal must be caught
- {
- let mut tampered = inner_commitments[0].clone();
- tampered.hiding = tampered.hiding.add(&<Point as CurvePoint>::generator());
- assert!(!verify_inner_precommit::<Point>(&precommits[0], &tampered));
- }
-
- // capture the aggregate nonce scalars so we can drive the FLAT signer
- // with the same randomness (this is test-only introspection)
- let d_sum = inner_nonces
- .iter()
- .fold(<Scalar as CurveScalar>::zero(), |acc, n| acc.add(&n.hiding));
- let e_sum = inner_nonces
- .iter()
- .fold(<Scalar as CurveScalar>::zero(), |acc, n| acc.add(&n.binding));
-
- // round 0: the commit-reveal precommitments the aggregate now verifies
- let inner_precommits: Vec<(u32, [u8; 32])> = inner_commitments
- .iter()
- .map(|c| (c.holder_index, inner_precommit::<Point>(c)))
- .collect();
- let (d_nested, e_nested) =
- aggregate_inner_commitment_pair::<Point>(&SESSION, &inner_precommits, &inner_commitments)
- .unwrap();
- assert_eq!(d_nested, <Point as CurvePoint>::generator().mul_scalar(&d_sum));
- assert_eq!(e_nested, <Point as CurvePoint>::generator().mul_scalar(&e_sum));
-
- // ── outer round: position 1 commits normally, position 2 uses the
- // aggregate PAIR (so the outer binding factor actually applies) ──
- let (nonces_1, commits_1) = frost::commit::<Point, _>(1, &mut rng).expect("index is 1-indexed by construction");
- let commits_2 = frost::SigningCommitments {
- index: 2,
- hiding: d_nested,
- binding: e_nested,
- };
- let package =
- frost::SigningPackage::new(msg.to_vec(), vec![commits_1, commits_2.clone()]).unwrap();
-
- // outer context — recomputable by any inner holder from public data
- let rho_2 = package.binding_factor(2, &group_pubkey);
- let r_outer = package.group_commitment(&group_pubkey);
- let challenge = package.challenge(&r_outer, &group_pubkey);
- let indices = package.signer_indices();
- let outer_lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
- let pos_2 = indices.iter().position(|&i| i == 2).unwrap();
- // A coordinator-supplied context is only accepted when it is the one
- // the holder recomputes for itself. Deprecated since 0.5.0 —
- // still exercised here because the legacy wire path still ships.
- #[allow(deprecated)]
- let params = InnerSigningParamsV2::from_coordinator_checked::<Point>(
- &rho_2,
- &challenge,
- &outer_lagrange[pos_2],
- &package,
- &group_pubkey,
- 2,
- )
- .unwrap();
- #[allow(deprecated)]
- let mismatched = InnerSigningParamsV2::from_coordinator_checked::<Point>(
- &rho_2,
- &Scalar::random(&mut rng),
- &outer_lagrange[pos_2],
- &package,
- &group_pubkey,
- 2,
- );
- assert!(matches!(mismatched, Err(Error::ChallengeMismatch)));
-
- let request = NestedSigningRequest {
- package: &package,
- nested_index: 2,
- session_id: SESSION,
- inner_precommits: &inner_precommits,
- inner_commitments: &inner_commitments,
- active_indices: &quorum,
- inner_threshold: 3,
- };
-
- // ── inner holders sign; every share is verified before aggregation ──
- let inner_lagrange = compute_lagrange_coefficients::<Scalar>(&quorum).unwrap();
- let public_shares: Vec<(u32, Point)> = inner_shares
- .iter()
- .map(|s| {
- (
- s.index,
- <Point as CurvePoint>::generator().mul_scalar(s.scalar()),
- )
- })
- .collect();
-
- let mut inner_sigs = Vec::new();
- for (n, share) in inner_nonces.into_iter().zip(inner_shares.iter()) {
- let sig = inner_sign_v2::<Point>(n, share, &group_pubkey, msg, &request).unwrap();
- let pos = quorum.iter().position(|&i| i == share.index).unwrap();
- let commitment = inner_commitments
- .iter()
- .find(|c| c.holder_index == share.index)
- .unwrap();
- let public = &public_shares
- .iter()
- .find(|(i, _)| *i == share.index)
- .unwrap()
- .1;
- assert!(
- verify_inner_share::<Point>(&sig, commitment, public, &params, &inner_lagrange[pos]),
- "holder {} produced an unverifiable share",
- share.index
- );
- inner_sigs.push(sig);
- }
-
- let z_nested = aggregate_inner_shares_verified::<Point>(
- &inner_sigs,
- &inner_commitments,
- &public_shares,
- &params,
- &quorum,
- )
- .expect("all inner shares must verify");
-
- // ── the equivalence: what a FLAT signer at position 2 would produce ──
- // z_flat = d + ρ·e + λ·c·σ₂
- let z_flat = d_sum
- .add(&rho_2.mul(&e_sum))
- .add(&params.outer_lambda.mul(&challenge).mul(&sigma_2));
- assert_eq!(
- z_nested, z_flat,
- "nested share must equal the flat FROST share bit-for-bit"
- );
-
- // ── and the assembled signature must verify ────────────────────────
- let sig_1 = frost::sign::<Point>(&package, nonces_1, &share_1, &group_pubkey).unwrap();
- let sig_2 = frost::SignatureShare {
- index: 2,
- response: z_nested,
- };
- let signature =
- frost::aggregate::<Point>(&package, &[sig_1, sig_2], &group_pubkey, None).unwrap();
- assert!(
- frost::verify_signature::<Point>(&group_pubkey, msg, &signature),
- "nested-produced signature must verify under the group key"
- );
-
- // silence unused warning for the flat share (kept for documentation)
- let _ = share_2_flat;
- }
-
- /// A dishonest inner holder is NAMED, not silently folded into a signature
- /// that then fails to verify with no attribution.
- #[test]
- fn v2_names_the_dishonest_inner_holder() {
- let mut rng = OsRng;
- let msg = b"m";
- let sigma_2 = Scalar::random(&mut rng);
- let quorum: Vec<u32> = vec![1, 2, 3];
- let (inner_pieces, _) = split_evaluation_for_inner::<Point, _>(&sigma_2, 5, 3, &mut rng);
- let inner_shares: Vec<SecretShare<Scalar>> = quorum
- .iter()
- .map(|k| {
- let (_, piece) = inner_pieces.iter().find(|(i, _)| i == k).unwrap();
- SecretShare::new(*k, *piece).expect("index is 1-indexed by construction")
- })
- .collect();
-
- let mut inner_nonces = Vec::new();
- let mut inner_commitments = Vec::new();
- for &k in &quorum {
- let (n, c) = inner_commit::<Point, _>(k, SESSION, &mut rng);
- inner_nonces.push(n);
- inner_commitments.push(c);
- }
- // round 0: the commit-reveal precommitments the aggregate now verifies
- let inner_precommits: Vec<(u32, [u8; 32])> = inner_commitments
- .iter()
- .map(|c| (c.holder_index, inner_precommit::<Point>(c)))
- .collect();
- let (d_nested, e_nested) =
- aggregate_inner_commitment_pair::<Point>(&SESSION, &inner_precommits, &inner_commitments)
- .unwrap();
- let group_pubkey = <Point as CurvePoint>::generator().mul_scalar(&sigma_2);
-
- let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).expect("index is 1-indexed by construction");
- let commits_2 = frost::SigningCommitments {
- index: 2,
- hiding: d_nested,
- binding: e_nested,
- };
- let package =
- frost::SigningPackage::new(msg.to_vec(), vec![commits_1, commits_2]).unwrap();
- let r_outer = package.group_commitment(&group_pubkey);
- let indices = package.signer_indices();
- let outer_lagrange = compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
- let pos_2 = indices.iter().position(|&i| i == 2).unwrap();
- let _ = (&r_outer, &outer_lagrange, pos_2);
- let params = InnerSigningParamsV2::from_outer::<Point>(&package, &group_pubkey, 2).unwrap();
- let request = NestedSigningRequest {
- package: &package,
- nested_index: 2,
- session_id: SESSION,
- inner_precommits: &inner_precommits,
- inner_commitments: &inner_commitments,
- active_indices: &quorum,
- inner_threshold: 3,
- };
-
- let public_shares: Vec<(u32, Point)> = inner_shares
- .iter()
- .map(|s| {
- (
- s.index,
- <Point as CurvePoint>::generator().mul_scalar(s.scalar()),
- )
- })
- .collect();
-
- let mut sigs = Vec::new();
- for (n, share) in inner_nonces.into_iter().zip(inner_shares.iter()) {
- sigs.push(inner_sign_v2::<Point>(n, share, &group_pubkey, msg, &request).unwrap());
- }
- // holder 2 goes rogue
- sigs[1].response = sigs[1].response.add(&<Scalar as CurveScalar>::one());
-
- let err = aggregate_inner_shares_verified::<Point>(
- &sigs,
- &inner_commitments,
- &public_shares,
- &params,
- &quorum,
- )
- .expect_err("a tampered share must be rejected");
- assert_eq!(err, vec![2], "the cheating holder must be identified");
- }
 
  #[test]
  fn test_interleaved_dkg() {
@@ -903,18 +546,31 @@ pub fn aggregate_inner_commitment_pair<P: CurvePoint>(
 /// [`Error::UnexpectedCommitment`] if the package's entry is not
 /// `(Σ D_k, Σ E_k)`; the errors of [`aggregate_inner_commitment_pair`]
 /// otherwise.
-pub fn verify_nested_commitment<P: CurvePoint>(
- package: &crate::frost::SigningPackage<P>,
+pub fn verify_nested_commitment<C>(
+ package: &frost_core::SigningPackage<C>,
  nested_index: u32,
  session_id: &[u8; 32],
  precommits: &[(u32, [u8; 32])],
- inner_commitments: &[InnerCommitments<P>],
-) -> Result<(), Error> {
+ inner_commitments: &[InnerCommitments<frost_core::Element<C>>],
+) -> Result<(), Error>
+where
+ C: frost_core::Ciphersuite,
+ frost_core::Element<C>: CurvePoint<Scalar = frost_core::Scalar<C>>,
+ frost_core::Scalar<C>: CurveScalar,
+{
+ let id: frost_core::Identifier<C> = u16::try_from(nested_index)
+ .map_err(|_| Error::InvalidIndex)?
+ .try_into()
+ .map_err(|_| Error::InvalidIndex)?;
  let entry = package
- .get_commitments(nested_index)
+ .signing_commitment(&id)
  .ok_or(Error::InvalidIndex)?;
- let (d, e) = aggregate_inner_commitment_pair::<P>(session_id, precommits, inner_commitments)?;
- if entry.hiding != d || entry.binding != e {
+ let (d, e) = aggregate_inner_commitment_pair::<frost_core::Element<C>>(
+ session_id,
+ precommits,
+ inner_commitments,
+ )?;
+ if entry.hiding().value() != d || entry.binding().value() != e {
  return Err(Error::UnexpectedCommitment);
  }
  Ok(())
@@ -938,7 +594,6 @@ pub fn verify_nested_commitment<P: CurvePoint>(
 /// - **`group_pubkey` — removed.** It used to live here, and a coordinator
 ///   that substituted `Y'` got a package that passed every self-consistency
 ///   check, including
-///   [`from_coordinator_checked`](InnerSigningParamsV2::from_coordinator_checked),
 ///   because everything was recomputed *using the supplied `Y`*. The holder
 ///   then signed the approved message under an attacker-chosen challenge.
 ///   That is not a forgery — the result verifies under nothing — but it is
@@ -958,9 +613,13 @@ pub fn verify_nested_commitment<P: CurvePoint>(
 /// state inside [`inner_sign_v2`]: the message against the holder's approved
 /// bytes, the session against its nonces, and the commitment set against its
 /// own round-1 commitment and the package's nested entry.
-pub struct NestedSigningRequest<'a, P: CurvePoint> {
+pub struct NestedSigningRequest<'a, C>
+where
+ C: frost_core::Ciphersuite,
+ frost_core::Element<C>: CurvePoint,
+{
  /// The outer signing package (carries the message and the FULL commitment list).
- pub package: &'a crate::frost::SigningPackage<P>,
+ pub package: &'a frost_core::SigningPackage<C>,
  /// The nested position's index in the OUTER signing set.
  ///
  /// Caller-anchored: see the type documentation.
@@ -974,7 +633,7 @@ pub struct NestedSigningRequest<'a, P: CurvePoint> {
  /// the inner group's own round 0, not from the coordinator.
  pub inner_precommits: &'a [(u32, [u8; 32])],
  /// The revealed inner commitment set from round 1.
- pub inner_commitments: &'a [InnerCommitments<P>],
+ pub inner_commitments: &'a [InnerCommitments<frost_core::Element<C>>],
  /// The inner quorum actually signing.
  ///
  /// Caller-anchored: see the type documentation. Validated against
@@ -993,11 +652,10 @@ pub struct NestedSigningRequest<'a, P: CurvePoint> {
 
 /// Outer context for v2 signing.
 ///
-/// The fields are private and [`InnerSigningParamsV2::from_outer`] is the only
+/// The fields are private and [`crate::zf::inner_params_from_zf`] is the only
 /// way to obtain them from public data: a coordinator cannot hand an inner
 /// holder a challenge, because the type cannot be built out of scalars. Where
 /// a coordinator distributes them anyway (a legacy wire format, say), they
-/// must be checked with [`InnerSigningParamsV2::from_coordinator_checked`],
 /// which recomputes and rejects a mismatch.
 #[derive(Clone)]
 pub struct InnerSigningParamsV2<S: CurveScalar> {
@@ -1011,7 +669,7 @@ pub struct InnerSigningParamsV2<S: CurveScalar> {
 
 impl<S: CurveScalar> InnerSigningParamsV2<S> {
  /// Build from an outer context derived somewhere other than
- /// [`from_outer`](Self::from_outer).
+ /// [`from_parts`](Self::from_parts).
  ///
  /// The three values must be the holder's own derivation from the outer
  /// signing package, never a coordinator's assertion — that is the whole
@@ -1043,86 +701,7 @@ impl<S: CurveScalar> InnerSigningParamsV2<S> {
  &self.outer_lambda
  }
 
- /// Derive the nested position's outer context from public data alone.
- ///
- /// This is the constructor every inner holder uses — through
- /// [`inner_sign_v2`], which calls it internally. All three fields come out
- /// of the outer [`SigningPackage`](crate::frost::SigningPackage) and the
- /// group public key, both of which the holder already has.
- ///
- /// `nested_index` is the nested position's index in the OUTER signing set.
- ///
- /// # Errors
- ///
- /// [`Error::InvalidIndex`] if `nested_index` is not one of the outer
- /// package's signers.
- pub fn from_outer<P: CurvePoint<Scalar = S>>(
- package: &crate::frost::SigningPackage<P>,
- group_pubkey: &P,
- nested_index: u32,
- ) -> Result<Self, Error> {
- let indices = package.signer_indices();
- let pos = indices
- .iter()
- .position(|&i| i == nested_index)
- .ok_or(Error::InvalidIndex)?;
- let lagrange = compute_lagrange_coefficients::<S>(&indices)?;
- let group_commitment = package.group_commitment(group_pubkey);
 
- Ok(Self {
- outer_binding: package.binding_factor(nested_index, group_pubkey),
- outer_challenge: package.challenge(&group_commitment, group_pubkey),
- outer_lambda: lagrange[pos].clone(),
- })
- }
-
- /// Accept a coordinator-supplied outer context ONLY if it is the one the
- /// holder recomputes from the package itself.
- ///
- /// # Deprecated: this validates self-consistency, not provenance
- ///
- /// It does what it says, and it is correctly documented as the
- /// legacy-wire-format escape hatch — but it *reads* like the blessed way
- /// to accept coordinator input, and a caller who stops reading at the name
- /// is protected against nothing. Everything here is recomputed against the
- /// **supplied** `package` and `group_pubkey`, so a coordinator that
- /// substitutes either gets a self-consistent triple that passes. narsild
- /// made exactly this mistake: it called this function correctly and
- /// still signed under an attacker-supplied `Y`.
- ///
- /// Prefer [`from_outer`](Self::from_outer), and take `group_pubkey` from
- /// your own key package rather than from the request. Where a legacy wire
- /// format distributes the three scalars anyway, this still recomputes and
- /// still rejects a mismatch — just do not read it as an authenticity
- /// check.
- ///
- /// # Errors
- ///
- /// [`Error::ChallengeMismatch`] if any of the three scalars differs
- /// from the locally derived value.
- #[deprecated(
- since = "0.5.0",
- note = "validates self-consistency, not the provenance of `package` or `group_pubkey`: \
- a substituted group key passes. Prefer `from_outer`, with `group_pubkey` taken \
- from the signer's own key package."
- )]
- pub fn from_coordinator_checked<P: CurvePoint<Scalar = S>>(
- supplied_binding: &S,
- supplied_challenge: &S,
- supplied_lambda: &S,
- package: &crate::frost::SigningPackage<P>,
- group_pubkey: &P,
- nested_index: u32,
- ) -> Result<Self, Error> {
- let local = Self::from_outer::<P>(package, group_pubkey, nested_index)?;
- if &local.outer_binding != supplied_binding
- || &local.outer_challenge != supplied_challenge
- || &local.outer_lambda != supplied_lambda
- {
- return Err(Error::ChallengeMismatch);
- }
- Ok(local)
- }
 }
 
 /// Inner holder's partial signature under v2.
@@ -1180,13 +759,18 @@ impl<S: CurveScalar> InnerSigningParamsV2<S> {
 /// [`Error::MessageMismatch`], [`Error::UnexpectedCommitment`],
 /// [`Error::SessionMismatch`], [`Error::InvalidIndex`],
 /// [`Error::DuplicateIndex`].
-pub fn inner_sign_v2<P: CurvePoint>(
- nonces: InnerNonces<P::Scalar>,
- share: &SecretShare<P::Scalar>,
- local_group_pubkey: &P,
+pub fn inner_sign_v2<C>(
+ nonces: InnerNonces<frost_core::Scalar<C>>,
+ share: &SecretShare<frost_core::Scalar<C>>,
+ local_group_pubkey: &frost_core::VerifyingKey<C>,
  approved_message: &[u8],
- request: &NestedSigningRequest<'_, P>,
-) -> Result<InnerSignatureShare<P::Scalar>, Error> {
+ request: &NestedSigningRequest<'_, C>,
+) -> Result<InnerSignatureShare<frost_core::Scalar<C>>, Error>
+where
+ C: frost_core::Ciphersuite,
+ frost_core::Element<C>: CurvePoint<Scalar = frost_core::Scalar<C>>,
+ frost_core::Scalar<C>: CurveScalar,
+{
  // the holder signs a message it holds, not one a coordinator asserts.
  if request.package.message() != approved_message {
  return Err(Error::MessageMismatch);
@@ -1236,14 +820,14 @@ pub fn inner_sign_v2<P: CurvePoint>(
  .find(|c| c.holder_index == nonces.holder_index)
  .ok_or(Error::UnexpectedCommitment)?;
  if mine.session_id != request.session_id
- || mine.hiding != P::generator().mul_scalar(&nonces.hiding)
- || mine.binding != P::generator().mul_scalar(&nonces.binding)
+ || mine.hiding != <frost_core::Element<C> as CurvePoint>::generator().mul_scalar(&nonces.hiding)
+ || mine.binding != <frost_core::Element<C> as CurvePoint>::generator().mul_scalar(&nonces.binding)
  {
  return Err(Error::UnexpectedCommitment);
  }
 
  // the nested position's outer commitment is this round's aggregate.
- verify_nested_commitment::<P>(
+ verify_nested_commitment::<C>(
  request.package,
  request.nested_index,
  &request.session_id,
@@ -1252,13 +836,13 @@ pub fn inner_sign_v2<P: CurvePoint>(
  )?;
 
  // Outer context, recomputed locally from the package.
- let params = InnerSigningParamsV2::from_outer::<P>(
+ let params = crate::zf::inner_params_from_zf::<C>(
  request.package,
  local_group_pubkey,
  request.nested_index,
  )?;
 
- let lagrange = compute_lagrange_coefficients::<P::Scalar>(request.active_indices)?;
+ let lagrange = compute_lagrange_coefficients::<frost_core::Scalar<C>>(request.active_indices)?;
  let my_pos = request
  .active_indices
  .iter()
@@ -1412,16 +996,21 @@ impl SpentSessions for MemorySpentSessions {
 /// whatever the store says happened before the process started; anything
 /// [`SpentSessions::spend`] returns for a write failure; and every error of
 /// [`inner_sign_v2`].
-pub fn inner_sign_v2_spending<P: CurvePoint, S: SpentSessions + ?Sized>(
+pub fn inner_sign_v2_spending<C, S: SpentSessions + ?Sized>(
  store: &mut S,
- nonces: InnerNonces<P::Scalar>,
- share: &SecretShare<P::Scalar>,
- local_group_pubkey: &P,
+ nonces: InnerNonces<frost_core::Scalar<C>>,
+ share: &SecretShare<frost_core::Scalar<C>>,
+ local_group_pubkey: &frost_core::VerifyingKey<C>,
  approved_message: &[u8],
- request: &NestedSigningRequest<'_, P>,
-) -> Result<InnerSignatureShare<P::Scalar>, Error> {
+ request: &NestedSigningRequest<'_, C>,
+) -> Result<InnerSignatureShare<frost_core::Scalar<C>>, Error>
+where
+ C: frost_core::Ciphersuite,
+ frost_core::Element<C>: CurvePoint<Scalar = frost_core::Scalar<C>>,
+ frost_core::Scalar<C>: CurveScalar,
+{
  store.spend(&nonces.session_id, nonces.holder_index)?;
- inner_sign_v2::<P>(
+ inner_sign_v2::<C>(
  nonces,
  share,
  local_group_pubkey,
@@ -1437,14 +1026,19 @@ pub fn inner_sign_v2_spending<P: CurvePoint, S: SpentSessions + ?Sized>(
 /// returns [`Error::MessageMismatch`]. This is the form to prefer: it
 /// makes the epoch and manifest the holder approved part of the bytes that get
 /// signed, instead of leaving them to a convention.
-pub fn inner_sign_v2_with_context<P: CurvePoint>(
- nonces: InnerNonces<P::Scalar>,
- share: &SecretShare<P::Scalar>,
- local_group_pubkey: &P,
+pub fn inner_sign_v2_with_context<C>(
+ nonces: InnerNonces<frost_core::Scalar<C>>,
+ share: &SecretShare<frost_core::Scalar<C>>,
+ local_group_pubkey: &frost_core::VerifyingKey<C>,
  ctx: &crate::SigningContext<'_>,
- request: &NestedSigningRequest<'_, P>,
-) -> Result<InnerSignatureShare<P::Scalar>, Error> {
- inner_sign_v2::<P>(nonces, share, local_group_pubkey, &ctx.encode(), request)
+ request: &NestedSigningRequest<'_, C>,
+) -> Result<InnerSignatureShare<frost_core::Scalar<C>>, Error>
+where
+ C: frost_core::Ciphersuite,
+ frost_core::Element<C>: CurvePoint<Scalar = frost_core::Scalar<C>>,
+ frost_core::Scalar<C>: CurveScalar,
+{
+ inner_sign_v2::<C>(nonces, share, local_group_pubkey, &ctx.encode(), request)
 }
 
 /// Verify one inner holder's share before it is aggregated:

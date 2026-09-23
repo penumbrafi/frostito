@@ -38,10 +38,11 @@ decaf377 = ["dep:decaf377"]
 # ZF frost-core integration. `zf` alone brings in the audited signing core;
 # the per-backend features add ZF's ciphersuite for that curve, except
 # decaf377, which RFC 9591 does not register and which `src/zf.rs` supplies.
-zf = ["dep:frost-core"]
-zf-ristretto255 = ["zf", "ristretto255", "dep:frost-ristretto255"]
-zf-secp256k1 = ["zf", "secp256k1", "dep:frost-secp256k1"]
-zf-decaf377 = ["zf", "decaf377"]
+# ZF's ciphersuite crate for a backend, for tests and for callers that want
+# the registered suite by name. `frost-core` itself is not optional: it is the
+# signing core.
+zf-ristretto255 = ["ristretto255", "dep:frost-ristretto255"]
+zf-secp256k1 = ["secp256k1", "dep:frost-secp256k1"]
 
 [dependencies]
 # hashing
@@ -88,7 +89,7 @@ serde = { version = "1.0", default-features = false, features = ["derive", "allo
 # substrate compatibility
 codec = { version = "3.6", package = "parity-scale-codec", default-features = false, features = ["derive"], optional = true }
 scale-info = { version = "2.11", default-features = false, features = ["derive"], optional = true }
-frost-core = { version = "3", default-features = false, features = ["internals", "serialization"], optional = true }
+frost-core = { version = "3", default-features = false, features = ["internals", "serialization"] }
 frost-ristretto255 = { version = "3", default-features = false, optional = true }
 frost-secp256k1 = { version = "3", default-features = false, optional = true }
 
@@ -103,14 +104,7 @@ rand_core_10 = { package = "rand_core", version = "0.10", default-features = fal
 # end-to-end: ZF FROST(Pallas) DKG -> osst reshare -> ZF FROST signing
 reddsa = { git = "https://github.com/ZcashFoundation/reddsa.git", rev = "475a552", features = ["frost"] }
 
-# The narsil examples are ristretto255 walkthroughs.
-[[example]]
-name = "narsil_escrow"
-required-features = ["ristretto255"]
 
-[[example]]
-name = "narsil_nested"
-required-features = ["ristretto255"]
 
 # The ZF FROST cross-test needs the Orchard spend-auth (pallas) backend.
 [[test]]

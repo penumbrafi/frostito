@@ -2,7 +2,7 @@
 //!
 //! A [`SigningContext`] is the thing a threshold group actually signs over.
 //! Instead of handing the raw application message to
-//! [`frost::SigningPackage`](crate::frost::SigningPackage), every signer binds
+//! `frost_core::SigningPackage`, every signer binds
 //! it to
 //!
 //! - the **epoch** the group's shares belong to, and
@@ -207,54 +207,54 @@ mod tests {
 
 // The end-to-end property the type exists for: a signature produced by an
 // epoch-n quorum does not verify as an epoch-n+1 authorization.
-#[cfg(all(test, feature = "ristretto255", feature = "std"))]
+#[cfg(all(test, feature = "zf-ristretto255", feature = "std"))]
 mod frost_tests {
  use super::*;
- use crate::frost::{self, Signature, SigningPackage};
- use crate::{CurvePoint, CurveScalar, SecretShare};
- use alloc::vec::Vec;
- use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
+ use alloc::collections::BTreeMap;
+ use frost_core::{
+ aggregate,
+ keys::{self, IdentifierList, KeyPackage},
+ round1, round2, Signature, SigningPackage,
+ };
+ use frost_ristretto255::Ristretto255Sha512 as C;
+ use frost_core::VerifyingKey;
 
- /// Deal a 2-of-3 sharing and sign `message` with signers 1 and 2.
- fn sign_2_of_3(message: &[u8]) -> (RistrettoPoint, Signature<RistrettoPoint>) {
+ /// Deal a 2-of-3 group and sign `message` with two of them, through
+ /// `frost-core`.
+ fn sign_2_of_3(message: &[u8]) -> (VerifyingKey<C>, Signature<C>) {
  use rand::rngs::OsRng;
  let mut rng = OsRng;
 
- // Shamir polynomial f(x) = secret + a1·x, threshold 2.
- let secret = <Scalar as CurveScalar>::random(&mut rng);
- let a1 = <Scalar as CurveScalar>::random(&mut rng);
- let eval = |x: u32| {
- let xs = <Scalar as CurveScalar>::from_u32(x);
- secret.add(&a1.mul(&xs))
- };
- let group_pubkey = RistrettoPoint::generator().mul_scalar(&secret);
+ let (shares, pubkeys) =
+ keys::generate_with_dealer::<C, _>(3, 2, IdentifierList::Default, &mut rng)
+ .expect("dealer keygen");
+ let packages: BTreeMap<_, _> = shares
+ .into_iter()
+ .map(|(id, s)| (id, KeyPackage::try_from(s).expect("key package")))
+ .collect();
 
- let active: [u32; 2] = [1, 2];
-
- // Round 1.
- let mut nonces = Vec::new();
- let mut commitments = Vec::new();
- for &i in &active {
- let (n, c) = frost::commit::<RistrettoPoint, _>(i, &mut rng).expect("index is 1-indexed by construction");
- nonces.push((i, n));
- commitments.push(c);
+ let signers: Vec<_> = packages.keys().copied().take(2).collect();
+ let mut nonces = BTreeMap::new();
+ let mut commitments = BTreeMap::new();
+ for id in &signers {
+ let (n, c) = round1::commit(packages[id].signing_share(), &mut rng);
+ nonces.insert(*id, n);
+ commitments.insert(*id, c);
  }
 
- // Round 2 — every signer independently builds the package over the
- // same context bytes.
- let package =
- SigningPackage::<RistrettoPoint>::new(message.to_vec(), commitments).unwrap();
+ let package = SigningPackage::new(commitments, message);
+ let sig_shares: BTreeMap<_, _> = signers
+ .iter()
+ .map(|id| {
+ (
+ *id,
+ round2::sign(&package, &nonces[id], &packages[id]).expect("sign"),
+ )
+ })
+ .collect();
 
- let mut sig_shares = Vec::new();
- for (i, n) in nonces {
- let share = SecretShare::new(i, eval(i)).expect("index is 1-indexed by construction");
- sig_shares
- .push(frost::sign::<RistrettoPoint>(&package, n, &share, &group_pubkey).unwrap());
- }
-
- let sig =
- frost::aggregate::<RistrettoPoint>(&package, &sig_shares, &group_pubkey, None).unwrap();
- (group_pubkey, sig)
+ let sig = aggregate(&package, &sig_shares, &pubkeys).expect("aggregate");
+ (*pubkeys.verifying_key(), sig)
  }
 
  #[test]
@@ -266,19 +266,19 @@ mod frost_tests {
  let (pubkey, sig) = sign_2_of_3(&epoch_7);
 
  // Verifies as what it is: an epoch-7 authorization.
- assert!(frost::verify_signature::<RistrettoPoint>(&pubkey, &epoch_7, &sig));
+ assert!(pubkey.verify(&epoch_7, &sig).is_ok());
 
  // After a key-preserving reshare to epoch 8 the group key is unchanged,
  // so this signature is still a valid signature *under that key* — but
  // it is not a valid epoch-8 authorization, which is the point.
  let epoch_8 = SigningContext::new(8, manifest, msg).encode();
- assert!(!frost::verify_signature::<RistrettoPoint>(&pubkey, &epoch_8, &sig));
+ assert!(pubkey.verify(&epoch_8, &sig).is_err());
 
  // Swapping the manifest underneath it fails the same way.
  let other_manifest = SigningContext::new(7, [0x5b; 32], msg).encode();
- assert!(!frost::verify_signature::<RistrettoPoint>(&pubkey, &other_manifest, &sig));
+ assert!(pubkey.verify(&other_manifest, &sig).is_err());
 
  // And the raw message, unbound, is not what was signed at all.
- assert!(!frost::verify_signature::<RistrettoPoint>(&pubkey, msg, &sig));
+ assert!(pubkey.verify(msg, &sig).is_err());
  }
 }

@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### the signing core is ZF frost-core
+
+`src/frost.rs` is gone — 1,166 lines of FROST implementation replaced by
+`frost-core`, which implements RFC 9591 and has been audited. `frost-core` is
+no longer optional; it is the signing core.
+
+**Every signature this crate produces changes.** The old implementation was
+structurally correct FROST under context strings of our own
+(`"frost-challenge-v1"`, `"frost-binding-v2"`) rather than the registered
+ones, so it was a ciphersuite nobody else implemented. Signatures are now
+ordinary RFC 9591 FROST and any conforming verifier accepts them. Keys are
+unaffected.
+
+- `nested`'s v2 signing path takes a `frost_core::SigningPackage` and a
+  `VerifyingKey`: `inner_sign_v2`, `inner_sign_v2_spending`,
+  `inner_sign_v2_with_context`, `verify_nested_commitment` and
+  `NestedSigningRequest` are now generic over `C: Ciphersuite`.
+- `InnerSigningParamsV2::from_outer` and `from_coordinator_checked` are
+  removed; `zf::inner_params_from_zf` replaces the first and the second was
+  already deprecated.
+- `frost::{Nonces, SigningCommitments, SigningPackage, SignatureShare,
+  Signature, commit, sign, aggregate, verify_signature}` are gone. Use
+  `frost_core::{round1, round2, aggregate}` and its types.
+- `zf-decaf377` and `zf` are gone as features. `zf-ristretto255` and
+  `zf-secp256k1` remain, pulling ZF's ciphersuite crate for that backend;
+  `zf::Decaf377Sha512` now needs only `decaf377`.
+- removed with the code they exercised: `tests/audit_frost_core.rs`, the
+  `from_coordinator_checked` tests, and the two `narsil_*` examples, whose
+  escrow application moved out in 0.6.0. `tests/audit_nested_v2.rs` and
+  `tests/zf_nested_equivalence.rs` cover the nested flow against `frost-core`
+  and CI runs both.
+
+`src/` drops from 10,551 lines to 9,103.
+
 ### nested FROST can sit inside a real RFC 9591 group
 
 `zf::inner_params_from_zf` recomputes an inner holder's outer context — the

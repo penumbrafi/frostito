@@ -6,7 +6,7 @@
 //! commit, sign, aggregate, verify — entirely inside `frost-core`, with this
 //! crate supplying only the ciphersuite.
 
-#![cfg(all(feature = "zf-decaf377", feature = "decaf377"))]
+#![cfg(feature = "decaf377")]
 
 use std::collections::BTreeMap;
 

@@ -7,14 +7,20 @@
 //! tests and none of them is ignored. The attack each one performs is
 //! unchanged — only the expected outcome is.
 
-#![cfg(all(feature = "ristretto255", feature = "std"))]
+#![cfg(all(feature = "zf-ristretto255", feature = "std"))]
 
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use frostito::curve::{CurvePoint, CurveScalar};
-use frostito::frost::{self, SigningCommitments};
+use frost_core::{
+ keys::{KeyPackage, PublicKeyPackage, SigningShare, VerifyingShare},
+ round1::{Nonce, NonceCommitment, SigningCommitments, SigningNonces},
+ round2, Identifier, SigningPackage, VerifyingKey,
+};
+use frost_ristretto255::Ristretto255Sha512 as C;
+use std::collections::BTreeMap;
 use frostito::nested::{
  aggregate_inner_commitment_pair, aggregate_inner_shares_verified, inner_commit,
- inner_precommit, inner_sign_v2, InnerCommitments, InnerSigningParamsV2,
+ inner_precommit, inner_sign_v2, InnerCommitments,
  NestedSigningRequest,
 };
 use frostito::{compute_lagrange_coefficients, Error, SecretShare};
@@ -23,6 +29,52 @@ use rand::rngs::OsRng;
 type Point = RistrettoPoint;
 
 const SESSION: [u8; 32] = [0x5Au8; 32];
+
+// ── ZF adapters ─────────────────────────────────────────────────────────────
+// The outer round runs on `frost-core`; these keep the tests reading the way
+// they did when it ran on this crate's own FROST.
+
+fn id(i: u32) -> Identifier<C> {
+ (i as u16).try_into().unwrap()
+}
+
+fn vk(p: Point) -> VerifyingKey<C> {
+ VerifyingKey::new(p)
+}
+
+/// Round 1 for an outer signer: sample nonces, return them with their
+/// commitments, as `frost::commit` used to.
+fn zf_commit(rng: &mut OsRng) -> (SigningNonces<C>, SigningCommitments<C>) {
+ let h = <Scalar as CurveScalar>::random(rng);
+ let b = <Scalar as CurveScalar>::random(rng);
+ let n = SigningNonces::from_nonces(Nonce::<C>::from_scalar(h), Nonce::<C>::from_scalar(b));
+ let c = *n.commitments();
+ (n, c)
+}
+
+/// A commitment pair built from points the caller already holds — how the
+/// nested position enters the outer round.
+fn zf_commitments(hiding: Point, binding: Point) -> SigningCommitments<C> {
+ SigningCommitments::new(NonceCommitment::new(hiding), NonceCommitment::new(binding))
+}
+
+/// An outer signing package over `msg` for the given `(index, commitments)`.
+fn zf_package(msg: &[u8], entries: Vec<(u32, SigningCommitments<C>)>) -> SigningPackage<C> {
+ SigningPackage::new(entries.into_iter().map(|(i, c)| (id(i), c)).collect(), msg)
+}
+
+/// A key package for an ordinary outer signer.
+fn zf_key_package(index: u32, share: &SecretShare<Scalar>, group: Point, t: u16) -> KeyPackage<C> {
+ KeyPackage::new(
+ id(index),
+ SigningShare::new(*share.scalar()),
+ VerifyingShare::new(<Point as CurvePoint>::generator().mul_scalar(share.scalar())),
+ vk(group),
+ t,
+ )
+}
+
+
 
 /// Shamir-split `secret` into `n` shares with threshold `t`.
 fn split(secret: &Scalar, n: u32, t: u32, rng: &mut OsRng) -> Vec<SecretShare<Scalar>> {
@@ -53,6 +105,8 @@ struct World {
  share_1: SecretShare<Scalar>,
  inner_shares: Vec<SecretShare<Scalar>>,
  quorum: Vec<u32>,
+ /// g^sigma_2 — the nested position's outer verifying share.
+ nested_public: Point,
 }
 
 fn world(rng: &mut OsRng) -> World {
@@ -64,12 +118,14 @@ fn world(rng: &mut OsRng) -> World {
  };
  let group_pubkey = <Point as CurvePoint>::generator().mul_scalar(&secret);
  let sigma_2 = eval(2);
+ let nested_public = <Point as CurvePoint>::generator().mul_scalar(&sigma_2);
  let pieces = split(&sigma_2, 5, 3, rng);
  World {
  group_pubkey,
  share_1: SecretShare::new(1, eval(1)).unwrap(),
  inner_shares: pieces[..3].to_vec(),
  quorum: vec![1, 2, 3],
+ nested_public,
  }
 }
 
@@ -121,15 +177,10 @@ fn coordinator_cannot_swap_the_message_under_the_inner_group() {
 
  // The coordinator is the other outer signer. It builds an outer package
  // over UNAPPROVED, using the jury's real commitment pair.
- let (nonces_1, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
- let commits_2 = SigningCommitments {
- index: 2,
- hiding: d_nested,
- binding: e_nested,
- };
+ let (nonces_1, commits_1) = zf_commit(&mut rng);
+ let commits_2 = zf_commitments(d_nested, e_nested);
  let evil_package =
- frost::SigningPackage::<Point>::new(UNAPPROVED.to_vec(), vec![commits_1, commits_2])
- .unwrap();
+ zf_package(UNAPPROVED, vec![(1, commits_1), (2, commits_2)]);
 
  let pre = precommits(&commitments);
  let request = NestedSigningRequest {
@@ -145,7 +196,7 @@ fn coordinator_cannot_swap_the_message_under_the_inner_group() {
  // The jury approved APPROVED. Every holder refuses, at the API.
  for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
  assert_eq!(
- inner_sign_v2::<Point>(n, s, &w.group_pubkey, APPROVED, &request).unwrap_err(),
+ inner_sign_v2::<C>(n, s, &vk(w.group_pubkey), APPROVED, &request).unwrap_err(),
  Error::MessageMismatch,
  "a holder must not sign a package over a message it did not approve"
  );
@@ -153,7 +204,8 @@ fn coordinator_cannot_swap_the_message_under_the_inner_group() {
 
  // And nothing the coordinator can do with its own share alone produces a
  // signature: position 2 never responded.
- let _ = frost::sign::<Point>(&evil_package, nonces_1, &w.share_1, &w.group_pubkey).unwrap();
+ let kp1 = zf_key_package(1, &w.share_1, w.group_pubkey, 2);
+ let _ = round2::sign(&evil_package, &nonces_1, &kp1).unwrap();
 }
 
 /// The same holders, signing the message they actually approved, still
@@ -174,14 +226,10 @@ fn the_approved_message_still_signs() {
  let (d_nested, e_nested) =
  aggregate_inner_commitment_pair::<Point>(&SESSION, &precommits(&commitments), &commitments).unwrap();
 
- let (nonces_1, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
- let commits_2 = SigningCommitments {
- index: 2,
- hiding: d_nested,
- binding: e_nested,
- };
+ let (nonces_1, commits_1) = zf_commit(&mut rng);
+ let commits_2 = zf_commitments(d_nested, e_nested);
  let package =
- frost::SigningPackage::<Point>::new(APPROVED.to_vec(), vec![commits_1, commits_2]).unwrap();
+ zf_package(APPROVED, vec![(1, commits_1), (2, commits_2)]);
  let pre = precommits(&commitments);
  let request = NestedSigningRequest {
  package: &package,
@@ -195,10 +243,11 @@ fn the_approved_message_still_signs() {
 
  let mut sigs = Vec::new();
  for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
- sigs.push(inner_sign_v2::<Point>(n, s, &w.group_pubkey, APPROVED, &request).unwrap());
+ sigs.push(inner_sign_v2::<C>(n, s, &vk(w.group_pubkey), APPROVED, &request).unwrap());
  }
 
- let params = InnerSigningParamsV2::from_outer::<Point>(&package, &w.group_pubkey, 2).unwrap();
+ let params =
+ frostito::zf::inner_params_from_zf::<C>(&package, &vk(w.group_pubkey), 2).unwrap();
  let z_nested = aggregate_inner_shares_verified::<Point>(
  &sigs,
  &commitments,
@@ -208,18 +257,27 @@ fn the_approved_message_still_signs() {
  )
  .expect("every share verifies");
 
- let sig_1 = frost::sign::<Point>(&package, nonces_1, &w.share_1, &w.group_pubkey).unwrap();
- let sig_2 = frost::SignatureShare {
- index: 2,
- response: z_nested,
- };
- let signature =
- frost::aggregate::<Point>(&package, &[sig_1, sig_2], &w.group_pubkey, None).unwrap();
- assert!(frost::verify_signature::<Point>(
- &w.group_pubkey,
- APPROVED,
- &signature
- ));
+ let kp1 = zf_key_package(1, &w.share_1, w.group_pubkey, 2);
+ let sig_1 = round2::sign(&package, &nonces_1, &kp1).unwrap();
+ // `SignatureShare` has no public constructor, so the nested position's
+ // scalar enters through the wire format — which is how it would arrive
+ // from the inner group in a deployment anyway.
+ let sig_2 = frost_core::round2::SignatureShare::<C>::deserialize(
+ &<Scalar as CurveScalar>::to_bytes(&z_nested),
+ )
+ .unwrap();
+
+ let mut shares = BTreeMap::new();
+ shares.insert(id(1), sig_1);
+ shares.insert(id(2), sig_2);
+
+ let mut verifying = BTreeMap::new();
+ verifying.insert(id(1), VerifyingShare::new(<Point as CurvePoint>::generator().mul_scalar(w.share_1.scalar())));
+ verifying.insert(id(2), VerifyingShare::new(w.nested_public));
+ let pubkeys = PublicKeyPackage::<C>::new(verifying, vk(w.group_pubkey), Some(2));
+
+ let signature = frost_core::aggregate(&package, &shares, &pubkeys).unwrap();
+ assert!(pubkeys.verifying_key().verify(APPROVED, &signature).is_ok());
 }
 
 /// (Medium, FIXED) — the nested position's commitment pair in the outer
@@ -246,13 +304,13 @@ fn substituted_nested_commitment_is_rejected_by_the_holder() {
  aggregate_inner_commitment_pair::<Point>(&SESSION, &precommits(&commitments), &commitments).unwrap();
 
  // The coordinator publishes a DIFFERENT pair for position 2.
- let (_, foreign) = frost::commit::<Point, _>(2, &mut rng).unwrap();
- assert_ne!(foreign.hiding, d_nested);
- assert_ne!(foreign.binding, e_nested);
+ let (_, foreign) = zf_commit(&mut rng);
+ assert_ne!(foreign.hiding().value(), d_nested);
+ assert_ne!(foreign.binding().value(), e_nested);
 
- let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
+ let (_, commits_1) = zf_commit(&mut rng);
  let package =
- frost::SigningPackage::<Point>::new(msg.to_vec(), vec![commits_1, foreign]).unwrap();
+ zf_package(msg, vec![(1, commits_1), (2, foreign)]);
 
  let pre = precommits(&commitments);
  let request = NestedSigningRequest {
@@ -267,7 +325,7 @@ fn substituted_nested_commitment_is_rejected_by_the_holder() {
 
  for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
  assert_eq!(
- inner_sign_v2::<Point>(n, s, &w.group_pubkey, msg, &request).unwrap_err(),
+ inner_sign_v2::<C>(n, s, &vk(w.group_pubkey), msg, &request).unwrap_err(),
  Error::UnexpectedCommitment,
  "the holder must notice that the outer package is not over its own round"
  );
@@ -300,19 +358,8 @@ fn nonces_from_another_session_are_rejected() {
  }
  let (d_b, e_b) = aggregate_inner_commitment_pair::<Point>(&OTHER, &precommits(&commits_b), &commits_b).unwrap();
 
- let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
- let package = frost::SigningPackage::<Point>::new(
- msg.to_vec(),
- vec![
- commits_1,
- SigningCommitments {
- index: 2,
- hiding: d_b,
- binding: e_b,
- },
- ],
- )
- .unwrap();
+ let (_, commits_1) = zf_commit(&mut rng);
+ let package = zf_package(msg, vec![(1, commits_1), (2, zf_commitments(d_b, e_b))]);
 
  let pre = precommits(&commits_b);
  let request = NestedSigningRequest {
@@ -328,7 +375,7 @@ fn nonces_from_another_session_are_rejected() {
  // Holder 1 still holds round A's nonces; it must not answer round B.
  let n = nonces_a.remove(0);
  assert_eq!(
- inner_sign_v2::<Point>(n, &w.inner_shares[0], &w.group_pubkey, msg, &request).unwrap_err(),
+ inner_sign_v2::<C>(n, &w.inner_shares[0], &vk(w.group_pubkey), msg, &request).unwrap_err(),
  Error::SessionMismatch
  );
 
@@ -363,19 +410,8 @@ fn incomplete_quorum_is_rejected() {
  let (d_nested, e_nested) =
  aggregate_inner_commitment_pair::<Point>(&SESSION, &precommits(&commitments), &commitments).unwrap();
 
- let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
- let package = frost::SigningPackage::<Point>::new(
- msg.to_vec(),
- vec![
- commits_1,
- SigningCommitments {
- index: 2,
- hiding: d_nested,
- binding: e_nested,
- },
- ],
- )
- .unwrap();
+ let (_, commits_1) = zf_commit(&mut rng);
+ let package = zf_package(msg, vec![(1, commits_1), (2, zf_commitments(d_nested, e_nested))]);
  let pre = precommits(&commitments);
  let request = NestedSigningRequest {
  package: &package,
@@ -386,11 +422,12 @@ fn incomplete_quorum_is_rejected() {
  active_indices: &w.quorum,
  inner_threshold: 3,
  };
- let params = InnerSigningParamsV2::from_outer::<Point>(&package, &w.group_pubkey, 2).unwrap();
+ let params =
+ frostito::zf::inner_params_from_zf::<C>(&package, &vk(w.group_pubkey), 2).unwrap();
 
  let mut sigs = Vec::new();
  for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
- sigs.push(inner_sign_v2::<Point>(n, s, &w.group_pubkey, msg, &request).unwrap());
+ sigs.push(inner_sign_v2::<C>(n, s, &vk(w.group_pubkey), msg, &request).unwrap());
  }
  let pubs = public_shares(&w.inner_shares);
 
@@ -462,15 +499,11 @@ fn v2_response_equals_the_flat_frost_response() {
  let (d_nested, e_nested) =
  aggregate_inner_commitment_pair::<Point>(&SESSION, &precommits(&commitments), &commitments).unwrap();
 
- let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
- let commits_2 = SigningCommitments {
- index: 2,
- hiding: d_nested,
- binding: e_nested,
- };
+ let (_, commits_1) = zf_commit(&mut rng);
+ let commits_2 = zf_commitments(d_nested, e_nested);
  let package =
- frost::SigningPackage::<Point>::new(b"m".to_vec(), vec![commits_1, commits_2]).unwrap();
- let params = InnerSigningParamsV2::from_outer::<Point>(&package, &group_pubkey, 2).unwrap();
+ zf_package(b"m", vec![(1, commits_1), (2, commits_2)]);
+ let params = frostito::zf::inner_params_from_zf::<C>(&package, &vk(group_pubkey), 2).unwrap();
  let pre = precommits(&commitments);
  let request = NestedSigningRequest {
  package: &package,
@@ -484,7 +517,7 @@ fn v2_response_equals_the_flat_frost_response() {
 
  let mut sigs = Vec::new();
  for (n, s) in nonces.into_iter().zip(inner.iter()) {
- sigs.push(inner_sign_v2::<Point>(n, s, &group_pubkey, b"m", &request).unwrap());
+ sigs.push(inner_sign_v2::<C>(n, s, &vk(group_pubkey), b"m", &request).unwrap());
  }
  let mut z_nested = <Scalar as CurveScalar>::zero();
  for s in &sigs {
@@ -508,65 +541,6 @@ fn v2_response_equals_the_flat_frost_response() {
  assert_eq!(recon, sigma_2);
 }
 
-/// / — `from_coordinator_checked` validates self-consistency, not
-/// provenance, and the group public key is no longer something a request can
-/// carry.
-///
-/// The attack the maintainer review describes: a coordinator substitutes `Y'`
-/// and recomputes ρ, c and λ *using the substituted key*. Every check in
-/// `from_coordinator_checked` passes, because every check recomputes against
-/// the supplied `group_pubkey`. This test asserts that it really does pass —
-/// that the function is not the authenticity check its name suggests — and
-/// that the resulting context differs from the one derived under the holder's
-/// own key, which is why `inner_sign_v2` now takes `Y` as its own parameter
-/// instead of reading it out of `NestedSigningRequest`.
-#[test]
-fn a_substituted_group_key_passes_from_coordinator_checked() {
- let mut rng = OsRng;
- let w = world(&mut rng);
-
- let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
- let (_, commits_2) = frost::commit::<Point, _>(2, &mut rng).unwrap();
- let package =
- frost::SigningPackage::<Point>::new(b"release 10 ZEC to alice".to_vec(), vec![commits_1, commits_2]).unwrap();
-
- // the coordinator's key, not the holder's
- let evil_y = <Point as CurvePoint>::generator().mul_scalar(&<Scalar as CurveScalar>::random(&mut rng));
- assert_ne!(evil_y, w.group_pubkey);
-
- let indices = package.signer_indices();
- let lagrange = frostito::compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
- let pos = indices.iter().position(|&i| i == 2).unwrap();
-
- let evil_r = package.group_commitment(&evil_y);
- let evil_rho = package.binding_factor(2, &evil_y);
- let evil_c = package.challenge(&evil_r, &evil_y);
-
- // self-consistent under the substituted key: accepted.
- #[allow(deprecated)]
- let accepted = InnerSigningParamsV2::from_coordinator_checked::<Point>(
- &evil_rho,
- &evil_c,
- &lagrange[pos],
- &package,
- &evil_y,
- 2,
- );
- assert!(
- accepted.is_ok(),
- "the check is self-consistency, not provenance — this is the trap"
- );
-
- // and it is a different context from the holder's own, so signing under it
- // would have produced a share over an attacker-chosen challenge.
- let honest = InnerSigningParamsV2::from_outer::<Point>(&package, &w.group_pubkey, 2).unwrap();
- assert_ne!(honest.outer_challenge(), accepted.as_ref().unwrap().outer_challenge());
- assert_ne!(honest.outer_binding(), accepted.as_ref().unwrap().outer_binding());
-
- // the request type cannot carry a group key at all any more: `Y` is a
- // parameter of `inner_sign_v2`, taken from the holder's own key package.
- // (Enforced at compile time — `NestedSigningRequest` has no such field.)
-}
 
 /// — `active_indices` is coordinator-supplied and was unvalidated on the
 /// signing side.
@@ -610,14 +584,10 @@ fn a_malformed_quorum_is_rejected_by_the_signer() {
  }
  let (d_nested, e_nested) =
  aggregate_inner_commitment_pair::<Point>(&SESSION, &precommits(&commitments), &commitments).unwrap();
- let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
- let commits_2 = SigningCommitments {
- index: 2,
- hiding: d_nested,
- binding: e_nested,
- };
+ let (_, commits_1) = zf_commit(&mut rng);
+ let commits_2 = zf_commitments(d_nested, e_nested);
  let package =
- frost::SigningPackage::<Point>::new(b"m".to_vec(), vec![commits_1, commits_2]).unwrap();
+ zf_package(b"m", vec![(1, commits_1), (2, commits_2)]);
 
  let pre = precommits(&commitments);
  let request = NestedSigningRequest {
@@ -630,10 +600,10 @@ fn a_malformed_quorum_is_rejected_by_the_signer() {
  inner_threshold: t,
  };
 
- let err = inner_sign_v2::<Point>(
+ let err = inner_sign_v2::<C>(
  nonces.remove(0),
  &w.inner_shares[0],
- &w.group_pubkey,
+ &vk(w.group_pubkey),
  b"m",
  &request,
  )
@@ -713,14 +683,10 @@ fn a_spent_session_cannot_sign_twice_across_a_restore() {
  let pre = precommits(&commitments);
  let (d_nested, e_nested) =
  aggregate_inner_commitment_pair::<Point>(&SESSION, &pre, &commitments).unwrap();
- let (_, commits_1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
- let commits_2 = SigningCommitments {
- index: 2,
- hiding: d_nested,
- binding: e_nested,
- };
+ let (_, commits_1) = zf_commit(&mut rng);
+ let commits_2 = zf_commitments(d_nested, e_nested);
  let package =
- frost::SigningPackage::<Point>::new(b"m".to_vec(), vec![commits_1, commits_2]).unwrap();
+ zf_package(b"m", vec![(1, commits_1), (2, commits_2)]);
  let request = NestedSigningRequest {
  package: &package,
  nested_index: 2,
@@ -734,11 +700,11 @@ fn a_spent_session_cannot_sign_twice_across_a_restore() {
  let mut store = MemorySpentSessions::new();
  assert!(!store.is_spent(&SESSION, 1));
 
- inner_sign_v2_spending::<Point, _>(
+ inner_sign_v2_spending::<C, _>(
  &mut store,
  nonces.remove(0),
  &w.inner_shares[0],
- &w.group_pubkey,
+ &vk(w.group_pubkey),
  b"m",
  &request,
  )
@@ -760,19 +726,8 @@ fn a_spent_session_cannot_sign_twice_across_a_restore() {
  &restored_commitments,
  )
  .unwrap();
- let (_, rc1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
- let restored_package = frost::SigningPackage::<Point>::new(
- b"m".to_vec(),
- vec![
- rc1,
- SigningCommitments {
- index: 2,
- hiding: rd,
- binding: re,
- },
- ],
- )
- .unwrap();
+ let (_, rc1) = zf_commit(&mut rng);
+ let restored_package = zf_package(b"m", vec![(1, rc1), (2, zf_commitments(rd, re))]);
  let restored_request = NestedSigningRequest {
  package: &restored_package,
  nested_index: 2,
@@ -783,11 +738,11 @@ fn a_spent_session_cannot_sign_twice_across_a_restore() {
  inner_threshold: 3,
  };
  assert_eq!(
- inner_sign_v2_spending::<Point, _>(
+ inner_sign_v2_spending::<C, _>(
  &mut store,
  restored,
  &w.inner_shares[0],
- &w.group_pubkey,
+ &vk(w.group_pubkey),
  b"m",
  &restored_request,
  )
@@ -799,14 +754,83 @@ fn a_spent_session_cannot_sign_twice_across_a_restore() {
  // another holder in the same session is unaffected: the pair is
  // (session, holder), not the session alone
  assert!(!store.is_spent(&SESSION, 2));
- inner_sign_v2_spending::<Point, _>(
+ inner_sign_v2_spending::<C, _>(
  &mut store,
  nonces.remove(0),
  &w.inner_shares[1],
- &w.group_pubkey,
+ &vk(w.group_pubkey),
  b"m",
  &request,
  )
  .expect("holder 2 has not signed this session");
  assert_eq!(store.len(), 2);
+}
+
+/// Identifiable abort inside the inner group: a tampered inner share is
+/// rejected, and the aggregate names the holder that produced it.
+///
+/// Without this an invalid share folds silently into the sum and the outer
+/// signature just fails to verify, with nothing to say who caused it.
+#[test]
+fn a_dishonest_inner_holder_is_named() {
+    use frostito::nested::split_evaluation_for_inner;
+
+    let mut rng = OsRng;
+    let msg = b"m";
+    let sigma_2 = <Scalar as CurveScalar>::random(&mut rng);
+    let quorum: Vec<u32> = vec![1, 2, 3];
+    let (pieces, _) = split_evaluation_for_inner::<Point, _>(&sigma_2, 5, 3, &mut rng);
+    let inner: Vec<SecretShare<Scalar>> = quorum
+        .iter()
+        .map(|k| {
+            let (_, piece) = pieces.iter().find(|(i, _)| i == k).unwrap();
+            SecretShare::new(*k, *piece).unwrap()
+        })
+        .collect();
+
+    let mut nonces = Vec::new();
+    let mut commitments = Vec::new();
+    for &k in &quorum {
+        let (n, c) = inner_commit::<Point, _>(k, SESSION, &mut rng);
+        nonces.push(n);
+        commitments.push(c);
+    }
+
+    let pre = precommits(&commitments);
+    let (d_nested, e_nested) =
+        aggregate_inner_commitment_pair::<Point>(&SESSION, &pre, &commitments).unwrap();
+    let group_pubkey = <Point as CurvePoint>::generator().mul_scalar(&sigma_2);
+
+    let (_, commits_1) = zf_commit(&mut rng);
+    let package = zf_package(msg, vec![(1, commits_1), (2, zf_commitments(d_nested, e_nested))]);
+    let params =
+        frostito::zf::inner_params_from_zf::<C>(&package, &vk(group_pubkey), 2).unwrap();
+
+    let request = NestedSigningRequest {
+        package: &package,
+        nested_index: 2,
+        session_id: SESSION,
+        inner_precommits: &pre,
+        inner_commitments: &commitments,
+        active_indices: &quorum,
+        inner_threshold: 3,
+    };
+
+    let mut sigs = Vec::new();
+    for (n, share) in nonces.into_iter().zip(inner.iter()) {
+        sigs.push(inner_sign_v2::<C>(n, share, &vk(group_pubkey), msg, &request).unwrap());
+    }
+
+    // holder 2 goes rogue
+    sigs[1].response = sigs[1].response.add(&<Scalar as CurveScalar>::one());
+
+    let err = aggregate_inner_shares_verified::<Point>(
+        &sigs,
+        &commitments,
+        &public_shares(&inner),
+        &params,
+        &quorum,
+    )
+    .expect_err("a tampered share must be rejected");
+    assert_eq!(err, vec![2], "the cheating holder must be identified");
 }

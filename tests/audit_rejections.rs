@@ -24,8 +24,7 @@
 
 #![cfg(all(feature = "ristretto255", feature = "std"))]
 
-use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
-use frostito::curve::CurvePoint;
+use curve25519_dalek::ristretto::RistrettoPoint;
 
 use frostito::dkg::{Dealer, DkgState};
 use frostito::Error;
@@ -33,75 +32,6 @@ use rand::rngs::OsRng;
 
 type Point = RistrettoPoint;
 
-/// (1) `ChallengeMismatch` from `from_coordinator_checked`.
-///
-/// The legacy wire path recomputes all three scalars and rejects any that
-/// differs. Note what this does *not* buy — see
-/// `a_substituted_group_key_passes_from_coordinator_checked` in
-/// `audit_nested_v2.rs`, which is the other half of .
-mod coordinator_supplied_scalars_are_recomputed {
- use super::*;
- use frostito::frost;
- use frostito::nested::InnerSigningParamsV2;
-
- #[test]
- fn a_wrong_scalar_is_rejected() {
- let mut rng = OsRng;
- let g = <Point as CurvePoint>::generator();
- let y = g.mul_scalar(&Scalar::random(&mut rng));
-
- let (_, c1) = frost::commit::<Point, _>(1, &mut rng).unwrap();
- let (_, c2) = frost::commit::<Point, _>(2, &mut rng).unwrap();
- let package =
- frost::SigningPackage::<Point>::new(b"m".to_vec(), vec![c1, c2]).unwrap();
-
- let indices = package.signer_indices();
- let lagrange = frostito::compute_lagrange_coefficients::<Scalar>(&indices).unwrap();
- let pos = indices.iter().position(|&i| i == 2).unwrap();
- let r = package.group_commitment(&y);
- let rho = package.binding_factor(2, &y);
- let c = package.challenge(&r, &y);
-
- // the honest triple is accepted
- #[allow(deprecated)]
- let ok = InnerSigningParamsV2::from_coordinator_checked::<Point>(
- &rho,
- &c,
- &lagrange[pos],
- &package,
- &y,
- 2,
- );
- assert!(ok.is_ok());
-
- // each of the three, perturbed on its own, is rejected
- let wrong = Scalar::random(&mut rng);
- for (a, b, l) in [
- (&wrong, &c, &lagrange[pos]),
- (&rho, &wrong, &lagrange[pos]),
- (&rho, &c, &wrong),
- ] {
- #[allow(deprecated)]
- let got = InnerSigningParamsV2::from_coordinator_checked::<Point>(
- a, b, l, &package, &y, 2,
- );
- assert!(matches!(got, Err(Error::ChallengeMismatch)));
- }
-
- // an index that is not in the package is an index error, not a
- // mismatch — the caller is asking about a signer that does not exist
- #[allow(deprecated)]
- let absent = InnerSigningParamsV2::from_coordinator_checked::<Point>(
- &rho,
- &c,
- &lagrange[pos],
- &package,
- &y,
- 7,
- );
- assert!(matches!(absent, Err(Error::InvalidIndex)));
- }
-}
 
 /// (2) `InvalidProofOfKnowledge` from a forged `Round1Package`.
 ///

@@ -244,6 +244,8 @@ pub use decaf377_suite::{
 // Driving `crate::nested` from a ZF signing package
 // ============================================================================
 
+use alloc::vec::Vec;
+
 use crate::curve::{CurvePoint, CurveScalar};
 use crate::error::Error as FrostitoError;
 use crate::lagrange::compute_lagrange_coefficients;
@@ -274,7 +276,7 @@ pub fn identifier_to_index<C: Cs>(id: &Identifier<C>) -> Result<u32, FrostitoErr
 /// The outer FROST context an inner holder needs, recomputed from a ZF
 /// [`SigningPackage`] rather than from this crate's own FROST.
 ///
-/// This is [`InnerSigningParamsV2::from_outer`] over `frost-core`: same three
+/// This is [`InnerSigningParamsV2::from_parts`] over `frost-core`: same three
 /// values, same local derivation, so a coordinator still asserts none of them.
 /// It is what lets a nested position sit inside a real RFC 9591 group.
 ///
