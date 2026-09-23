@@ -260,7 +260,7 @@ use crate::error::Error as FrostitoError;
 use crate::lagrange::compute_lagrange_coefficients;
 use crate::nested::InnerSigningParamsV2;
 use frost_core::{
-    challenge, Field, Group, compute_binding_factor_list, compute_group_commitment, Ciphersuite as Cs,
+    Field, Group, compute_binding_factor_list, compute_group_commitment, Ciphersuite as Cs,
     Element as ZfElement, Identifier, Scalar as CScalar, SigningPackage, VerifyingKey,
 };
 
@@ -358,7 +358,10 @@ where
 
     let r = compute_group_commitment::<C>(package, &factors)
         .map_err(|_| FrostitoError::InvalidCommitment)?;
-    let c = challenge::<C>(&r.to_element(), verifying_key, package.message())
+    // `C::challenge`, not `frost_core::challenge`: a ciphersuite may override
+    // it, and Taproot does — BIP340 hashes x-only coordinates under a tagged
+    // hash, where the generic form uses the 33-byte compressed encoding.
+    let c = C::challenge(&r.to_element(), verifying_key, package.message())
         .map_err(|_| FrostitoError::InvalidCommitment)?;
 
     Ok(InnerSigningParamsV2::from_parts(

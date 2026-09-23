@@ -99,3 +99,104 @@ fn the_nested_bridge_takes_the_taproot_suite() {
     let _ = absent;
     assert!(inner_params_from_zf::<C>(&package, pubkeys.verifying_key(), 3).is_err());
 }
+
+/// Does the nested composition survive BIP340's parity rules?
+///
+/// Under Taproot, `compute_signature_share` negates the signer's nonces when
+/// the group commitment `R` has odd Y, and `into_even_y` negates the key
+/// package when the group key has odd Y. A nested position's outer nonce is
+/// the sum of its inner holders' nonces, and its outer share is spread across
+/// them — so both negations have to reach inside the group.
+///
+/// This drives the flat response `d + rho*e + lambda*c*sigma` from the bridged
+/// context, exactly as an inner holder assembles it, and compares against what
+/// `round2::sign` produces. Run over many samples so both parities are hit.
+///
+/// # Known gap — this is a PoC, not a regression test
+///
+/// It fails, and it is supposed to until `nested` learns BIP340's parity
+/// rules. `Ciphersuite` exposes `pre_sign` and `compute_signature_share` as
+/// overridable hooks precisely so a suite can normalise; Taproot uses both,
+/// and `inner_sign_v2` assembles its response by hand, bypassing them.
+///
+/// Agreement rose from 0/24 to roughly 9/24 once the bridge dispatched
+/// through `C::challenge` instead of `frost_core::challenge`. What remains is
+/// the two negations, each independent and each hit about half the time:
+///
+/// - `R` has odd Y  -> every inner holder must negate its own `(d_k, e_k)`
+/// - the group key has odd Y -> every inner holder must negate its `sigma_k`
+///
+/// Both are derivable locally by each holder from public data, so the fix
+/// keeps the property that no coordinator asserts anything. It needs a small
+/// trait — `Ciphersuite` has no generic way to ask "does this suite normalise
+/// parity", because x-only encoding is a secp256k1 notion.
+///
+/// Until then: a nested position cannot hold a key in a Taproot multisig.
+/// Flat FROST under this suite is unaffected and is covered above.
+#[ignore = "known gap: nested does not apply BIP340 parity normalisation"]
+#[test]
+fn nested_assembly_matches_taproot_signing_across_parities() {
+    use frost_core::round1::{Nonce, SigningNonces};
+    use frostito::curve::CurveScalar;
+    use frostito::zf::inner_params_from_zf;
+    use k256::Scalar;
+
+    let mut rng = OsRng;
+    let mut agreed = 0usize;
+    let mut differed = 0usize;
+
+    for _ in 0..24 {
+        let (shares, pubkeys) =
+            keys::generate_with_dealer::<C, _>(2, 2, IdentifierList::Default, &mut rng).unwrap();
+        let packages: BTreeMap<_, _> = shares
+            .into_iter()
+            .map(|(i, s)| (i, KeyPackage::try_from(s).unwrap()))
+            .collect();
+
+        let mut held = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for id in packages.keys() {
+            let h = <Scalar as CurveScalar>::random(&mut rng);
+            let b = <Scalar as CurveScalar>::random(&mut rng);
+            let n = SigningNonces::from_nonces(
+                Nonce::<C>::from_scalar(h),
+                Nonce::<C>::from_scalar(b),
+            );
+            commitments.insert(*id, *n.commitments());
+            held.insert(*id, (h, b, n));
+        }
+
+        let package = SigningPackage::new(commitments, MSG);
+        let vk = pubkeys.verifying_key();
+
+        let target = *packages.keys().next().unwrap();
+        let zf_share = round2::sign(&package, &held[&target].2, &packages[&target]).unwrap();
+
+        let params = inner_params_from_zf::<C>(&package, vk, 1).unwrap();
+        let (h, b, _) = &held[&target];
+        let sigma = packages[&target].signing_share().to_scalar();
+        let ours = h.add(
+            &params.outer_binding().mul(b).add(
+                &params
+                    .outer_lambda()
+                    .mul(params.outer_challenge())
+                    .mul(&sigma),
+            ),
+        );
+
+        if <Scalar as CurveScalar>::to_bytes(&ours).to_vec() == zf_share.serialize() {
+            agreed += 1;
+        } else {
+            differed += 1;
+        }
+    }
+
+    assert_eq!(
+        differed, 0,
+        "the nested assembly diverges from Taproot signing in {differed} of {} samples \
+         (agreed in {agreed}): BIP340 negates the signer's nonces when R has odd Y and \
+         negates the key package when the group key has odd Y, and neither negation \
+         currently reaches the inner group",
+        agreed + differed
+    );
+}
