@@ -191,3 +191,72 @@ fn key_material_is_interchangeable_but_signatures_are_not() {
  );
  }
 }
+
+/// The nested arithmetic, checked against `frost-core`'s own signature share.
+///
+/// `frostito::zf::inner_params_from_zf` hands an inner holder the outer
+/// context — ρ, c, λ — recomputed from a ZF signing package. If those are
+/// right, then the flat FROST response
+///
+/// ```text
+/// z_i = d_i + ρ_i·e_i + λ_i·c·σ_i
+/// ```
+///
+/// assembled by hand from them must equal the share `frost_core::round2::sign`
+/// produces for that participant. That is the equivalence nested FROST rests
+/// on — a nested position is indistinguishable from a flat signer — checked
+/// against the audited implementation rather than against our own.
+#[test]
+fn zf_derived_outer_context_reproduces_the_signature_share() {
+        use frostito::zf::inner_params_from_zf;
+
+    let mut rng = OsRng;
+    let g = deal(3, 2, &mut rng);
+    let signers = [1u32, 2u32];
+
+    let mut nonce_scalars = BTreeMap::new();
+    let mut zf_nonces = BTreeMap::new();
+    let mut zf_commitments = BTreeMap::new();
+
+    for &i in &signers {
+        let h = <Scalar as CurveScalar>::random(&mut rng);
+        let b = <Scalar as CurveScalar>::random(&mut rng);
+        let (_, zf) = paired_nonces(h, b);
+        zf_commitments.insert(id(i), *zf.commitments());
+        nonce_scalars.insert(i, (h, b));
+        zf_nonces.insert(i, zf);
+    }
+
+    let package = ZfPackage::new(zf_commitments, MSG);
+    let verifying_key = VerifyingKey::new(g.group_pubkey);
+
+    for &i in &signers {
+        let share = &g.shares[(i - 1) as usize];
+
+        // what frost-core computes
+        let key_package = KeyPackage::<C>::new(
+            id(i),
+            SigningShare::new(*share.scalar()),
+            VerifyingShare::new(g.verifying[&i]),
+            verifying_key,
+            g.t,
+        );
+        let zf_share = zf_round2::sign(&package, &zf_nonces[&i], &key_package).expect("zf sign");
+
+        // what an inner holder assembles from the bridged outer context
+        let params = inner_params_from_zf::<C>(&package, &verifying_key, i).expect("bridge");
+        let (d, e) = nonce_scalars[&i];
+        let ours = d.add(
+            &params
+                .outer_binding()
+                .mul(&e)
+                .add(&params.outer_lambda().mul(params.outer_challenge()).mul(share.scalar())),
+        );
+
+        assert_eq!(
+            <Scalar as CurveScalar>::to_bytes(&ours).to_vec(),
+            zf_share.serialize(),
+            "index {i}: d + rho*e + lambda*c*sigma must equal frost-core's share"
+        );
+    }
+}

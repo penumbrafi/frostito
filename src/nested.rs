@@ -1001,7 +1001,7 @@ pub struct NestedSigningRequest<'a, P: CurvePoint> {
 /// which recomputes and rejects a mismatch.
 #[derive(Clone)]
 pub struct InnerSigningParamsV2<S: CurveScalar> {
- /// outer binding factor for the nested position: ρ = H(index, m, B)
+ /// outer binding factor for the nested position: ρ = H(Y, index, m, B)
  outer_binding: S,
  /// outer schnorr challenge: c = H(R_outer, Y, m)
  outer_challenge: S,
@@ -1010,6 +1010,21 @@ pub struct InnerSigningParamsV2<S: CurveScalar> {
 }
 
 impl<S: CurveScalar> InnerSigningParamsV2<S> {
+ /// Build from an outer context derived somewhere other than
+ /// [`from_outer`](Self::from_outer).
+ ///
+ /// The three values must be the holder's own derivation from the outer
+ /// signing package, never a coordinator's assertion — that is the whole
+ /// point of this type. [`crate::zf::inner_params_from_zf`] is the
+ /// supported producer, deriving them from a `frost-core` package.
+ pub fn from_parts(outer_binding: S, outer_challenge: S, outer_lambda: S) -> Self {
+ Self {
+ outer_binding,
+ outer_challenge,
+ outer_lambda,
+ }
+ }
+
  /// The outer binding factor ρ for the nested position.
  #[inline]
  pub fn outer_binding(&self) -> &S {

@@ -50,7 +50,7 @@ mod lagrange;
 pub mod liveness;
 pub mod nested;
 pub mod reshare;
-#[cfg(all(feature = "zf-decaf377", feature = "decaf377"))]
+#[cfg(feature = "zf")]
 pub mod zf;
 #[cfg(feature = "sealed")]
 pub mod sealed;

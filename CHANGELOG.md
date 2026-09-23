@@ -1,5 +1,29 @@
 # changelog
 
+## [Unreleased]
+
+### nested FROST can sit inside a real RFC 9591 group
+
+`zf::inner_params_from_zf` recomputes an inner holder's outer context — the
+binding factor, the challenge and the Lagrange coefficient — from a
+`frost_core::SigningPackage` instead of from this crate's own FROST. Same
+local derivation as `InnerSigningParamsV2::from_outer`, so a coordinator still
+asserts none of it, over `frost-core`'s `internals`.
+
+Bounded on `Element<C>: CurvePoint` and `Scalar<C>: CurveScalar` rather than a
+marker trait, which holds for ristretto255 and secp256k1 because the element
+and scalar types are the same on both sides.
+
+`tests/zf_differential.rs` checks the thing nested rests on, against the
+audited implementation rather than against ourselves: assemble
+`z = d + rho*e + lambda*c*sigma` by hand from the bridged context, and it
+equals the share `frost_core::round2::sign` produces for that participant,
+byte for byte. That is the "a nested position is indistinguishable from a flat
+signer" claim, now with an external oracle.
+
+Also: `InnerSigningParamsV2::from_parts`, and `zf` is no longer gated behind
+`zf-decaf377` — the decaf377 ciphersuite is, the bridge is not.
+
 ## [0.6.0] - 2026-09-23
 
 ### pruned
