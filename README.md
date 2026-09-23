@@ -25,12 +25,22 @@ default build is `std` + `ristretto255`. everything else is off by default.
 
 | feature | what it is |
 |---|---|
-| `sealed` | DKG round 2 over Noise_K: sub-shares encrypted and authenticated per recipient (`osst::sealed`). needs `std` |
-| `zf` | ZF `frost-core` 3.0 as the signing core, with `internals`. `zf-ristretto255` / `zf-secp256k1` add ZF's ciphersuite for that backend; `zf-decaf377` enables `osst::zf`, which supplies the decaf377 ciphersuite ZF does not ship |
+| `sealed` | DKG round 2 over Noise_K: sub-shares encrypted and authenticated per recipient (`frostito::sealed`). needs `std` |
+| `zf-ristretto255` / `zf-secp256k1` / `zf-secp256k1-tr` | ZF's ciphersuite crate for that backend. `-tr` is BIP340/Taproot, which is what Bitcoin verifies; plain `zf-secp256k1` is RFC 9591's registered suite and is **not** Bitcoin-compatible |
 
 `no_std` on every backend.
 
-### curves
+### what this signs, and what it does not
+
+| chain | works | via |
+|---|---|---|
+| Bitcoin Taproot (P2TR) | yes | `zf-secp256k1-tr` — BIP340. not yet checked against a Bitcoin verifier |
+| Zcash shielded (Orchard) | yes | `reddsa` RedPallas; reshare into ZF key packages is tested |
+| Zcash transparent | no | ECDSA. FROST is Schnorr-only |
+| Bitcoin pre-Taproot | no | ECDSA, same reason |
+| Penumbra (UM) | **no** | spend auth is `decaf377-rdsa`: BLAKE2b personalised `decaf377-rdsa---`, over a hashed basepoint, re-randomizable. `zf::Decaf377Sha512` is SHA-512 over decaf377's standard generator — a different scheme entirely. A Penumbra-compatible suite would follow `reddsa`'s pattern: rerandomized FROST over the spend-auth basepoint. It does not exist here yet |
+
+## curves
 
 | feature | curve | compatible with |
 |---------|-------|---------------|
@@ -38,7 +48,7 @@ default build is `std` + `ristretto255`. everything else is off by default.
 | `pallas` | pallas (curve generator) | generic pallas |
 | `pallas` | pallas in the orchard spend-auth group (`OrchardSpendAuthCurve`) | zcash orchard, ZF `reddsa` / `frost-core` FROST(Pallas) |
 | `secp256k1` | secp256k1 | bitcoin, ethereum |
-| `decaf377` | decaf377 | penumbra |
+| `decaf377` | decaf377 | **not** penumbra spend-auth — see below |
 
 everything is generic over `P: OsstPoint`. the snippets below fix a concrete
 point type.
@@ -142,16 +152,18 @@ lowest committed dealer indices) for coordinators to put in the manifest.
 
 ## modules
 
-- `osst::dkg` — distributed key generation over an agreed dealer set;
+- `frostito::dkg` — distributed key generation over an agreed dealer set;
   complaints and disqualification
-- `osst::sealed` — encrypted, authenticated DKG round 2 (feature `sealed`)
-- `osst::frost` — plain FROST signing
-- `osst::nested` — nested FROST
-- `osst::reshare` — proactive secret sharing
-- `osst::liveness` — checkpoint proofs for holder participation
-- `osst::context` — epoch-bound signing contexts
-- `osst::zf` — `Decaf377Sha512`, a `frost_core::Ciphersuite` for decaf377 (feature `zf-decaf377`)
-- `osst::curve` — curve backend traits
+- `frostito::sealed` — encrypted, authenticated DKG round 2 (feature `sealed`)
+- `frostito::frost` — plain FROST signing
+- `frostito::nested` — nested FROST
+- `frostito::reshare` — proactive secret sharing
+- `frostito::liveness` — checkpoint proofs for holder participation
+- `frostito::context` — epoch-bound signing contexts
+- `frostito::zf` — the bridge that drives `nested` from a `frost_core` signing
+  package, plus `Decaf377Sha512`, a ciphersuite for decaf377 that ZF does not
+  ship
+- `frostito::curve` — curve backend traits
 
 [`docs/frostito-design.svg`](docs/frostito-design.svg) is the architecture diagram.
 
