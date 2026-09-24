@@ -80,7 +80,7 @@ pub const NOISE_PATTERN: &str = "Noise_K_25519_ChaChaPoly_BLAKE2s";
 /// Separation tag for deriving a participant's X25519 static key from its
 /// existing identity seed.
 ///
-/// osst-specific rather than zcli's tag: a node may link both, and the two
+/// frostito-specific rather than zcli's tag: a node may link both, and the two
 /// ceremonies must not share a key.
 pub const X25519_DERIVE_INFO: &[u8] = b"frostito/sealed/x25519/v1";
 

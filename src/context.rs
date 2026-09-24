@@ -28,7 +28,7 @@
 //!
 //! # Scope — read this before relying on it
 //!
-//! This mechanism works only where the **verifier is osst-aware**, i.e. where
+//! This mechanism works only where the **verifier is frostito-aware**, i.e. where
 //! the bytes being signed are chosen by this protocol: custody authorization,
 //! escrow release, narsil-style spend approval, internal attestations.
 //!

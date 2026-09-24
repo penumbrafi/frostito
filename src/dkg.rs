@@ -549,14 +549,14 @@ impl<P: CurvePoint> DkgState<P> {
  /// group key or to any verification share, and further submissions from it
  /// are refused.
  ///
- /// # This is a local mutation, and osst provides no agreement
+ /// # This is a local mutation, and frostito provides no agreement
  ///
  /// Every participant must apply the same complaints or they derive
  /// different keys — and nothing in this crate makes that true. The 0.4.0
  /// doc said the first half and not the second, which reads as if the
  /// library were handling it.
  ///
- /// What osst does provide is [`Complaint`]: signed by the accuser's roster
+ /// What frostito does provide is [`Complaint`]: signed by the accuser's roster
  /// identity, bound to `(epoch, session_id, round)`, carrying evidence a
  /// third party re-runs, with a verdict that distinguishes a real offence
  /// from a false accusation. What it does not and cannot provide is
@@ -939,7 +939,7 @@ pub enum ComplaintVerdict {
 /// # Why this exists
 ///
 /// `DkgState::disqualify` is a local mutation whose correctness needs every
-/// participant to apply the same complaints, and through 0.4.x osst provided
+/// participant to apply the same complaints, and through 0.4.x the crate provided
 /// nothing to make that true. A complaint was not a value at all, let alone a
 /// verifiable one, so the only two policies available to a caller were
 /// "believe everyone" — one packet aborts the ceremony — and "believe no-one",
@@ -968,7 +968,7 @@ pub enum ComplaintVerdict {
 /// the place to hand-roll it.
 ///
 /// **The roster must therefore bind an identity public key per participant.**
-/// osst does not own the roster — the caller does — so this API verifies
+/// frostito does not own the roster — the caller does — so this API verifies
 /// against a public key the caller supplies. What that means for a deployment:
 /// the identity keys must be part of the same signed roster/manifest whose
 /// hash is the ceremony id, or an attacker supplies the key as well as the
@@ -976,7 +976,7 @@ pub enum ComplaintVerdict {
 ///
 /// # What a caller (narsild) still has to do
 ///
-/// osst provides the value, the binding and the verifier. Agreement is not
+/// frostito provides the value, the binding and the verifier. Agreement is not
 /// something a library can provide:
 ///
 /// 1. Re-broadcast every complaint on receipt. A complaint delivered to one
@@ -1407,7 +1407,7 @@ pub const ECHO_DIGEST_DOMAIN: &[u8] = b"frostito/dkg-round1-echo/v1";
 /// honest parties never compare notes. The standard construction is an echo
 /// round: after round 1 closes, every participant publishes a digest of the
 /// **full** commitment set it saw and refuses to enter round 2 until it holds
-/// `n` matching digests. osst cannot provide the broadcast — that is the
+/// `n` matching digests. frostito cannot provide the broadcast — that is the
 /// caller's job, and a caller without a reliable one must not run this
 /// protocol — but it can make sure every participant computes the digest the
 /// same way, which is what this type is.
