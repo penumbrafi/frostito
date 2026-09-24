@@ -15,7 +15,7 @@
 //! OSST gates authorization, inner FROST produces the partial signature
 //! ```
 //!
-//! # signing protocol (v2)
+//! # signing protocol
 //!
 //! 1. inner holders agree a `session_id`, generate nonce pairs, publish
 //!    H(k ‖ session ‖ D_k ‖ E_k), then reveal (D_k, E_k)
@@ -238,7 +238,7 @@ pub fn combine_shares<S: CurveScalar>(
 pub struct InnerNonces<S: CurveScalar> {
  pub holder_index: u32,
  /// The round this nonce pair belongs to. Carried so that
- /// [`inner_sign_v2`] can refuse to answer a round the holder did not
+ /// [`inner_sign`] can refuse to answer a round the holder did not
  /// commit to.
  pub session_id: [u8; 32],
  pub(crate) hiding: S,
@@ -267,7 +267,7 @@ pub struct InnerCommitments<P: CurvePoint> {
 /// `session_id` names the inner round. It is public, must be agreed by the
 /// inner group before round 1 (a hash of the epoch, the nested position and a
 /// round counter is the intended shape), and is carried through to
-/// [`inner_sign_v2`], which refuses to sign for any other round.
+/// [`inner_sign`], which refuses to sign for any other round.
 pub fn inner_commit<P: CurvePoint, R: rand_core::RngCore + rand_core::CryptoRng>(
  holder_index: u32,
  session_id: [u8; 32],
@@ -463,7 +463,7 @@ pub fn verify_inner_precommit<P: CurvePoint>(
 ///
 /// Through 0.4.x the requirement was a doc comment — "callers MUST have
 /// verified every precommitment" — and nothing called
-/// [`verify_inner_precommit`], including `inner_sign_v2`. "Not load-bearing"
+/// [`verify_inner_precommit`], including `inner_sign`. "Not load-bearing"
 /// and "unenforced" together mean nobody notices when a caller skips it, and
 /// the callers this crate has do skip it.
 ///
@@ -530,7 +530,7 @@ pub fn aggregate_inner_commitment_pair<P: CurvePoint>(
 /// Check that the outer package's commitment for the nested position is the
 /// pair this inner round actually produced.
 ///
-/// Every inner holder calls this — directly, or via [`inner_sign_v2`], which
+/// Every inner holder calls this — directly, or via [`inner_sign`], which
 /// calls it for them — before signing. Without it a coordinator can run the
 /// holders through a round over a commitment set they never agreed to.
 ///
@@ -548,9 +548,7 @@ pub fn verify_nested_commitment<C>(
  inner_commitments: &[InnerCommitments<frost_core::Element<C>>],
 ) -> Result<(), Error>
 where
- C: frost_core::Ciphersuite,
- frost_core::Element<C>: CurvePoint<Scalar = frost_core::Scalar<C>>,
- frost_core::Scalar<C>: CurveScalar,
+    C: crate::curve::NestedSuite,
 {
  let id: frost_core::Identifier<C> = u16::try_from(nested_index)
  .map_err(|_| Error::InvalidIndex)?
@@ -573,7 +571,7 @@ where
 /// Everything an inner holder needs about the OUTER round that legitimately
 /// comes from the coordinator.
 ///
-/// Passed by reference to [`inner_sign_v2`]. Every field is public data; the
+/// Passed by reference to [`inner_sign`]. Every field is public data; the
 /// holder derives the outer binding factor, challenge and Lagrange coefficient
 /// from it locally, so no coordinator ever gets to assert them.
 ///
@@ -593,25 +591,21 @@ where
 ///   That is not a forgery — the result verifies under nothing — but it is
 ///   free choice of `c` over a fixed `m`, which is the degree of freedom the
 ///   ROS literature is about, and there is no reason to concede it. `Y` is now
-///   a separate argument to [`inner_sign_v2`], which the holder must supply
+///   a separate argument to [`inner_sign`], which the holder must supply
 ///   from its own key package, so a request simply cannot carry one.
 /// - **`nested_index`** must be the holder's own group's position in the outer
 ///   set, as fixed when the outer key was generated — not a position a
 ///   coordinator assigns per request.
 /// - **`active_indices`** must be the inner quorum the holder's own group
-///   agreed, not a set the coordinator picks. [`inner_sign_v2`] validates it
+///   agreed, not a set the coordinator picks. [`inner_sign`] validates it
 ///   against `inner_commitments`, which bounds the damage but does not
 ///   make a coordinator-chosen quorum the holder's own choice.
 ///
 /// `package`, `session_id` and `inner_commitments` are checked against local
-/// state inside [`inner_sign_v2`]: the message against the holder's approved
+/// state inside [`inner_sign`]: the message against the holder's approved
 /// bytes, the session against its nonces, and the commitment set against its
 /// own round-1 commitment and the package's nested entry.
-pub struct NestedSigningRequest<'a, C>
-where
- C: frost_core::Ciphersuite,
- frost_core::Element<C>: CurvePoint,
-{
+pub struct NestedSigningRequest<'a, C: crate::curve::NestedSuite> {
  /// The outer signing package (carries the message and the FULL commitment list).
  pub package: &'a frost_core::SigningPackage<C>,
  /// The nested position's index in the OUTER signing set.
@@ -622,7 +616,7 @@ where
  pub session_id: [u8; 32],
  /// The round-0 precommitments, as `(holder_index, precommit)`.
  ///
- /// Verified against `inner_commitments` by [`inner_sign_v2`] — the
+ /// Verified against `inner_commitments` by [`inner_sign`] — the
  /// commit–reveal round is no longer a caller convention. These come from
  /// the inner group's own round 0, not from the coordinator.
  pub inner_precommits: &'a [(u32, [u8; 32])],
@@ -631,20 +625,20 @@ where
  /// The inner quorum actually signing.
  ///
  /// Caller-anchored: see the type documentation. Validated against
- /// `inner_commitments` and `inner_threshold` by [`inner_sign_v2`].
+ /// `inner_commitments` and `inner_threshold` by [`inner_sign`].
  pub active_indices: &'a [u32],
  /// The inner group's own threshold `t_in`, from the holder's inner key
  /// material.
  ///
  /// Caller-anchored, and the reason it is here rather than derived: a
  /// [`SecretShare`] carries an index and a scalar and
- /// nothing else, so `inner_sign_v2` has no way to learn `t_in` from its
+ /// nothing else, so `inner_sign` has no way to learn `t_in` from its
  /// arguments. Supply the value the inner DKG or reshare fixed; a holder
  /// that passes a coordinator's number has anchored nothing.
  pub inner_threshold: u32,
 }
 
-/// Outer context for v2 signing.
+/// Outer context for one signing round.
 ///
 /// The fields are private and [`crate::zf::inner_params_from_zf`] is the only
 /// way to obtain them from public data: a coordinator cannot hand an inner
@@ -652,7 +646,7 @@ where
 /// a coordinator distributes them anyway (a legacy wire format, say), they
 /// which recomputes and rejects a mismatch.
 #[derive(Clone)]
-pub struct InnerSigningParamsV2<S: CurveScalar> {
+pub struct InnerSigningParams<S: CurveScalar> {
  /// outer binding factor for the nested position: ρ = H(Y, index, m, B)
  outer_binding: S,
  /// outer schnorr challenge: c = H(R_outer, Y, m)
@@ -661,7 +655,7 @@ pub struct InnerSigningParamsV2<S: CurveScalar> {
  outer_lambda: S,
 }
 
-impl<S: CurveScalar> InnerSigningParamsV2<S> {
+impl<S: CurveScalar> InnerSigningParams<S> {
  /// Build from an outer context derived somewhere other than
  /// [`from_parts`](Self::from_parts).
  ///
@@ -698,7 +692,7 @@ impl<S: CurveScalar> InnerSigningParamsV2<S> {
 
 }
 
-/// Inner holder's partial signature under v2.
+/// Inner holder's partial signature.
 ///
 /// z_k = d_k + ρ·e_k + (λ_out·c·μ_k)·σ_k
 ///
@@ -731,7 +725,7 @@ impl<S: CurveScalar> InnerSigningParamsV2<S> {
 ///
 /// Any caller whose state can survive or roll back a restart — which is every
 /// daemon — MUST record `(session_id, holder_index)` as spent, durably, before
-/// the share leaves the process. [`inner_sign_v2_spending`] does that ordering
+/// the share leaves the process. [`inner_sign`] does that ordering
 /// for you against a [`SpentSessions`] store; the full contract is on that
 /// trait.
 ///
@@ -753,7 +747,7 @@ impl<S: CurveScalar> InnerSigningParamsV2<S> {
 /// [`Error::MessageMismatch`], [`Error::UnexpectedCommitment`],
 /// [`Error::SessionMismatch`], [`Error::InvalidIndex`],
 /// [`Error::DuplicateIndex`].
-pub fn inner_sign_v2<C>(
+pub fn inner_sign<C>(
  nonces: InnerNonces<frost_core::Scalar<C>>,
  share: &SecretShare<frost_core::Scalar<C>>,
  local_group_pubkey: &frost_core::VerifyingKey<C>,
@@ -761,9 +755,7 @@ pub fn inner_sign_v2<C>(
  request: &NestedSigningRequest<'_, C>,
 ) -> Result<InnerSignatureShare<frost_core::Scalar<C>>, Error>
 where
- C: frost_core::Ciphersuite,
- frost_core::Element<C>: CurvePoint<Scalar = frost_core::Scalar<C>>,
- frost_core::Scalar<C>: CurveScalar,
+    C: crate::curve::NestedSuite,
 {
  // the holder signs a message it holds, not one a coordinator asserts.
  if request.package.message() != approved_message {
@@ -869,7 +861,7 @@ where
 ///
 /// `session_id` is a **mixing guard, not a replay guard.** It threads through
 /// [`InnerNonces`], [`InnerCommitments`] and [`inner_precommit`], and it is
-/// checked for equality in [`inner_sign_v2`],
+/// checked for equality in [`inner_sign`],
 /// [`aggregate_inner_commitment_pair`] and [`verify_nested_commitment`]. What
 /// it buys is that two concurrent inner rounds cannot be spliced into each
 /// other: a commitment from round A cannot be presented as part of round B,
@@ -885,7 +877,7 @@ where
 ///
 /// Two things, both in-process:
 ///
-/// 1. [`inner_sign_v2`] takes `nonces` **by value**, so the pair is consumed
+/// 1. [`inner_sign`] takes `nonces` **by value**, so the pair is consumed
 ///    and zeroized on drop; producing two shares from one commitment round
 ///    requires deliberately cloning.
 /// 2. It checks that the published commitment matches the nonces being
@@ -908,7 +900,7 @@ where
 ///
 /// The implementation must be **durable and write-ahead**: the record has to
 /// be on stable storage, `fsync`'d, *before* the share leaves the process.
-/// [`inner_sign_v2_spending`] calls [`spend`](Self::spend) before it computes
+/// [`inner_sign`] calls [`spend`](Self::spend) before it computes
 /// anything, so an implementation that writes synchronously gets the ordering
 /// for free. An implementation that buffers, or that records after the fact,
 /// provides nothing: the crash window is exactly the window that matters.
@@ -932,6 +924,16 @@ pub trait SpentSessions {
  /// Whether the pair has already been spent. Advisory: a caller must still
  /// go through [`spend`](Self::spend), which is the atomic operation.
  fn is_spent(&self, session_id: &[u8; 32], holder_index: u32) -> bool;
+}
+
+impl<T: SpentSessions + ?Sized> SpentSessions for &mut T {
+    fn spend(&mut self, session_id: &[u8; 32], holder_index: u32) -> Result<(), Error> {
+        (**self).spend(session_id, holder_index)
+    }
+
+    fn is_spent(&self, session_id: &[u8; 32], holder_index: u32) -> bool {
+        (**self).is_spent(session_id, holder_index)
+    }
 }
 
 /// An in-memory [`SpentSessions`], for tests.
@@ -972,69 +974,6 @@ impl SpentSessions for MemorySpentSessions {
  }
 }
 
-/// [`inner_sign_v2`], with `(session_id, holder_index)` recorded as spent
-/// before the share is computed.
-///
-/// This is the form a daemon should use. The write happens first, so a crash
-/// between the record and the share leaves the session burnt rather than
-/// replayable — the safe direction. A caller that records afterwards has
-/// implemented nothing: the crash window is the whole point.
-///
-/// The `session_id` a holder spends is the one in its own nonces, not the one
-/// in the request, so a coordinator cannot get a share recorded against a
-/// session the holder is not in.
-///
-/// # Errors
-///
-/// [`Error::SessionSpent`] if this holder has already signed this session,
-/// whatever the store says happened before the process started; anything
-/// [`SpentSessions::spend`] returns for a write failure; and every error of
-/// [`inner_sign_v2`].
-pub fn inner_sign_v2_spending<C, S: SpentSessions + ?Sized>(
- store: &mut S,
- nonces: InnerNonces<frost_core::Scalar<C>>,
- share: &SecretShare<frost_core::Scalar<C>>,
- local_group_pubkey: &frost_core::VerifyingKey<C>,
- approved_message: &[u8],
- request: &NestedSigningRequest<'_, C>,
-) -> Result<InnerSignatureShare<frost_core::Scalar<C>>, Error>
-where
- C: frost_core::Ciphersuite,
- frost_core::Element<C>: CurvePoint<Scalar = frost_core::Scalar<C>>,
- frost_core::Scalar<C>: CurveScalar,
-{
- store.spend(&nonces.session_id, nonces.holder_index)?;
- inner_sign_v2::<C>(
- nonces,
- share,
- local_group_pubkey,
- approved_message,
- request,
- )
-}
-
-/// [`inner_sign_v2`] with the approved message given as an epoch-bound
-/// [`SigningContext`](crate::SigningContext) rather than raw bytes.
-///
-/// The package must have been built over `ctx.encode()`; otherwise this
-/// returns [`Error::MessageMismatch`]. This is the form to prefer: it
-/// makes the epoch and manifest the holder approved part of the bytes that get
-/// signed, instead of leaving them to a convention.
-pub fn inner_sign_v2_with_context<C>(
- nonces: InnerNonces<frost_core::Scalar<C>>,
- share: &SecretShare<frost_core::Scalar<C>>,
- local_group_pubkey: &frost_core::VerifyingKey<C>,
- ctx: &crate::SigningContext<'_>,
- request: &NestedSigningRequest<'_, C>,
-) -> Result<InnerSignatureShare<frost_core::Scalar<C>>, Error>
-where
- C: frost_core::Ciphersuite,
- frost_core::Element<C>: CurvePoint<Scalar = frost_core::Scalar<C>>,
- frost_core::Scalar<C>: CurveScalar,
-{
- inner_sign_v2::<C>(nonces, share, local_group_pubkey, &ctx.encode(), request)
-}
-
 /// Verify one inner holder's share before it is aggregated:
 ///
 /// z_k·G == (D_k + ρ·E_k) + (λ_out·c·μ_k)·P_k
@@ -1047,7 +986,7 @@ pub fn verify_inner_share<P: CurvePoint>(
  sig: &InnerSignatureShare<P::Scalar>,
  commitment: &InnerCommitments<P>,
  public_share: &P,
- params: &InnerSigningParamsV2<P::Scalar>,
+ params: &InnerSigningParams<P::Scalar>,
  mu_k: &P::Scalar,
 ) -> bool {
  let lhs = P::generator().mul_scalar(&sig.response);
@@ -1074,7 +1013,7 @@ pub fn aggregate_inner_shares_verified<P: CurvePoint>(
  sigs: &[InnerSignatureShare<P::Scalar>],
  commitments: &[InnerCommitments<P>],
  public_shares: &[(u32, P)],
- params: &InnerSigningParamsV2<P::Scalar>,
+ params: &InnerSigningParams<P::Scalar>,
  active_indices: &[u32],
 ) -> Result<P::Scalar, Vec<u32>> {
  let lagrange = match compute_lagrange_coefficients::<P::Scalar>(active_indices) {

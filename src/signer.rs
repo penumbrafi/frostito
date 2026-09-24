@@ -1,64 +1,102 @@
 //! Composable signing.
 //!
-//! `inner_sign_v2`, `inner_sign_v2_spending` and `inner_sign_v2_with_context`
-//! are the same computation with one concern each, and there is no function
-//! for two at once. So: one [`Signer`], and [`Layer`]s that wrap it.
+//! Epoch binding and spent-nonce durability are separate concerns from
+//! producing a share, and there was no function that did two at once. So:
+//! one [`Signer`], and [`Layer`]s that wrap it.
 //!
 //! ```ignore
 //! let mut signer = Stack::new(Holder::new(&share, &verifying_key))
-//!     .layer(Bind::new(&ctx))       // epoch and manifest into the message
-//!     .layer(Spend::new(&mut log))  // durable, before anything else runs
+//!     .layer(Spend::new(log))   // durable, before anything else runs
 //!     .into_inner();
 //!
-//! let z = signer.sign(SignRequest { nonces, approved_message: &msg, nested: &req })?;
+//! let z = signer.sign(SignRequest::bound(nonces, &ctx, &req))?;
 //! ```
 //!
-//! Outermost runs first, as in `tower`: `Spend` above wraps `Bind` wraps
-//! `Holder`, so the session is recorded before any signing work begins.
+//! Outermost runs first, as in `tower`: `Spend` above wraps `Holder`, so the
+//! session is recorded before any signing work begins.
 //!
-//! Ciphersuite semantics are not layers. BIP340's parity normalisation is
-//! part of what signing means under Taproot, not a policy a caller chooses —
-//! and a layer can be left off, where leaving that one off gives silently
-//! invalid signatures.
+//! # what is a layer and what is not
+//!
+//! A layer holds material that outlives the round. What varies per round goes
+//! in the [`SignRequest`] — including the message, which is why it is fixed at
+//! construction by [`raw`](SignRequest::raw) or [`bound`](SignRequest::bound)
+//! and has no public field for anything downstream to substitute.
+//!
+//! Ciphersuite semantics are not layers either. BIP340's parity normalisation
+//! is part of what signing means under Taproot, not a policy a caller
+//! chooses, and a layer can be left off.
 
-use alloc::vec::Vec;
+use alloc::borrow::Cow;
 
-use frost_core::{Ciphersuite, Scalar};
+use frost_core::Scalar;
 
+use crate::curve::NestedSuite;
 use crate::error::Error;
 use crate::nested::{
-    inner_sign_v2, InnerNonces, InnerSignatureShare, NestedSigningRequest, SpentSessions,
+    inner_sign, InnerNonces, InnerSignatureShare, NestedSigningRequest, SpentSessions,
 };
 use crate::SecretShare;
 
 /// One signing request: everything that varies per round.
 ///
-/// The long-lived material — the share and the group key — belongs to the
-/// [`Signer`], not here.
-pub struct SignRequest<'a, C: Ciphersuite>
-where
-    frost_core::Element<C>: crate::curve::CurvePoint,
-    Scalar<C>: crate::curve::CurveScalar,
-{
+/// The long-lived material — the share, the group key, the spent-session
+/// store — belongs to the [`Signer`], not here.
+///
+/// The message is not a public field. It is fixed at construction by
+/// [`raw`](Self::raw) or [`bound`](Self::bound), so there is exactly one
+/// place it can come from and nothing downstream can substitute another.
+pub struct SignRequest<'a, C: NestedSuite> {
     /// This holder's nonces for the round. Consumed: a nonce pair answers once.
     pub nonces: InnerNonces<Scalar<C>>,
-    /// The message the holder approved, which must be the one the package carries.
-    pub approved_message: &'a [u8],
     /// The outer round, as the coordinator published it.
     pub nested: &'a NestedSigningRequest<'a, C>,
+    message: Cow<'a, [u8]>,
+}
+
+impl<'a, C: NestedSuite> SignRequest<'a, C> {
+    /// Sign `approved_message` as given.
+    ///
+    /// Use this only where the bytes are fixed by somebody else — a Bitcoin
+    /// sighash, an Orchard `SpendAuthSig`. Where this protocol chooses what
+    /// gets signed, prefer [`bound`](Self::bound).
+    pub fn raw(
+        nonces: InnerNonces<Scalar<C>>,
+        approved_message: &'a [u8],
+        nested: &'a NestedSigningRequest<'a, C>,
+    ) -> Self {
+        Self {
+            nonces,
+            nested,
+            message: Cow::Borrowed(approved_message),
+        }
+    }
+
+    /// Sign `ctx.encode()`: the message with its epoch and manifest bound in.
+    ///
+    /// The coordinator's package must have been built over the same encoding,
+    /// or signing fails with [`Error::MessageMismatch`].
+    pub fn bound(
+        nonces: InnerNonces<Scalar<C>>,
+        ctx: &crate::SigningContext<'_>,
+        nested: &'a NestedSigningRequest<'a, C>,
+    ) -> Self {
+        Self {
+            nonces,
+            nested,
+            message: Cow::Owned(ctx.encode()),
+        }
+    }
+
+    /// The bytes this holder approved.
+    pub fn approved_message(&self) -> &[u8] {
+        &self.message
+    }
 }
 
 /// A stage that turns a [`SignRequest`] into a signature share.
-pub trait Signer<C: Ciphersuite>
-where
-    frost_core::Element<C>: crate::curve::CurvePoint,
-    Scalar<C>: crate::curve::CurveScalar,
-{
+pub trait Signer<C: NestedSuite> {
     /// Produce this holder's share, or refuse.
-    fn sign(
-        &mut self,
-        req: SignRequest<'_, C>,
-    ) -> Result<InnerSignatureShare<Scalar<C>>, Error>;
+    fn sign(&mut self, req: SignRequest<'_, C>) -> Result<InnerSignatureShare<Scalar<C>>, Error>;
 }
 
 /// Wraps a [`Signer`] in one more concern.
@@ -98,18 +136,12 @@ impl<S> Stack<S> {
 /// `verifying_key` is the holder's *own* key material, never a coordinator's
 /// assertion — that is the whole reason this type holds it rather than taking
 /// it per request.
-pub struct Holder<'k, C: Ciphersuite>
-where
-    Scalar<C>: crate::curve::CurveScalar,
-{
+pub struct Holder<'k, C: NestedSuite> {
     share: &'k SecretShare<Scalar<C>>,
     verifying_key: &'k frost_core::VerifyingKey<C>,
 }
 
-impl<'k, C: Ciphersuite> Holder<'k, C>
-where
-    Scalar<C>: crate::curve::CurveScalar,
-{
+impl<'k, C: NestedSuite> Holder<'k, C> {
     /// A signer for `share`, anchored to `verifying_key`.
     pub fn new(
         share: &'k SecretShare<Scalar<C>>,
@@ -122,21 +154,13 @@ where
     }
 }
 
-impl<C> Signer<C> for Holder<'_, C>
-where
-    C: Ciphersuite,
-    frost_core::Element<C>: crate::curve::CurvePoint<Scalar = Scalar<C>>,
-    Scalar<C>: crate::curve::CurveScalar,
-{
-    fn sign(
-        &mut self,
-        req: SignRequest<'_, C>,
-    ) -> Result<InnerSignatureShare<Scalar<C>>, Error> {
-        inner_sign_v2::<C>(
+impl<C: NestedSuite> Signer<C> for Holder<'_, C> {
+    fn sign(&mut self, req: SignRequest<'_, C>) -> Result<InnerSignatureShare<Scalar<C>>, Error> {
+        inner_sign::<C>(
             req.nonces,
             self.share,
             self.verifying_key,
-            req.approved_message,
+            &req.message,
             req.nested,
         )
     }
@@ -150,25 +174,40 @@ where
 ///
 /// The recording is durable and happens first: if it fails, nothing signs. A
 /// holder that signs and then fails to record has already given up the share.
-pub struct Spend<'s, T: ?Sized> {
-    store: &'s mut T,
+///
+/// The store is owned, so the stack can be built once and held for the life of
+/// the holder; [`Spending::into_store`] gives it back.
+pub struct Spend<T> {
+    store: T,
 }
 
-impl<'s, T: SpentSessions + ?Sized> Spend<'s, T> {
+impl<T: SpentSessions> Spend<T> {
     /// Spend into `store`.
-    pub fn new(store: &'s mut T) -> Self {
+    pub fn new(store: T) -> Self {
         Self { store }
     }
 }
 
 /// [`Spend`] wrapped around a signer.
-pub struct Spending<'s, T: ?Sized, S> {
-    store: &'s mut T,
+pub struct Spending<T, S> {
+    store: T,
     inner: S,
 }
 
-impl<'s, T: SpentSessions + ?Sized, S> Layer<S> for Spend<'s, T> {
-    type Signer = Spending<'s, T, S>;
+impl<T: SpentSessions, S> Spending<T, S> {
+    /// The spent-session store, back out.
+    pub fn into_store(self) -> T {
+        self.store
+    }
+
+    /// The store, borrowed — to query [`SpentSessions::is_spent`].
+    pub fn store(&self) -> &T {
+        &self.store
+    }
+}
+
+impl<T: SpentSessions, S> Layer<S> for Spend<T> {
+    type Signer = Spending<T, S>;
 
     fn layer(self, inner: S) -> Self::Signer {
         Spending {
@@ -178,72 +217,15 @@ impl<'s, T: SpentSessions + ?Sized, S> Layer<S> for Spend<'s, T> {
     }
 }
 
-impl<C, T, S> Signer<C> for Spending<'_, T, S>
+impl<C, T, S> Signer<C> for Spending<T, S>
 where
-    C: Ciphersuite,
-    frost_core::Element<C>: crate::curve::CurvePoint,
-    Scalar<C>: crate::curve::CurveScalar,
-    T: SpentSessions + ?Sized,
+    C: NestedSuite,
+    T: SpentSessions,
     S: Signer<C>,
 {
-    fn sign(
-        &mut self,
-        req: SignRequest<'_, C>,
-    ) -> Result<InnerSignatureShare<Scalar<C>>, Error> {
+    fn sign(&mut self, req: SignRequest<'_, C>) -> Result<InnerSignatureShare<Scalar<C>>, Error> {
         self.store
             .spend(&req.nonces.session_id, req.nonces.holder_index)?;
         self.inner.sign(req)
-    }
-}
-
-/// Binds an epoch and manifest into the message before signing.
-///
-/// The holder then signs `ctx.encode()` rather than a bare payload, so a
-/// signature valid for one epoch is not a valid authorisation in another.
-pub struct Bind<'c> {
-    ctx: &'c crate::SigningContext<'c>,
-}
-
-impl<'c> Bind<'c> {
-    /// Bind `ctx`.
-    pub fn new(ctx: &'c crate::SigningContext<'c>) -> Self {
-        Self { ctx }
-    }
-}
-
-/// [`Bind`] wrapped around a signer.
-pub struct Bound<'c, S> {
-    ctx: &'c crate::SigningContext<'c>,
-    inner: S,
-}
-
-impl<'c, S> Layer<S> for Bind<'c> {
-    type Signer = Bound<'c, S>;
-
-    fn layer(self, inner: S) -> Self::Signer {
-        Bound {
-            ctx: self.ctx,
-            inner,
-        }
-    }
-}
-
-impl<C, S> Signer<C> for Bound<'_, S>
-where
-    C: Ciphersuite,
-    frost_core::Element<C>: crate::curve::CurvePoint,
-    Scalar<C>: crate::curve::CurveScalar,
-    S: Signer<C>,
-{
-    fn sign(
-        &mut self,
-        req: SignRequest<'_, C>,
-    ) -> Result<InnerSignatureShare<Scalar<C>>, Error> {
-        let encoded: Vec<u8> = self.ctx.encode();
-        self.inner.sign(SignRequest {
-            nonces: req.nonces,
-            approved_message: &encoded,
-            nested: req.nested,
-        })
     }
 }

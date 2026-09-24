@@ -1,4 +1,4 @@
-//! Audit regression tests — `frostito::nested` v2 (the 2026-09 review,
+//! Audit regression tests — `frostito::nested` (the 2026-09 review,
 //! findings ..).
 //!
 //! These began as adversarial PoCs on branch `audit-2026-09`, each `#[ignore]`d
@@ -20,7 +20,7 @@ use frost_ristretto255::Ristretto255Sha512 as C;
 use std::collections::BTreeMap;
 use frostito::nested::{
  aggregate_inner_commitment_pair, aggregate_inner_shares_verified, inner_commit,
- inner_precommit, inner_sign_v2, InnerCommitments,
+ inner_precommit, inner_sign, InnerCommitments,
  NestedSigningRequest,
 };
 use frostito::{compute_lagrange_coefficients, Error, SecretShare};
@@ -151,7 +151,7 @@ fn public_shares(shares: &[SecretShare<Scalar>]) -> Vec<(u32, Point)> {
 /// (High, FIXED) — a malicious coordinator can no longer obtain a
 /// signature on a message the inner group never authorised.
 ///
-/// `inner_sign_v2` now takes the message the holder approved and the full
+/// `inner_sign` now takes the message the holder approved and the full
 /// public commitment set, recomputes the outer binding factor and challenge
 /// itself, and refuses to produce a share when the package carries a different
 /// message. The coordinator still derives its own context honestly — that was
@@ -196,7 +196,7 @@ fn coordinator_cannot_swap_the_message_under_the_inner_group() {
  // The jury approved APPROVED. Every holder refuses, at the API.
  for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
  assert_eq!(
- inner_sign_v2::<C>(n, s, &vk(w.group_pubkey), APPROVED, &request).unwrap_err(),
+ inner_sign::<C>(n, s, &vk(w.group_pubkey), APPROVED, &request).unwrap_err(),
  Error::MessageMismatch,
  "a holder must not sign a package over a message it did not approve"
  );
@@ -243,7 +243,7 @@ fn the_approved_message_still_signs() {
 
  let mut sigs = Vec::new();
  for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
- sigs.push(inner_sign_v2::<C>(n, s, &vk(w.group_pubkey), APPROVED, &request).unwrap());
+ sigs.push(inner_sign::<C>(n, s, &vk(w.group_pubkey), APPROVED, &request).unwrap());
  }
 
  let params =
@@ -283,7 +283,7 @@ fn the_approved_message_still_signs() {
 /// (Medium, FIXED) — the nested position's commitment pair in the outer
 /// package is now tied to the inner commitment round.
 ///
-/// `inner_sign_v2` recomputes `(Sum D_k, Sum E_k)` over the round-1 set for the
+/// `inner_sign` recomputes `(Sum D_k, Sum E_k)` over the round-1 set for the
 /// session the nonces were committed to, and compares it to the package's
 /// entry for the nested position. A substituted entry is named, not silently
 /// signed over.
@@ -325,7 +325,7 @@ fn substituted_nested_commitment_is_rejected_by_the_holder() {
 
  for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
  assert_eq!(
- inner_sign_v2::<C>(n, s, &vk(w.group_pubkey), msg, &request).unwrap_err(),
+ inner_sign::<C>(n, s, &vk(w.group_pubkey), msg, &request).unwrap_err(),
  Error::UnexpectedCommitment,
  "the holder must notice that the outer package is not over its own round"
  );
@@ -375,7 +375,7 @@ fn nonces_from_another_session_are_rejected() {
  // Holder 1 still holds round A's nonces; it must not answer round B.
  let n = nonces_a.remove(0);
  assert_eq!(
- inner_sign_v2::<C>(n, &w.inner_shares[0], &vk(w.group_pubkey), msg, &request).unwrap_err(),
+ inner_sign::<C>(n, &w.inner_shares[0], &vk(w.group_pubkey), msg, &request).unwrap_err(),
  Error::SessionMismatch
  );
 
@@ -427,7 +427,7 @@ fn incomplete_quorum_is_rejected() {
 
  let mut sigs = Vec::new();
  for (n, s) in nonces.into_iter().zip(w.inner_shares.iter()) {
- sigs.push(inner_sign_v2::<C>(n, s, &vk(w.group_pubkey), msg, &request).unwrap());
+ sigs.push(inner_sign::<C>(n, s, &vk(w.group_pubkey), msg, &request).unwrap());
  }
  let pubs = public_shares(&w.inner_shares);
 
@@ -468,13 +468,13 @@ fn incomplete_quorum_is_rejected() {
  );
 }
 
-/// (Info) — the v2 equivalence claim holds on honest inputs.
+/// (Info) — the equivalence claim holds on honest inputs.
 ///
 /// A nested position's response is bit-for-bit what a flat FROST signer
 /// holding sigma_2 with nonces (Sum d_k, Sum e_k) produces. Note what this
 /// establishes: honest-transcript equality, not a reduction.
 #[test]
-fn v2_response_equals_the_flat_frost_response() {
+fn response_equals_the_flat_frost_response() {
  let mut rng = OsRng;
  let secret = <Scalar as CurveScalar>::random(&mut rng);
  let a1 = <Scalar as CurveScalar>::random(&mut rng);
@@ -516,7 +516,7 @@ fn v2_response_equals_the_flat_frost_response() {
 
  let mut sigs = Vec::new();
  for (n, s) in nonces.into_iter().zip(inner.iter()) {
- sigs.push(inner_sign_v2::<C>(n, s, &vk(group_pubkey), b"m", &request).unwrap());
+ sigs.push(inner_sign::<C>(n, s, &vk(group_pubkey), b"m", &request).unwrap());
  }
  let mut z_nested = <Scalar as CurveScalar>::zero();
  for s in &sigs {
@@ -544,7 +544,7 @@ fn v2_response_equals_the_flat_frost_response() {
 /// — `active_indices` is coordinator-supplied and was unvalidated on the
 /// signing side.
 ///
-/// `inner_sign_v2` checked only that this holder appeared somewhere in the
+/// `inner_sign` checked only that this holder appeared somewhere in the
 /// list. A set with duplicates, with members that published no round-1
 /// commitment, or smaller than `t_in` produced μ_k over a quorum that does not
 /// match the ΣD the package committed to, and the share simply failed to
@@ -599,7 +599,7 @@ fn a_malformed_quorum_is_rejected_by_the_signer() {
  inner_threshold: t,
  };
 
- let err = inner_sign_v2::<C>(
+ let err = inner_sign::<C>(
  nonces.remove(0),
  &w.inner_shares[0],
  &vk(w.group_pubkey),
@@ -658,7 +658,7 @@ fn a_reveal_without_a_matching_precommit_is_rejected() {
 }
 
 /// — the session id is a mixing guard, not a replay guard, and
-/// `inner_sign_v2_spending` is where a caller bolts on the missing half.
+/// `inner_sign` is where a caller bolts on the missing half.
 ///
 /// Consuming the nonces by value protects one process. It does not survive a
 /// snapshot-restore, which brings the nonces back and lets them sign again
@@ -667,7 +667,8 @@ fn a_reveal_without_a_matching_precommit_is_rejected() {
 /// restored VM has.
 #[test]
 fn a_spent_session_cannot_sign_twice_across_a_restore() {
- use frostito::nested::{inner_sign_v2_spending, MemorySpentSessions, SpentSessions};
+ use frostito::nested::{MemorySpentSessions, SpentSessions};
+ use frostito::signer::{Holder, SignRequest, Signer, Spend, Stack};
 
  let mut rng = OsRng;
  let w = world(&mut rng);
@@ -696,19 +697,19 @@ fn a_spent_session_cannot_sign_twice_across_a_restore() {
  inner_threshold: 3,
  };
 
- let mut store = MemorySpentSessions::new();
+ let store = MemorySpentSessions::new();
  assert!(!store.is_spent(&SESSION, 1));
 
- inner_sign_v2_spending::<C, _>(
- &mut store,
- nonces.remove(0),
- &w.inner_shares[0],
- &vk(w.group_pubkey),
- b"m",
- &request,
- )
+ // the stack is built once and held: the store lives in the layer.
+ let key = vk(w.group_pubkey);
+ let mut signer = Stack::new(Holder::new(&w.inner_shares[0], &key))
+ .layer(Spend::new(store))
+ .into_inner();
+
+ signer
+ .sign(SignRequest::raw(nonces.remove(0), b"m", &request))
  .expect("the first share is produced normally");
- assert!(store.is_spent(&SESSION, 1));
+ assert!(signer.store().is_spent(&SESSION, 1));
 
  // the restore: the node comes back from a snapshot taken before it
  // signed, re-runs round 1 for the same session, and tries again. Every
@@ -737,14 +738,8 @@ fn a_spent_session_cannot_sign_twice_across_a_restore() {
  inner_threshold: 3,
  };
  assert_eq!(
- inner_sign_v2_spending::<C, _>(
- &mut store,
- restored,
- &w.inner_shares[0],
- &vk(w.group_pubkey),
- b"m",
- &restored_request,
- )
+ signer
+ .sign(SignRequest::raw(restored, b"m", &restored_request))
  .unwrap_err(),
  Error::SessionSpent,
  "a restored node must not answer the same session twice"
@@ -752,17 +747,15 @@ fn a_spent_session_cannot_sign_twice_across_a_restore() {
 
  // another holder in the same session is unaffected: the pair is
  // (session, holder), not the session alone
+ let store = signer.into_store();
  assert!(!store.is_spent(&SESSION, 2));
- inner_sign_v2_spending::<C, _>(
- &mut store,
- nonces.remove(0),
- &w.inner_shares[1],
- &vk(w.group_pubkey),
- b"m",
- &request,
- )
+ let mut signer_2 = Stack::new(Holder::new(&w.inner_shares[1], &key))
+ .layer(Spend::new(store))
+ .into_inner();
+ signer_2
+ .sign(SignRequest::raw(nonces.remove(0), b"m", &request))
  .expect("holder 2 has not signed this session");
- assert_eq!(store.len(), 2);
+ assert_eq!(signer_2.into_store().len(), 2);
 }
 
 /// Identifiable abort inside the inner group: a tampered inner share is
@@ -817,7 +810,7 @@ fn a_dishonest_inner_holder_is_named() {
 
     let mut sigs = Vec::new();
     for (n, share) in nonces.into_iter().zip(inner.iter()) {
-        sigs.push(inner_sign_v2::<C>(n, share, &vk(group_pubkey), msg, &request).unwrap());
+        sigs.push(inner_sign::<C>(n, share, &vk(group_pubkey), msg, &request).unwrap());
     }
 
     // holder 2 goes rogue
@@ -836,17 +829,19 @@ fn a_dishonest_inner_holder_is_named() {
 
 /// Spending and epoch-binding at once — which the free functions could not do.
 ///
-/// `inner_sign_v2_spending` and `inner_sign_v2_with_context` each added one
+/// `inner_sign` and `inner_sign` each added one
 /// concern and there was no third function for both. A caller who wanted a
 /// durable spend record *and* an epoch-bound message had to write it, and the
-/// order is not obvious: spend first, or bind first? Get it wrong and you
-/// record a session you then refuse to sign, or sign one you never recorded.
+/// order is not obvious, and getting it wrong means recording a session you
+/// then refuse to sign, or signing one you never recorded.
 ///
-/// As a stack the order is in the composition, and both hold.
+/// As a stack the order is in the composition. Binding is not a layer: it is
+/// how the request names its message, so it cannot be silently overridden by
+/// something further down.
 #[test]
-fn a_stack_composes_spending_and_epoch_binding() {
+fn a_stack_spends_and_the_request_binds() {
     use frostito::nested::MemorySpentSessions;
-    use frostito::signer::{Bind, Holder, SignRequest, Signer, Spend, Stack};
+    use frostito::signer::{Holder, SignRequest, Signer, Spend, Stack};
     use frostito::SigningContext;
 
     let mut rng = OsRng;
@@ -878,37 +873,48 @@ fn a_stack_composes_spending_and_epoch_binding() {
         inner_threshold: 3,
     };
 
-    let mut log = MemorySpentSessions::new();
+    let log = MemorySpentSessions::new();
     let share = &w.inner_shares[0];
     let key = vk(w.group_pubkey);
 
     // Spend outermost, so the session is durable before any signing happens.
     let mut signer = Stack::new(Holder::new(share, &key))
-        .layer(Bind::new(&ctx))
-        .layer(Spend::new(&mut log))
+        .layer(Spend::new(log))
         .into_inner();
 
-    let first = signer.sign(SignRequest {
-        nonces: nonces.remove(0),
-        // `Bind` replaces this with ctx.encode(), so a bare payload is fine.
-        approved_message: b"release the escrow",
-        nested: &request,
-    });
+    // `bound` is the only place the message comes from, and it is the epoch
+    // encoding — not the bare payload the context was built around.
+    let req = SignRequest::bound(nonces.remove(0), &ctx, &request);
+    assert_eq!(req.approved_message(), bound.as_slice());
+    assert_ne!(req.approved_message(), b"release the escrow");
+
+    let first = signer.sign(req);
     assert!(first.is_ok(), "the composed stack must sign: {first:?}");
 
     // The epoch binding held: the package carries ctx.encode(), and
-    // `inner_sign_v2` refuses a package whose message is not what it signed.
+    // `inner_sign` refuses a package whose message is not what it signed.
     assert_eq!(package.message(), bound.as_slice());
 
-    // And the spend record went in, so the same nonces cannot answer twice.
-    let (n2, _) = inner_commit::<Point, _>(w.quorum[0], SESSION, &mut rng);
-    let again = signer.sign(SignRequest {
-        nonces: n2,
-        approved_message: b"release the escrow",
-        nested: &request,
-    });
+    // A raw request for the bare payload is refused against the same package,
+    // which is what makes the binding load-bearing rather than decorative.
+    let (n_raw, _) = inner_commit::<Point, _>(w.quorum[0], SESSION, &mut rng);
+    let mut unspent = Stack::new(Holder::new(share, &key))
+        .layer(Spend::new(MemorySpentSessions::new()))
+        .into_inner();
     assert_eq!(
-        again.unwrap_err(),
+        unspent
+            .sign(SignRequest::raw(n_raw, b"release the escrow", &request))
+            .unwrap_err(),
+        frostito::Error::MessageMismatch,
+        "an unbound message must not pass for a bound one"
+    );
+
+    // And the spend record went in, so the same session cannot answer twice.
+    let (n2, _) = inner_commit::<Point, _>(w.quorum[0], SESSION, &mut rng);
+    assert_eq!(
+        signer
+            .sign(SignRequest::bound(n2, &ctx, &request))
+            .unwrap_err(),
         frostito::Error::SessionSpent,
         "the spend layer must refuse a second answer for the same session"
     );

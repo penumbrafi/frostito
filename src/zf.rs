@@ -255,13 +255,12 @@ pub use decaf377_suite::{
 
 use alloc::vec::Vec;
 
-use crate::curve::{CurvePoint, CurveScalar};
 use crate::error::Error as FrostitoError;
 use crate::lagrange::compute_lagrange_coefficients;
-use crate::nested::InnerSigningParamsV2;
+use crate::nested::InnerSigningParams;
 use frost_core::{
     Field, Group, compute_binding_factor_list, compute_group_commitment, Ciphersuite as Cs,
-    Element as ZfElement, Identifier, Scalar as CScalar, SigningPackage, VerifyingKey,
+    Identifier, Scalar as CScalar, SigningPackage, VerifyingKey,
 };
 
 /// This crate's `u32` share index, from a ZF [`Identifier`].
@@ -301,7 +300,7 @@ pub fn identifier_to_index<C: Cs>(id: &Identifier<C>) -> Result<u32, FrostitoErr
 /// The outer FROST context an inner holder needs, recomputed from a ZF
 /// [`SigningPackage`] rather than from this crate's own FROST.
 ///
-/// This is [`InnerSigningParamsV2::from_parts`] over `frost-core`: same three
+/// This is [`InnerSigningParams::from_parts`] over `frost-core`: same three
 /// values, same local derivation, so a coordinator still asserts none of them.
 /// It is what lets a nested position sit inside a real RFC 9591 group.
 ///
@@ -318,11 +317,9 @@ pub fn inner_params_from_zf<C>(
     package: &SigningPackage<C>,
     verifying_key: &VerifyingKey<C>,
     nested_index: u32,
-) -> Result<InnerSigningParamsV2<CScalar<C>>, FrostitoError>
+) -> Result<InnerSigningParams<CScalar<C>>, FrostitoError>
 where
-    C: Cs,
-    ZfElement<C>: CurvePoint<Scalar = CScalar<C>>,
-    CScalar<C>: CurveScalar,
+    C: crate::curve::NestedSuite,
 {
     let mut indices = Vec::with_capacity(package.signing_commitments().len());
     for id in package.signing_commitments().keys() {
@@ -364,7 +361,7 @@ where
     let c = C::challenge(&r.to_element(), verifying_key, package.message())
         .map_err(|_| FrostitoError::InvalidCommitment)?;
 
-    Ok(InnerSigningParamsV2::from_parts(
+    Ok(InnerSigningParams::from_parts(
         rho,
         c.to_scalar(),
         lagrange[pos],

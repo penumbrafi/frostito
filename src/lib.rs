@@ -46,7 +46,6 @@ pub mod curve;
 pub mod dkg;
 mod error;
 mod lagrange;
-pub mod liveness;
 pub mod nested;
 pub mod reshare;
 pub mod signer;
@@ -57,21 +56,9 @@ pub mod sealed;
 pub(crate) mod test_rng;
 
 pub use context::{SigningContext, SIGNING_CONTEXT_DOMAIN};
-pub use curve::{Curve, CurvePoint, CurveScalar};
+pub use curve::{CurvePoint, CurveScalar, NestedSuite};
 pub use error::Error;
 pub use lagrange::compute_lagrange_coefficients;
-
-#[cfg(feature = "ristretto255")]
-pub use curve::ristretto::Ristretto255;
-
-#[cfg(feature = "pallas")]
-pub use curve::pallas::{OrchardSpendAuthCurve, PallasCurve};
-
-#[cfg(feature = "secp256k1")]
-pub use curve::secp256k1::Secp256k1Curve;
-
-#[cfg(feature = "decaf377")]
-pub use curve::decaf377::Decaf377Curve;
 
 /// Sample a uniform scalar for any backend curve, from a `rand_core` 0.6 RNG.
 ///
@@ -157,20 +144,6 @@ impl<S: CurveScalar> SecretShare<S> {
  }
 }
 
-
-// ============================================================================
-// Ristretto255-specific convenience exports (default)
-// ============================================================================
-
-
-// ============================================================================
-// Pallas-specific convenience exports
-// ============================================================================
-
-
-// ============================================================================
-// Tests (Pallas)
-// ============================================================================
 
 
 

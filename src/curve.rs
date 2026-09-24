@@ -125,12 +125,6 @@ pub trait CurvePoint: Clone + Debug + Sized + PartialEq + Send + Sync {
 
 extern crate alloc;
 
-/// Complete curve backend
-pub trait Curve: Clone + Debug + Default {
- type Scalar: CurveScalar;
- type Point: CurvePoint<Scalar = Self::Scalar>;
-}
-
 // ============================================================================
 // Ristretto255 implementation
 // ============================================================================
@@ -237,14 +231,6 @@ pub mod ristretto {
  }
  }
 
- /// Ristretto255 curve backend
- #[derive(Clone, Debug, Default)]
- pub struct Ristretto255;
-
- impl Curve for Ristretto255 {
- type Scalar = Scalar;
- type Point = RistrettoPoint;
- }
 }
 
 // ============================================================================
@@ -368,20 +354,6 @@ pub mod pallas {
  }
  }
 
- /// Pallas curve backend using the *curve* generator.
- ///
- /// Not Zcash-compatible on its own: Orchard spend authorization
- /// (RedPallas `SpendAuth`) uses a hash-to-curve basepoint, not the Pallas
- /// generator. Use [`OrchardSpendAuthCurve`] for anything that must agree
- /// with ZF `reddsa` / `frost-core` FROST(Pallas) key material.
- #[derive(Clone, Debug, Default)]
- pub struct PallasCurve;
-
- impl Curve for PallasCurve {
- type Scalar = Scalar;
- type Point = Point;
- }
-
  /// Byte encoding of the Orchard `SpendAuthSig` basepoint.
  /// Reproducible by `pallas::Point::hash_to_curve("z.cash:Orchard")(b"G").to_bytes()`.
  /// Same constant as `reddsa::orchard::ORCHARD_SPENDAUTHSIG_BASEPOINT_BYTES`.
@@ -395,8 +367,13 @@ pub mod pallas {
  /// operates in, so shares, commitments and verifying shares produced with
  /// this backend load directly into `frost-core` key packages.
  ///
+ /// Use this, not the bare `pallas::Point`, for anything that must agree
+ /// with ZF key material: Orchard spend authorization uses a hash-to-curve
+ /// basepoint, not the Pallas generator, and Feldman commitments only verify
+ /// in the same group as the shares.
+ ///
  /// Byte encoding is the plain Pallas point encoding, so values convert to
- /// and from the `PallasCurve` backend and ZF types losslessly.
+ /// and from the bare `pallas::Point` and ZF types losslessly.
  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
  pub struct SpendAuthPoint(pub Point);
 
@@ -453,14 +430,6 @@ pub mod pallas {
  }
  }
 
- /// Pallas backend in the Orchard spend-auth group. Zcash-compatible.
- #[derive(Clone, Debug, Default)]
- pub struct OrchardSpendAuthCurve;
-
- impl Curve for OrchardSpendAuthCurve {
- type Scalar = Scalar;
- type Point = SpendAuthPoint;
- }
 }
 
 // ============================================================================
@@ -645,14 +614,6 @@ pub mod secp256k1 {
  }
  }
 
- /// secp256k1 curve backend (Bitcoin)
- #[derive(Clone, Debug, Default)]
- pub struct Secp256k1Curve;
-
- impl Curve for Secp256k1Curve {
- type Scalar = Scalar;
- type Point = ProjectivePoint;
- }
 }
 
 // ============================================================================
@@ -765,12 +726,38 @@ pub mod decaf377 {
  }
  }
 
- /// decaf377 curve backend (Penumbra)
- #[derive(Clone, Debug, Default)]
- pub struct Decaf377Curve;
+}
 
- impl Curve for Decaf377Curve {
- type Scalar = Fr;
- type Point = Element;
- }
+/// A `frost-core` ciphersuite whose group and field this crate can also drive
+/// directly.
+///
+/// The nested protocol works in two vocabularies at once: `frost-core`'s, for
+/// the outer round, and this crate's [`CurvePoint`]/[`CurveScalar`], for the
+/// inner arithmetic. Every nested item therefore needs all three of
+///
+/// ```text
+/// C: Ciphersuite,
+/// frost_core::Element<C>: CurvePoint<Scalar = frost_core::Scalar<C>>,
+/// frost_core::Scalar<C>: CurveScalar,
+/// ```
+///
+/// which is noise on every signature. This trait names that conjunction once.
+/// The blanket impl means a suite satisfies it automatically — there is
+/// nothing to implement.
+pub trait NestedSuite:
+    frost_core::Ciphersuite<
+        Group: frost_core::Group<
+            Field: frost_core::Field<Scalar: CurveScalar>,
+            Element: CurvePoint<Scalar = frost_core::Scalar<Self>>,
+        >,
+    >
+{
+}
+
+impl<C> NestedSuite for C
+where
+    C: frost_core::Ciphersuite,
+    frost_core::Element<C>: CurvePoint<Scalar = frost_core::Scalar<C>>,
+    frost_core::Scalar<C>: CurveScalar,
+{
 }

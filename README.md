@@ -19,11 +19,11 @@ cover:
 
 ```toml
 [dependencies]
-frostito = { version = "0.7.1", features = ["zf-secp256k1-tr", "sealed"] }
+frostito = { version = "0.8.0", features = ["zf-secp256k1-tr", "sealed"] }
 ```
 
-pin `0.7.1` or later. 0.7.0 rejects every secp256k1 identifier on the nested
-path and cannot sign.
+pin `0.8.0`. it renames the nested signing API, with no deprecation path from
+0.7.x.
 
 ### features
 
@@ -59,7 +59,7 @@ concrete point type.
 | `ristretto255` | curve25519 | polkadot, sr25519 |
 | `secp256k1` | secp256k1 | bitcoin, ethereum |
 | `pallas` | pallas, curve generator | generic pallas |
-| `pallas` | pallas, orchard spend-auth group (`OrchardSpendAuthCurve`) | zcash orchard, ZF `reddsa` |
+| `pallas` | pallas, orchard spend-auth group (`curve::pallas::SpendAuthPoint`) | zcash orchard, ZF `reddsa` |
 | `decaf377` | decaf377 | see the penumbra row above — not penumbra spend-auth |
 
 ## distributed key generation
@@ -92,12 +92,11 @@ agreed.confirm_all(&peer_digests, n as usize)?;
 
 // round 2 — sealed per recipient, bound to sender, recipient and ceremony
 let roster = sealed::SealedRoster::new(&x25519_pubkeys, session_id)?;
-for j in 1..=n {
-    let packet = sealed::seal_subshare::<Point>(
-        &my_x25519_secret, &roster, 2,
-        &dealer.generate_subshare(j)?, dealer.commitment(),
-    )?;
-    send_to(j, packet);
+for (j, packet) in sealed::seal_round2::<Point>(&dealer, &my_x25519_secret, &roster, 2)?
+    .into_iter()
+    .enumerate()
+{
+    send_to(j as u32 + 1, packet);
 }
 
 // aggregate over exactly the agreed dealer set
@@ -144,29 +143,34 @@ what that establishes is honest-transcript equality, not a reduction. the
 inner group is one trust unit: `t_in` corrupt holders are a corrupt outer
 signer, with no further guarantee.
 
-under taproot the parity normalisation is not yet applied by `inner_sign_v2` —
+under taproot the parity normalisation is not yet applied by `inner_sign` —
 the recipe is verified in the tests, but a caller has to follow it by hand
 until it moves into the holder.
 
 ## signing
 
-epoch binding and spent-nonce durability are separate concerns from signing,
-and there was no function for two at once — so they are layers instead, in
-`tower`'s shape.
+spent-nonce durability is a separate concern from producing a share, and
+there was no function that did both. so it is a layer, in `tower`'s shape.
 
 ```rust
-use frostito::signer::{Bind, Holder, SignRequest, Signer, Spend, Stack};
+use frostito::signer::{Holder, SignRequest, Signer, Spend, Stack};
 
+// built once and held: the store lives in the layer
 let mut signer = Stack::new(Holder::new(&share, &verifying_key))
-    .layer(Bind::new(&ctx))       // epoch and manifest into the message
-    .layer(Spend::new(&mut log))  // durable, before anything else runs
+    .layer(Spend::new(log))   // durable, before anything else runs
     .into_inner();
 
-let z = signer.sign(SignRequest { nonces, approved_message: &msg, nested: &req })?;
+// epoch and manifest bound into the bytes, per round
+let z = signer.sign(SignRequest::bound(nonces, &ctx, &req))?;
 ```
 
-outermost runs first: `Spend` wraps `Bind` wraps `Holder`, so the session is
-recorded before any signing work begins.
+outermost runs first: `Spend` wraps `Holder`, so the session is recorded
+before any signing work begins.
+
+a layer holds material that outlives the round; what varies per round goes in
+the request. so the message is not a layer — it is fixed at construction,
+`raw` for bytes somebody else chose (a sighash) and `bound` for bytes this
+protocol chose, with no public field for anything downstream to substitute.
 
 ## resharing
 
@@ -224,7 +228,6 @@ none of this is supplied by the crate, and all of it is load-bearing:
 - `frostito::signer` — composable signing: `Holder`, `Bind`, `Spend`, `Stack`
 - `frostito::reshare` — proactive secret sharing
 - `frostito::context` — epoch-bound signing contexts
-- `frostito::liveness` — checkpoint proofs for holder participation
 - `frostito::zf` — the bridge that drives `nested` from a `frost_core` signing
   package, plus `Decaf377Sha512`
 - `frostito::curve` — curve backend traits

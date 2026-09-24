@@ -11,10 +11,10 @@
 //! live rather than duplicated:
 //!
 //! - the *duplicate* branch of — `incomplete_quorum_is_rejected` in
-//!   `audit_nested_v2.rs` asserts `vec![1, 3]` for a duplicated share
+//!   `audit_nested.rs` asserts `vec![1, 3]` for a duplicated share
 //!   alongside a missing holder, so both branches were covered;
 //! - `SessionMismatch` in `aggregate_inner_commitment_pair` as distinct from
-//!   in `inner_sign_v2` — `nonces_from_another_session_are_rejected` asserts
+//!   in `inner_sign` — `nonces_from_another_session_are_rejected` asserts
 //!   both, the second over a mixed commitment set.
 //!
 //! The rest existed only as `#[cfg(test)]` unit tests inside `src/`, which is

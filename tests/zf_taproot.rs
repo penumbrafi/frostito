@@ -125,7 +125,7 @@ fn the_nested_bridge_takes_the_taproot_suite() {
 /// the nested design exists to keep.
 ///
 /// This passes, so the composition is sound under Taproot. What is still
-/// missing is the library API: `inner_sign_v2` does not apply steps 2 and 4,
+/// missing is the library API: `inner_sign` does not apply steps 2 and 4,
 /// because `Ciphersuite` has no generic way to ask whether a suite normalises
 /// parity — x-only encoding is a secp256k1 notion. That needs a small trait,
 /// and until it exists a caller must apply the recipe itself.

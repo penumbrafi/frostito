@@ -1,33 +1,66 @@
 # changelog
 
-## [Unreleased]
+## [0.8.0] - 2026-09-24
 
-### composable signing: `frostito::signer`
+### Added
 
-`inner_sign_v2`, `inner_sign_v2_spending` and `inner_sign_v2_with_context`
-were the same computation with one concern each and no way to have two at
-once. Three concerns is eight combinations; the crate shipped three, and a
-caller wanting a durable spend record *and* an epoch-bound message wrote it
-themselves — including deciding an ordering that is not obvious.
+- **`frostito::signer` — composable signing.** `inner_sign_v2`,
+  `inner_sign_v2_spending` and `inner_sign_v2_with_context` were the same
+  computation with one concern each and no way to have two at once. Three
+  concerns is eight combinations; the crate shipped three, and a caller
+  wanting a durable spend record *and* an epoch-bound message wrote it
+  themselves, including deciding an ordering that is not obvious.
 
-So: one `Signer`, and `Layer`s that wrap it, in the shape `tower` uses.
+  So: one `Signer`, and `Layer`s that wrap it, in the shape `tower` uses.
 
-```rust
-let mut signer = Stack::new(Holder::new(&share, &verifying_key))
-    .layer(Bind::new(&ctx))
-    .layer(Spend::new(&mut log))
-    .into_inner();
-```
+  ```rust
+  let mut signer = Stack::new(Holder::new(&share, &verifying_key))
+      .layer(Spend::new(log))
+      .into_inner();
 
-Outermost runs first, as in `tower`: the session is recorded before any
-signing work begins. `tests/audit_nested_v2.rs` exercises the combination that
-had no function.
+  let z = signer.sign(SignRequest::bound(nonces, &ctx, &req))?;
+  ```
 
-Ciphersuite semantics are not layers. BIP340's parity normalisation is part of
-what signing means under Taproot, not a policy — and a layer can be left off,
-where leaving that one off gives silently invalid signatures.
+  Outermost runs first: the session is recorded before any signing work
+  begins. A layer holds material that outlives the round; what varies per
+  round goes in the request. So the message is not a layer — it is fixed at
+  construction by `SignRequest::raw` (bytes somebody else chose, a sighash)
+  or `SignRequest::bound` (bytes this protocol chose), with no public field
+  for anything downstream to substitute.
 
-The free functions remain.
+  Ciphersuite semantics are not layers either. BIP340's parity normalisation
+  is part of what signing means under Taproot, not a policy, and a layer can
+  be left off.
+
+- `curve::NestedSuite` names the conjunction every nested item used to repeat
+  (`C: Ciphersuite`, `Element<C>: CurvePoint<Scalar = Scalar<C>>`,
+  `Scalar<C>: CurveScalar`). Blanket-implemented, so there is nothing to
+  write; public signatures bound on it instead of on three clauses.
+
+### Changed
+
+- `inner_sign_v2` → `inner_sign`, `InnerSigningParamsV2` → `InnerSigningParams`.
+  Nothing named v1 is left to distinguish them from; it was never released.
+
+### Removed
+
+- **`frostito::liveness`**, 760 lines. Nothing in the crate or its tests
+  referenced it, its module docs described an integration with `ligerito`
+  that was never a dependency, and its test vectors still hashed
+  `OSST-CONTRIBUTION-V1` — a protocol removed in 0.7.0.
+- **The `Curve` trait** and the marker types `Ristretto255`, `PallasCurve`,
+  `OrchardSpendAuthCurve`, `Secp256k1Curve`, `Decaf377Curve`. Everything is
+  generic over `P: CurvePoint` directly; `Curve` only ever mapped a name to a
+  `(Point, Scalar)` pair and no protocol code used it. Name the point type:
+  `curve::pallas::SpendAuthPoint` instead of
+  `<OrchardSpendAuthCurve as Curve>::Point`.
+- `inner_sign_v2_spending` and `inner_sign_v2_with_context`. The stack is what
+  replaces them: `Spend` for the first, `SignRequest::bound` for the second,
+  and unlike them the two compose.
+
+Breaking for 0.7.x callers of the nested signing API, with no deprecation
+path. 0.7.0 additionally cannot sign on secp256k1 at all and should be
+yanked.
 
 ## [0.7.1] - 2026-09-23
 

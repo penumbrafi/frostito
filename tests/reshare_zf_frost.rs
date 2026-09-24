@@ -7,21 +7,21 @@
 //! reshare math lives in frostito, the signing lives in ZF frost, and the
 //! group key never changes.
 //!
-//! Uses the `OrchardSpendAuthCurve` backend: ZF's FROST(Pallas) operates in
-//! the Orchard spend-auth basepoint group, not under the Pallas generator,
-//! and Feldman commitments only verify in the same group as the shares.
+//! Uses the Orchard spend-auth point type: ZF's FROST(Pallas) operates in the
+//! Orchard spend-auth basepoint group, not under the Pallas generator, and
+//! Feldman commitments only verify in the same group as the shares.
 #![cfg(feature = "pallas")]
 
 use std::collections::BTreeMap;
 
-use frostito::curve::{Curve, CurvePoint, CurveScalar};
+use frostito::curve::pallas::SpendAuthPoint;
+use frostito::curve::{CurvePoint, CurveScalar};
 use frostito::reshare::{Aggregator, Dealer, SharePolynomial};
-use frostito::OrchardSpendAuthCurve;
 use rand::rngs::OsRng;
 use reddsa::frost::redpallas::{self as zf, keys, round1, round2, Identifier};
 
-type P = <OrchardSpendAuthCurve as Curve>::Point;
-type S = <OrchardSpendAuthCurve as Curve>::Scalar;
+type P = SpendAuthPoint;
+type S = <SpendAuthPoint as CurvePoint>::Scalar;
 
 fn id(i: u32) -> Identifier {
  Identifier::try_from(i as u16).unwrap()
