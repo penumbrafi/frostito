@@ -201,6 +201,21 @@ assert!(polynomial.verify_share(player_index, &new_share));
 `ReshareState::dealer_set()` gives the deterministic choice (the `t_old`
 lowest committed dealer indices) for coordinators to put in the manifest.
 
+every dealer must also prove it can open the constant term it published:
+
+```rust
+let proof = dealer.prove_possession(epoch, &mut rng);
+state.submit_commitment(dealer.commitment().clone(), &proof)?;  // refuses without it
+```
+
+the commitment alone is a statement about a point. a dealer can copy
+`g^{s_j}` out of the previous epoch's public polynomial and deal a polynomial
+through a point it cannot open — every feldman check and the group-key check
+still pass, because those are statements about commitments too. the proof is
+what separates the two, and it is checked before the dealer can reach
+`dealer_set` and so the manifest. DKG has required the same of its dealers
+since 0.4.
+
 because the reshare is key-preserving, rotation alone does not retire old
 shares — a stale quorum can still sign. `frostito::context` binds the epoch
 and a manifest hash into the signed bytes to close that, and its own docs say

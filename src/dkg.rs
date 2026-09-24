@@ -67,10 +67,16 @@ pub struct ProofOfKnowledge<P: CurvePoint> {
 }
 
 impl<P: CurvePoint> ProofOfKnowledge<P> {
- fn challenge(dealer_index: u32, epoch: u64, constant_commitment: &P, r: &P) -> P::Scalar {
+ fn challenge(
+ domain: &[u8],
+ dealer_index: u32,
+ epoch: u64,
+ constant_commitment: &P,
+ r: &P,
+ ) -> P::Scalar {
  use sha2::{Digest, Sha512};
  let mut h = Sha512::new();
- h.update(DKG_POK_DOMAIN);
+ h.update(domain);
  h.update(dealer_index.to_le_bytes());
  h.update(epoch.to_le_bytes());
  h.update(constant_commitment.compress());
@@ -86,19 +92,46 @@ impl<P: CurvePoint> ProofOfKnowledge<P> {
  a_0: &P::Scalar,
  rng: &mut R,
  ) -> Self {
+ Self::prove_in(DKG_POK_DOMAIN, dealer_index, epoch, a_0, rng)
+ }
+
+ /// Verify against a dealer's constant-term commitment.
+ pub fn verify(&self, dealer_index: u32, epoch: u64, constant_commitment: &P) -> bool {
+ self.verify_in(DKG_POK_DOMAIN, dealer_index, epoch, constant_commitment)
+ }
+
+ /// [`prove`](Self::prove) under a caller-chosen domain tag.
+ ///
+ /// The same construction serves DKG round 1 and reshare dealing, over
+ /// different secrets: a fresh polynomial's constant term in the first case,
+ /// the dealer's standing share in the second. Separating the domains keeps
+ /// a proof made for one from verifying in the other.
+ pub(crate) fn prove_in<R: rand_core::RngCore + rand_core::CryptoRng>(
+ domain: &[u8],
+ dealer_index: u32,
+ epoch: u64,
+ a_0: &P::Scalar,
+ rng: &mut R,
+ ) -> Self {
  let k = P::Scalar::random(rng);
  let r = P::generator().mul_scalar(&k);
  let constant_commitment = P::generator().mul_scalar(a_0);
- let e = Self::challenge(dealer_index, epoch, &constant_commitment, &r);
+ let e = Self::challenge(domain, dealer_index, epoch, &constant_commitment, &r);
  Self {
  z: k.add(&e.mul(a_0)),
  r,
  }
  }
 
- /// Verify against a dealer's constant-term commitment.
- pub fn verify(&self, dealer_index: u32, epoch: u64, constant_commitment: &P) -> bool {
- let e = Self::challenge(dealer_index, epoch, constant_commitment, &self.r);
+ /// [`verify`](Self::verify) under a caller-chosen domain tag.
+ pub(crate) fn verify_in(
+ &self,
+ domain: &[u8],
+ dealer_index: u32,
+ epoch: u64,
+ constant_commitment: &P,
+ ) -> bool {
+ let e = Self::challenge(domain, dealer_index, epoch, constant_commitment, &self.r);
  P::generator().mul_scalar(&self.z) == self.r.add(&constant_commitment.mul_scalar(&e))
  }
 }

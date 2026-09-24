@@ -30,8 +30,18 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use crate::curve::{CurvePoint, CurveScalar};
+use crate::dkg::ProofOfKnowledge;
 use crate::error::Error;
 use crate::lagrange::compute_lagrange_coefficients;
+
+/// Domain tag for a reshare dealer's proof of possession.
+///
+/// Separate from [`DKG_POK_DOMAIN`](crate::dkg::DKG_POK_DOMAIN): the same
+/// Schnorr construction proves a different statement here — possession of the
+/// standing share being redistributed, rather than of a fresh polynomial's
+/// constant term — and a proof made for one ceremony must not verify in the
+/// other.
+pub const RESHARE_POK_DOMAIN: &[u8] = b"frostito/reshare-pok/v1";
 
 // ============================================================================
 // Core Types
@@ -82,6 +92,18 @@ impl<P: CurvePoint> DealerCommitment<P> {
 
  /// Commitment to dealer's share: C_0 = g^{s_i}
  #[inline]
+ /// Check a dealer's [proof of possession](Dealer::prove_possession)
+ /// against the constant term of this commitment.
+ ///
+ /// `epoch` must be the epoch being resharded into, and must be the same
+ /// value on every verifier.
+ pub fn verify_possession(&self, epoch: u64, proof: &ProofOfKnowledge<P>) -> bool {
+ match self.coefficients.first() {
+ Some(c0) => proof.verify_in(RESHARE_POK_DOMAIN, self.dealer_index, epoch, c0),
+ None => false,
+ }
+ }
+
  pub fn share_commitment(&self) -> &P {
  &self.coefficients[0]
  }
@@ -360,6 +382,30 @@ impl<P: CurvePoint> Dealer<P> {
  /// Generate all sub-shares for a player range
  ///
  /// Returns sub-shares for players 1..=num_players
+ /// Prove this dealer still holds the share it is redistributing.
+ ///
+ /// A reshare dealer's constant term **is** its standing share `σ_i`, so the
+ /// commitment it publishes already contains `g^{σ_i}`. Publishing that is
+ /// not the same as holding the preimage: without a proof, a dealer can
+ /// commit to a constant term copied from the previous epoch's public
+ /// polynomial and deal a polynomial through a point it cannot open. The
+ /// sub-shares still pass their Feldman checks, and the group key check
+ /// still passes, because both are statements about commitments.
+ ///
+ /// [`DkgState::submit_commitment`](crate::dkg::DkgState::submit_commitment)
+ /// has required this of DKG dealers since 0.4; this is the same proof for
+ /// the reshare side, under its own domain tag.
+ ///
+ /// `epoch` must be the epoch being resharded *into* — the same value every
+ /// verifier uses — so a proof cannot be replayed across rounds.
+ pub fn prove_possession<R: rand_core::RngCore + rand_core::CryptoRng>(
+ &self,
+ epoch: u64,
+ rng: &mut R,
+ ) -> ProofOfKnowledge<P> {
+ ProofOfKnowledge::prove_in(RESHARE_POK_DOMAIN, self.index, epoch, &self.polynomial[0], rng)
+ }
+
  pub fn generate_subshares(&self, num_players: u32) -> Vec<SubShare<P::Scalar>> {
  (1..=num_players)
  .map(|j| self.generate_subshare(j).expect("index is 1-indexed by construction"))
@@ -774,13 +820,30 @@ impl<P: CurvePoint> ReshareState<P> {
  }
  }
 
- /// Submit a dealer's commitment
+ /// Submit a dealer's commitment, with its proof of possession.
+ ///
+ /// The proof is checked before the commitment is recorded, so a dealer that
+ /// cannot open its own constant term never enters
+ /// [`dealer_set`](Self::dealer_set) and therefore never enters the epoch
+ /// manifest. This mirrors
+ /// [`DkgState::submit_commitment`](crate::dkg::DkgState::submit_commitment),
+ /// which has verified the DKG proof of knowledge since 0.4.
  ///
  /// Returns true if this is a new commitment, false if duplicate.
+ ///
+ /// # Errors
+ ///
+ /// [`Error::InvalidProofOfKnowledge`] if the proof does not open the commitment's
+ /// constant term under this state's target epoch.
  pub fn submit_commitment(
  &mut self,
  commitment: DealerCommitment<P>,
+ proof: &ProofOfKnowledge<P>,
  ) -> Result<bool, Error> {
+ if !commitment.verify_possession(self.target_epoch, proof) {
+ return Err(Error::InvalidProofOfKnowledge(commitment.dealer_index));
+ }
+
  let idx = commitment
  .dealer_index
  .checked_sub(1)
@@ -1289,6 +1352,87 @@ mod tests {
  &mut rng
  ));
  }
+ /// A reshare dealer must prove it can open the constant term it published.
+ ///
+ /// The commitment alone is a statement about a point, not about a secret: a
+ /// dealer can copy `g^{σ_j}` out of the previous epoch's public polynomial
+ /// and deal a polynomial through a point it cannot open. Every Feldman
+ /// check and the group-key check still pass, because those are also
+ /// statements about commitments. The proof is what separates the two, and
+ /// `submit_commitment` is where it is enforced — before the dealer can
+ /// reach `dealer_set` and so the epoch manifest.
+ #[test]
+ fn a_reshare_dealer_proves_possession_of_its_share() {
+ let mut rng = OsRng;
+ let secret = Scalar::random(&mut rng);
+ let old_shares = shamir_split(&secret, 5, 3);
+
+ let epoch = 9u64;
+ let dealer: Dealer<RistrettoPoint> =
+ Dealer::new(old_shares[0].index, *old_shares[0].scalar(), 3, &mut rng).unwrap();
+ let commitment = dealer.commitment().clone();
+ let proof = dealer.prove_possession(epoch, &mut rng);
+
+ assert!(commitment.verify_possession(epoch, &proof));
+
+ // a different epoch: a proof does not carry from one reshare round to
+ // the next, so a recorded transcript cannot be replayed forward
+ assert!(!commitment.verify_possession(epoch + 1, &proof));
+
+ // another dealer's commitment: the index is in the challenge, so the
+ // proof does not transfer to a position its author does not hold
+ let other: Dealer<RistrettoPoint> =
+ Dealer::new(old_shares[1].index, *old_shares[1].scalar(), 3, &mut rng).unwrap();
+ assert!(!other.commitment().verify_possession(epoch, &proof));
+
+ // and the DKG proof for the same index and epoch does not verify here:
+ // same construction, different domain tag
+ let dkg_proof = crate::dkg::ProofOfKnowledge::<RistrettoPoint>::prove(
+ old_shares[0].index,
+ epoch,
+ old_shares[0].scalar(),
+ &mut rng,
+ );
+ assert!(!commitment.verify_possession(epoch, &dkg_proof));
+ assert!(dkg_proof.verify(old_shares[0].index, epoch, commitment.share_commitment()));
+ }
+
+ /// The gate: a dealer that cannot open its constant term never reaches the
+ /// dealer set, so it never reaches the epoch manifest.
+ #[test]
+ fn an_unproven_reshare_dealer_is_refused() {
+ let mut rng = OsRng;
+ let secret = Scalar::random(&mut rng);
+ let group_pubkey: RistrettoPoint = RistrettoPoint::generator().mul_scalar(&secret);
+ let old_shares = shamir_split(&secret, 5, 3);
+ let epoch = 4u64;
+
+ let mut state: ReshareState<RistrettoPoint> =
+ ReshareState::new(epoch, 5, 3, 3, 5, group_pubkey);
+
+ // dealer 1 proves for the wrong epoch
+ let d1: Dealer<RistrettoPoint> =
+ Dealer::new(old_shares[0].index, *old_shares[0].scalar(), 3, &mut rng).unwrap();
+ let stale = d1.prove_possession(epoch - 1, &mut rng);
+ assert_eq!(
+ state
+ .submit_commitment(d1.commitment().clone(), &stale)
+ .unwrap_err(),
+ Error::InvalidProofOfKnowledge(old_shares[0].index)
+ );
+ assert_eq!(state.commitment_count(), 0, "a refused dealer is not recorded");
+
+ // the honest dealers get in, and the refused one is absent from the set
+ for share in &old_shares[1..4] {
+ let d: Dealer<RistrettoPoint> =
+ Dealer::new(share.index, *share.scalar(), 3, &mut rng).unwrap();
+ let pok = d.prove_possession(epoch, &mut rng);
+ state.submit_commitment(d.commitment().clone(), &pok).unwrap();
+ }
+ assert_eq!(state.dealer_set(), Some(vec![2, 3, 4]));
+ }
+
+
 
  #[test]
  fn test_reshare_state() {
@@ -1312,8 +1456,9 @@ mod tests {
  for share in &old_shares {
  let dealer: Dealer<RistrettoPoint> =
  Dealer::new(share.index, *share.scalar(), 3, &mut rng).expect("index is 1-indexed by construction");
+ let pok = dealer.prove_possession(1, &mut rng);
  state
- .submit_commitment(dealer.commitment().clone())
+ .submit_commitment(dealer.commitment().clone(), &pok)
  .unwrap();
  }
 
@@ -1329,7 +1474,10 @@ mod tests {
  let share = &old_shares[i - 1];
  let dealer: Dealer<RistrettoPoint> =
  Dealer::new(share.index, *share.scalar(), 3, &mut rng).expect("index is 1-indexed by construction");
- partial.submit_commitment(dealer.commitment().clone()).unwrap();
+ let pok = dealer.prove_possession(2, &mut rng);
+ partial
+ .submit_commitment(dealer.commitment().clone(), &pok)
+ .unwrap();
  }
  assert_eq!(partial.dealer_set(), Some(vec![2, 4, 5]));
  assert!(partial.verify_group_key().unwrap());

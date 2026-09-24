@@ -32,6 +32,16 @@
   is part of what signing means under Taproot, not a policy, and a layer can
   be left off.
 
+- **`reshare::Dealer::prove_possession`** and
+  `DealerCommitment::verify_possession`, required by
+  `ReshareState::submit_commitment`. A reshare dealer's constant term is its
+  standing share, and publishing `g^{σ_i}` is not the same as holding `σ_i`:
+  a dealer could copy the point out of the previous epoch's public polynomial
+  and deal a polynomial through it, passing every Feldman check and the
+  group-key check, since those are statements about commitments too. DKG
+  dealers have had to prove this since 0.4; reshare dealers did not. Same
+  Schnorr construction, its own domain tag (`RESHARE_POK_DOMAIN`), enforced
+  before a dealer can reach `dealer_set` and so the epoch manifest.
 - `curve::NestedSuite` names the conjunction every nested item used to repeat
   (`C: Ciphersuite`, `Element<C>: CurvePoint<Scalar = Scalar<C>>`,
   `Scalar<C>: CurveScalar`). Blanket-implemented, so there is nothing to
@@ -39,6 +49,8 @@
 
 ### Changed
 
+- `ReshareState::submit_commitment` takes the dealer's proof of possession as
+  a second argument and returns `InvalidProofOfKnowledge` without it.
 - `inner_sign_v2` → `inner_sign`, `InnerSigningParamsV2` → `InnerSigningParams`.
   Nothing named v1 is left to distinguish them from; it was never released.
 
