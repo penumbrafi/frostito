@@ -42,9 +42,6 @@
 //! cryptographer; it has not been done. The inner group must be treated as one
 //! trust unit: `t_in` corrupt holders are a corrupt outer signer, with no
 //! further guarantee.
-//!
-//! v1 — a pre-bound single point with an identity binding commitment — was
-//! insecure and has been removed.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -394,14 +391,11 @@ mod tests {
 
 
 // ============================================================================
-// Nested FROST v2 — outer-bound, commit-reveal, verifiable
+// Nested FROST — outer-bound, commit-reveal, verifiable
 // ============================================================================
 //
-// v1 pre-bound the inner nonces and presented one point to the outer protocol.
-// That severs the outer binding coupling (see the warning on
-// `aggregate_inner_commitments`) and admits a ROS-style forgery.
-//
-// v2 instead presents the nested position as an ORDINARY FROST signer:
+// The nested position is presented to the outer protocol as an ORDINARY FROST
+// signer:
 //
 // D_nested = Σ_k D_k E_nested = Σ_k E_k
 //

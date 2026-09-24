@@ -472,8 +472,7 @@ fn incomplete_quorum_is_rejected() {
 ///
 /// A nested position's response is bit-for-bit what a flat FROST signer
 /// holding sigma_2 with nonces (Sum d_k, Sum e_k) produces. Note what this
-/// establishes: honest-transcript equality, not a reduction (see the report's
-/// §1.2 and the correction to the v1 writeup).
+/// establishes: honest-transcript equality, not a reduction.
 #[test]
 fn v2_response_equals_the_flat_frost_response() {
  let mut rng = OsRng;

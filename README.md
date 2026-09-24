@@ -1,61 +1,70 @@
 # frostito
 
-threshold Schnorr: distributed key generation, FROST signing, nested FROST,
-and proactive resharing.
+threshold Schnorr for collective custody: distributed key generation, nested
+FROST, and proactive resharing, on top of ZF
+[`frost-core`](https://github.com/ZcashFoundation/frost).
 
-the signing math is being rooted in ZF [`frost-core`](https://github.com/ZcashFoundation/frost);
-what stays here is the part it does not cover — confidential authenticated DKG
-round 2, dealer-equivocation detection, complaints, committee rotation, and
-nested FROST.
+the signing math is `frost-core`'s. what lives here is the part it does not
+cover:
+
+- confidential, authenticated DKG round 2, with dealer-equivocation detection
+  and checkable complaints
+- **nested FROST** — one outer FROST position held by an inner threshold
+  group, so a chain or a sub-committee can be a party inside somebody else's
+  quorum
+- **key-preserving reshare** — rotate the custodian set without changing the
+  group public key, so a deposit address survives validator churn
 
 ## using it
 
-repository and cargo package are both `frostito`.
-
 ```toml
 [dependencies]
-frostito = { git = "https://github.com/penumbrafi/frostito", features = ["sealed"] }
+frostito = { version = "0.7.1", features = ["zf-secp256k1-tr", "sealed"] }
 ```
 
-there are no release tags. pin a `rev`.
+pin `0.7.1` or later. 0.7.0 rejects every secp256k1 identifier on the nested
+path and cannot sign.
 
 ### features
 
-default build is `std` + `ristretto255`. everything else is off by default.
+default build is `std` + `ristretto255`. everything else is off.
 
 | feature | what it is |
 |---|---|
-| `sealed` | DKG round 2 over Noise_K: sub-shares encrypted and authenticated per recipient (`frostito::sealed`). needs `std` |
-| `zf-ristretto255` / `zf-secp256k1` / `zf-secp256k1-tr` | ZF's ciphersuite crate for that backend. `-tr` is BIP340/Taproot, which is what Bitcoin verifies; plain `zf-secp256k1` is RFC 9591's registered suite and is **not** Bitcoin-compatible |
+| `sealed` | DKG round 2 over Noise_K: sub-shares encrypted and authenticated per recipient. needs `std` |
+| `zf-secp256k1-tr` | BIP340/Taproot. this is the one bitcoin verifies |
+| `zf-secp256k1` | RFC 9591's registered secp256k1 suite. **not** bitcoin-compatible |
+| `zf-ristretto255` | RFC 9591 ristretto255 |
+| `ristretto255` `secp256k1` `pallas` `decaf377` | curve backends for the DKG, reshare and nested code |
 
-`no_std` on every backend.
+`no_std` on every backend, `sealed` aside.
 
 ### what this signs, and what it does not
 
 | chain | works | via |
 |---|---|---|
-| Bitcoin Taproot (P2TR) | yes | `zf-secp256k1-tr` — BIP340. not yet checked against a Bitcoin verifier |
-| Zcash shielded (Orchard) | yes | `reddsa` RedPallas; reshare into ZF key packages is tested |
-| Zcash transparent | no | ECDSA. FROST is Schnorr-only |
-| Bitcoin pre-Taproot | no | ECDSA, same reason |
-| Penumbra (UM) | **not yet** | Penumbra already ships this as `decaf377-frost` — ciphersuite `Decaf377Rdsa`, BLAKE2b personalised `FROST-decaf377` / `decaf377-rdsa---`, over decaf377's conventional basepoint, re-randomizable. It is on `frost-core` 0.7; this crate is on 3.0, and that is the only thing in the way. `zf::Decaf377Sha512` is **not** it — same curve and basepoint, different hash and context string, so nothing it signs verifies under Penumbra |
+| bitcoin taproot (P2TR) | yes | `zf-secp256k1-tr`. not yet checked against libsecp256k1 |
+| zcash shielded (orchard) | yes | `reddsa` redpallas; reshare into ZF key packages is tested |
+| zcash transparent | no | ECDSA. FROST is schnorr-only |
+| bitcoin pre-taproot | no | ECDSA, same reason |
+| penumbra (UM) | not yet | penumbra already ships `decaf377-frost` (ciphersuite `Decaf377Rdsa`, BLAKE2b personalised, re-randomizable). it is on `frost-core` 0.7 and this crate is on 3.0; that version split is the only thing in the way. `zf::Decaf377Sha512` is **not** it — same curve and basepoint, different hash and context string, so nothing it signs verifies under penumbra |
 
 ## curves
 
-| feature | curve | compatible with |
-|---------|-------|---------------|
-| `ristretto255` | curve25519 | polkadot, sr25519 |
-| `pallas` | pallas (curve generator) | generic pallas |
-| `pallas` | pallas in the orchard spend-auth group (`OrchardSpendAuthCurve`) | zcash orchard, ZF `reddsa` / `frost-core` FROST(Pallas) |
-| `secp256k1` | secp256k1 | bitcoin, ethereum |
-| `decaf377` | decaf377 | **not** penumbra spend-auth — see below |
+everything below `zf` is generic over `P: CurvePoint`; the snippets fix a
+concrete point type.
 
-everything is generic over `P: OsstPoint`. the snippets below fix a concrete
-point type.
+| feature | curve | compatible with |
+|---|---|---|
+| `ristretto255` | curve25519 | polkadot, sr25519 |
+| `secp256k1` | secp256k1 | bitcoin, ethereum |
+| `pallas` | pallas, curve generator | generic pallas |
+| `pallas` | pallas, orchard spend-auth group (`OrchardSpendAuthCurve`) | zcash orchard, ZF `reddsa` |
+| `decaf377` | decaf377 | see the penumbra row above — not penumbra spend-auth |
 
 ## distributed key generation
 
-round 1: Feldman commitment plus a proof of knowledge of the constant term.
+round 1: feldman commitment plus a proof of knowledge of the constant term.
 echo round: participants compare digests of the round-1 set, so a dealer
 cannot hand two of them different commitments. round 2: one sealed sub-share
 per recipient.
@@ -101,30 +110,68 @@ for packet in inbox {
     agg.add_subshare(sub, &commitment)?;
 }
 
-let my_share = agg.finalize()?;            // s_me
+let my_share = agg.finalize()?;              // s_me
 let group_pubkey = agg.derive_group_key()?;  // Y
 ```
 
 `open_subshare_agreed` discards the plaintext of a sub-share that fails the
-Feldman check. `open_subshare_agreed_with_evidence` returns it, which is what
+feldman check. `open_subshare_agreed_with_evidence` returns it, which is what
 `dkg::Complaint` needs to be checkable by a third party. `dkg::ComplaintTally`
 gates disqualification on `t` distinct accusers.
 
 ## nested FROST
 
 `frostito::nested` splits one outer FROST position among an inner group. the
-outer share is never materialized as a scalar by any party. inner signers hold
-the message and the full commitment set, so a coordinator cannot obtain a
-share for a payload the signer has not seen.
+outer share is never materialized as a scalar by any party, and inner signers
+hold the message and the full outer commitment set, so a coordinator cannot
+obtain a share for a payload the signer has not seen.
 
-worked flow: [`examples/narsil_nested.rs`](examples/narsil_nested.rs)
-(interleaved DKG, escrow authorization, outer aggregation).
-[`docs/nested-frost-v1-vs-v2.svg`](docs/nested-frost-v1-vs-v2.svg) shows what
-the insecure v1 did differently; v1 itself is gone.
+the nested position is presented to the outer protocol as an ordinary signer —
+`D = Σ D_k`, `E = Σ E_k` — so it receives a real outer binding factor, and each
+holder answers with
+
+```text
+z_k = d_k + ρ·e_k + (λ·c·μ_k)·σ_k
+```
+
+`zf::inner_params_from_zf` recovers `ρ`, `c` and `λ` from a `frost-core`
+`SigningPackage`, which is what makes an inner holder's response bit-for-bit
+equal to the share `frost_core::round2::sign` would have produced for that
+position. that equivalence is asserted against `frost-core` itself in
+`tests/zf_nested_equivalence.rs`, and under taproot in `tests/zf_taproot.rs`.
+
+what that establishes is honest-transcript equality, not a reduction. the
+inner group is one trust unit: `t_in` corrupt holders are a corrupt outer
+signer, with no further guarantee.
+
+under taproot the parity normalisation is not yet applied by `inner_sign_v2` —
+the recipe is verified in the tests, but a caller has to follow it by hand
+until it moves into the holder.
+
+## signing
+
+epoch binding and spent-nonce durability are separate concerns from signing,
+and there was no function for two at once — so they are layers instead, in
+`tower`'s shape.
+
+```rust
+use frostito::signer::{Bind, Holder, SignRequest, Signer, Spend, Stack};
+
+let mut signer = Stack::new(Holder::new(&share, &verifying_key))
+    .layer(Bind::new(&ctx))       // epoch and manifest into the message
+    .layer(Spend::new(&mut log))  // durable, before anything else runs
+    .into_inner();
+
+let z = signer.sign(SignRequest { nonces, approved_message: &msg, nested: &req })?;
+```
+
+outermost runs first: `Spend` wraps `Bind` wraps `Holder`, so the session is
+recorded before any signing work begins.
 
 ## resharing
 
-rotates the custodian set. the group public key is unchanged.
+rotates the custodian set. the group public key is unchanged, which is the
+point: a deposit address outlives the validator set holding it.
 
 ```rust
 use frostito::reshare::{Dealer, Aggregator};
@@ -150,31 +197,42 @@ assert!(polynomial.verify_share(player_index, &new_share));
 `ReshareState::dealer_set()` gives the deterministic choice (the `t_old`
 lowest committed dealer indices) for coordinators to put in the manifest.
 
+because the reshare is key-preserving, rotation alone does not retire old
+shares — a stale quorum can still sign. `frostito::context` binds the epoch
+and a manifest hash into the signed bytes to close that, and its own docs say
+where it does not apply (protocol-defined signatures, where the message is a
+sighash somebody else chose).
+
+## what the caller owes
+
+none of this is supplied by the crate, and all of it is load-bearing:
+
+- **reliable broadcast** for round 1 and the echo round. the echo round detects
+  equivocation; it does not repair it
+- **agreement on the dealer set** before any aggregation, in DKG and reshare
+  alike
+- **durable spent-session state**. a holder that restores a snapshot and signs
+  again with the same nonces gives up its share. `SpentSessions` is the seam;
+  `MemorySpentSessions` is in-memory — a restart forgets everything
+
 ## modules
 
-- `frostito::dkg` — distributed key generation over an agreed dealer set;
-  complaints and disqualification
+- `frostito::dkg` — distributed key generation over an agreed dealer set,
+  complaints, disqualification
 - `frostito::sealed` — encrypted, authenticated DKG round 2 (feature `sealed`)
-- `frostito::frost` — plain FROST signing
 - `frostito::nested` — nested FROST
+- `frostito::signer` — composable signing: `Holder`, `Bind`, `Spend`, `Stack`
 - `frostito::reshare` — proactive secret sharing
-- `frostito::liveness` — checkpoint proofs for holder participation
 - `frostito::context` — epoch-bound signing contexts
+- `frostito::liveness` — checkpoint proofs for holder participation
 - `frostito::zf` — the bridge that drives `nested` from a `frost_core` signing
-  package, plus `Decaf377Sha512`, a ciphersuite for decaf377 that ZF does not
-  ship
+  package, plus `Decaf377Sha512`
 - `frostito::curve` — curve backend traits
 
-[`docs/frostito-design.svg`](docs/frostito-design.svg) is the architecture diagram.
+[`docs/frostito-design.svg`](docs/frostito-design.svg) is the architecture
+diagram. [`SECURITY.md`](SECURITY.md) is the reporting address and the scope.
 
-## canonical repo
-
-canonical source: https://github.com/penumbrafi/frostito.
-`github.com/rotkonetworks/frostito` mirrors `main` so existing pins
-(`rev = "14e38da"`) keep resolving.
-
-the vendored copies in `zcli` (`crates/osst`) and `zk.poker`
-(`crates/frostito`) are being replaced by a git dependency on this repo.
+canonical source: https://github.com/penumbrafi/frostito
 
 ## license
 

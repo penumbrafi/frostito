@@ -22,7 +22,7 @@ std = [
     "sha2/std",
     "rand_core/std",
 ]
-# Confidential, authenticated DKG round-2 delivery (`osst::sealed`).
+# Confidential, authenticated DKG round-2 delivery (`frostito::sealed`).
 #
 # Needs std (snow does), so the no_std core stays clean and the plaintext
 # SubShare/Dealer API is unchanged beneath it.
@@ -104,7 +104,7 @@ hex = "0.4"
 # with a local adapter; see `src/test_rng.rs`.
 rand_core_10 = { package = "rand_core", version = "0.10", default-features = false }
 
-# end-to-end: ZF FROST(Pallas) DKG -> osst reshare -> ZF FROST signing
+# end-to-end: ZF FROST(Pallas) DKG -> frostito reshare -> ZF FROST signing
 reddsa = { git = "https://github.com/ZcashFoundation/reddsa.git", rev = "475a552", features = ["frost"] }
 
 
