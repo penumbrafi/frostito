@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "frostito"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "blake2b_simd",
  "curve25519-dalek",
@@ -1341,9 +1341,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-pasta-curves"
-version = "1.0.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b11ea111779520b119485fdb0fd69c3ec96b6eaab0e1bfbfb3f9cb67c55815a"
+checksum = "32245cb7516361b02b4188b5536d5a998b6be454cf229a2531fb36820a2c4995"
 dependencies = [
  "blake2b_simd",
  "ff 0.14.0",

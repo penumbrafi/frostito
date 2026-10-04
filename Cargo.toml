@@ -1,6 +1,6 @@
 [package]
 name = "frostito"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "nested FROST, hardened DKG, and proactive resharing, on ZF frost-core"
@@ -61,11 +61,11 @@ zeroize = { version = "1.8", default-features = false, features = ["derive"] }
 curve25519-dalek = { version = "4.1", default-features = false, features = ["digest", "group", "alloc", "rand_core", "zeroize"], optional = true }
 
 # pallas - for Zcash Orchard compatibility.
-# Zakura Common 1.0 fork (pasta-1.0 / ff+group 0.14). Package rename keeps the
+# Zakura Common 2.x fork (pasta 2.x / ff+group 0.14; same API as 1.0). Package rename keeps the
 # `use pasta_curves` paths working; the pallas backend only touches stable
 # ff/group traits (Field/PrimeField/FromUniformBytes/Group/GroupEncoding) -
 # except `Field::random`, which ff 0.14 moved onto rand_core 0.10 (see curve.rs).
-pasta_curves = { package = "zakura-pasta-curves", version = "=1.0.0", default-features = false, features = ["alloc"], optional = true }
+pasta_curves = { package = "zakura-pasta-curves", version = "2.0", default-features = false, features = ["alloc"], optional = true }
 
 # secp256k1 - for Bitcoin compatibility
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa"], optional = true }

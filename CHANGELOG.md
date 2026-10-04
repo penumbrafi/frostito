@@ -1,5 +1,17 @@
 # changelog
 
+## [0.9.0] - unreleased
+
+### Changed
+
+- **Zakura Common 2.** The `pallas` backend now uses
+  `zakura-pasta-curves 2.x` (was `=1.0.0`). Same `ff`/`group` 0.14 API,
+  but the point and scalar types are a different crate version, so a
+  consumer must move its own pasta (and orchard/reddsa) to Common 2 in the
+  same step. The requirement is a caret, not an exact pin, so it unifies with
+  whichever 2.x the consumer pins. Common 2 carries NU7 (branch `0x77190ad9`,
+  V6 transactions).
+
 ## [0.8.0] - 2026-09-24
 
 ### Added
